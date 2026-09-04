@@ -4,8 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
-description = "Provider-preserving launcher for Muse Code backed by Codex"
+publish.workspace = true
+description = "Host-preserving Muse Code launcher backed by OpenAI Codex"
 
 [dependencies]
 anyhow = "1"

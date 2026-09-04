@@ -4,27 +4,64 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rust:
-    runs-on: macos-14
+    name: Rust quality gates
+    runs-on: macos-15
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          toolchain: 1.93.0
+          persist-credentials: false
+
+      - name: Install Rust 1.93.0
+        uses: dtolnay/rust-toolchain@283fb51ee3c8a49cd7c8ff30102f3fcf3cfbe0e1 # 1.93.0
+        with:
           components: rustfmt, clippy
           targets: aarch64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --all-targets --locked
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Check first-party formatting
+        run: >-
+          cargo fmt
+          --package codex-transport
+          --package muse-codex
+          --package muse-codex-gateway
+          -- --check
+
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test workspace
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Build Apple silicon release binaries
+        run: cargo build --workspace --release --locked --target aarch64-apple-darwin
+
+      - name: Self-test release gateway
+        run: ./target/aarch64-apple-darwin/release/muse-codex-gateway self-test
 
   release-tooling:
-    runs-on: macos-14
+    name: Release tooling
+    runs-on: macos-15
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - run: bash tests/scripts/release-tooling-test.sh
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Test signed release tooling
+        run: bash tests/scripts/release-tooling-test.sh

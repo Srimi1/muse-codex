@@ -57,10 +57,11 @@ case "$published_at" in
   *[!0-9T:Z+.-]*|'') die "manifest publication timestamp is malformed" ;;
 esac
 
-validate_artifact() {
+validate_file() {
   role=$1
   expected_name=$2
-  prefix=artifacts.macos_arm64.$role
+  prefix=$3
+  verify_bundle_file=$4
   filename=$(json_get "$prefix.filename")
   url=$(json_get "$prefix.url")
   size=$(json_get "$prefix.size")
@@ -87,18 +88,37 @@ validate_artifact() {
   esac
   [ "${#sha256}" -eq 64 ] || die "$role artifact SHA-256 is malformed"
 
-  if [ -n "$bundle_dir" ]; then
+  if [ -n "$bundle_dir" ] && [ "$verify_bundle_file" -eq 1 ]; then
     artifact=$bundle_dir/$filename
-    [ -f "$artifact" ] || die "$role artifact is missing from bundle"
+    [ -f "$artifact" ] || die "$role file is missing from bundle"
     actual_size=$(wc -c <"$artifact" | tr -d '[:space:]')
-    [ "$actual_size" = "$size" ] || die "$role artifact size does not match manifest"
+    [ "$actual_size" = "$size" ] || die "$role file size does not match manifest"
     actual_sha=$(shasum -a 256 "$artifact" | awk '{print $1}')
-    [ "$actual_sha" = "$sha256" ] || die "$role artifact digest does not match manifest"
+    [ "$actual_sha" = "$sha256" ] || die "$role file digest does not match manifest"
   fi
 }
 
-validate_artifact launcher muse-codex
-validate_artifact gateway muse-codex-gateway
+validate_file launcher muse-codex artifacts.macos_arm64.launcher 1
+validate_file gateway muse-codex-gateway artifacts.macos_arm64.gateway 1
+
+# install.sh verifies a staging directory that intentionally contains only the
+# downloaded executables. A release directory, identified by the presence of
+# any legal payload, must contain and verify the complete legal set.
+verify_legal_bundle=0
+if [ -n "$bundle_dir" ]; then
+  for legal_name in LICENSE THIRD_PARTY_NOTICES.md NOTICE; do
+    if [ -e "$bundle_dir/$legal_name" ] || [ -L "$bundle_dir/$legal_name" ]; then
+      verify_legal_bundle=1
+      break
+    fi
+  done
+fi
+
+validate_file license LICENSE legal.license "$verify_legal_bundle"
+validate_file third-party-notices THIRD_PARTY_NOTICES.md \
+  legal.third_party_notices "$verify_legal_bundle"
+validate_file openai-codex-notice NOTICE \
+  legal.openai_codex_notice "$verify_legal_bundle"
 
 if grep -E 'muse-bin-|"filename"[[:space:]]*:[[:space:]]*"muse"' "$manifest" >/dev/null; then
   die "manifest attempts to include a stock Muse artifact"

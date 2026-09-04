@@ -4,7 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
+publish.workspace = true
+description = "Loopback compatibility gateway between Muse Code and OpenAI Codex"
 
 [[bin]]
 name = "muse-codex-gateway"
@@ -32,4 +35,3 @@ url = "2"
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
-

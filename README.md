@@ -1,217 +1,222 @@
-# muse-codex
+<p align="center">
+  <img src="assets/muse-codex-logo.png" alt="Muse Codex logo: an abstract M surrounding code chevrons and a spark" width="168">
+</p>
 
-`muse-codex` keeps the stock Meta Muse Code harness and replaces only its model
-transport with an OpenAI Codex/GPT transport. The Muse terminal UI, sessions,
-tools, approvals, sandbox, rules, hooks, MCP servers, skills, subagents, and
-worktrees continue to be owned by the unmodified Muse executable.
+<h1 align="center">Muse Codex</h1>
 
-This project is an independent compatibility layer. It is not affiliated with,
-endorsed by, or distributed by Meta or OpenAI.
+<p align="center"><strong>Keep the harness. Change the model.</strong></p>
 
-## Important boundary
+<p align="center">
+  An independent compatibility gateway for using OpenAI models through the stock Muse Code CLI.
+</p>
 
-The stock `muse` executable is a prerequisite. This repository does not contain,
-download, modify, package, or redistribute Muse Code. Install Muse from Meta's
-official channel and accept Meta's terms separately:
+<p align="center">
+  <a href="https://github.com/Srimi1/muse-codex/actions/workflows/ci.yml"><img alt="CI status" src="https://github.com/Srimi1/muse-codex/actions/workflows/ci.yml/badge.svg?branch=main"></a>
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-4c6ef5.svg"></a>
+  <a href="rust-toolchain.toml"><img alt="Rust 1.93" src="https://img.shields.io/badge/Rust-1.93-dea584.svg?logo=rust"></a>
+  <img alt="Platform: Apple-silicon macOS" src="https://img.shields.io/badge/platform-macOS%20arm64-111827.svg?logo=apple">
+  <img alt="Status: experimental" src="https://img.shields.io/badge/status-experimental-8b5cf6.svg">
+</p>
+
+> [!WARNING]
+> **Experimental and source-only.** Muse Codex currently supports Apple-silicon
+> macOS and exactly Muse Code `1.0.3-R2198.1`. Other Muse versions are rejected.
+> No public binary release is available.
+
+> [!IMPORTANT]
+> Muse Codex is not affiliated with, endorsed by, or distributed by Meta or
+> OpenAI. Install and license Muse Code separately through Meta's official
+> channel.
+
+## What it does
+
+Muse Codex keeps the unmodified Muse executable in charge of the terminal UI,
+sessions, prompts, tools, approvals, sandbox, skills, subagents, and worktrees.
+It replaces only the model connection with a private loopback gateway backed by
+the pinned OpenAI Codex client.
+
+- **Preserves the host:** normal Muse commands and provider-independent behavior
+  stay in the stock executable.
+- **Isolates credentials:** Muse receives a short-lived loopback token, never an
+  OpenAI credential.
+- **Keeps tools local:** the gateway translates model traffic but never executes
+  a model-requested tool.
+- **Fails closed:** unsupported Muse builds, conflicting providers, unsafe
+  endpoints, and unverifiable release artifacts are rejected.
+
+### Ownership boundary
+
+| Stock Muse owns | Muse Codex owns | Not included here |
+| --- | --- | --- |
+| TUI and exec mode | CLI routing and version gate | The proprietary Muse binary |
+| Sessions and context | Isolated OpenAI authentication | OpenAI service access |
+| Tools and approvals | Loopback gateway lifecycle | A public binary release |
+| Sandbox and extensions | Model catalog and stream translation | Modified Muse host source |
+
+```mermaid
+flowchart LR
+    U[User] --> L[muse-codex launcher]
+    L -->|spawns| M[Stock Muse Code]
+    L -->|starts| G[Loopback gateway]
+    M -->|ephemeral bearer token| G
+    G -->|authenticated HTTPS| O[OpenAI]
+    M --> T[Tools, approvals, sandbox]
+```
+
+See [Architecture](docs/ARCHITECTURE.md) and the
+[Security model](docs/SECURITY.md) for the detailed boundaries.
+
+## Compatibility
+
+| Component | Supported baseline |
+| --- | --- |
+| Operating system | macOS on Apple silicon (`arm64`) |
+| Muse Code | Exactly `1.0.3-R2198.1` |
+| Rust | `1.93.0` for source builds |
+| OpenAI Codex source | `rust-v0.133.0` at `9474e5cfc4494b0ba319352aa86ce436c59e65c8` |
+| Authentication | ChatGPT browser/device login or an OpenAI API key |
+
+The current Meta installer may provide a newer Muse build. Muse Codex does not
+bypass its version gate; verify the installed binary before building:
+
+```console
+$ muse --version
+Muse Code 1.0.3 (1.0.3-R2198.1)
+```
+
+If the output differs, this version of Muse Codex will not start a session.
+
+## Quick start from source
+
+Install the exact Muse prerequisite through
+[Meta's official Muse Code installer](https://dev.meta.ai/install.sh), then:
 
 ```sh
-curl -fsSL https://dev.meta.ai/install.sh | sh
+git clone https://github.com/Srimi1/muse-codex.git
+cd muse-codex
+
+cargo build --workspace --release --locked
+
+mkdir -p "$HOME/.local/bin"
+install -m 0755 target/release/muse-codex "$HOME/.local/bin/muse-codex"
+install -m 0755 target/release/muse-codex-gateway "$HOME/.local/bin/muse-codex-gateway"
 ```
 
-The compatibility baseline is Muse `1.0.3-R2198.1`. A newer Muse release may
-work, but must pass the black-box compatibility suite before it is declared
-supported.
+The launcher and gateway must remain beside one another or both be available on
+`PATH`. For a nonstandard Muse location, set `MUSE_CODEX_MUSE_BIN` to the exact
+executable.
 
-## Architecture at a glance
+### Authenticate
 
-```text
-                       localhost only
-user -> muse-codex -> stock muse -> compatibility gateway -> OpenAI
-          |               |
-          |               +-- TUI, sessions, tools, safety, extensions
-          +-- auth commands, process isolation, provider routing
-```
-
-The launcher starts a private loopback gateway, gives the Muse child a
-per-process bearer token, and points Muse's existing endpoint transport at that
-gateway. The gateway implements the Muse model-catalog and Responses streaming
-contract and translates it to the pinned Codex client. It never executes a tool;
-tool execution and approval remain inside Muse.
-
-See [Architecture](docs/ARCHITECTURE.md) and [Security](docs/SECURITY.md) for the
-full boundaries and invariants.
-
-## Requirements
-
-- macOS on Apple silicon (`arm64`)
-- Stock Muse Code `1.0.3-R2198.1` installed by Meta, or its exact executable
-  selected through `MUSE_CODEX_MUSE_BIN`
-- An OpenAI account entitled to the selected authentication mode
-- Access to the project's private, immutable release feed
-- For source builds: Rust and Cargo matching the repository toolchain
-
-The exact tracked OpenAI Codex `rust-v0.133.0` source used by the transport is
-vendored under `vendor/openai-codex`; source builds do not fetch a moving Codex
-branch.
-
-ChatGPT subscription authentication and OpenAI API-key billing are distinct
-modes. `muse-codex` never silently falls back from one to the other.
-
-## Install a signed private release
-
-Release binaries are not published from a public, mutable URL. Obtain these
-values from the release operator through an authenticated channel:
-
-- `MUSE_CODEX_RELEASE_MANIFEST_URL`: exact HTTPS URL of `manifest.json`
-- `MUSE_CODEX_RELEASE_SIGNATURE_URL`: exact HTTPS URL of
-  `manifest.json.sig`
-- `MUSE_CODEX_RELEASE_PUBLIC_KEY_FILE`: local path to the trusted release public
-  key, delivered independently of the feed
-
-If the feed needs authentication, put it in a mode-`0600` curl configuration
-file and set `MUSE_CODEX_RELEASE_CURL_CONFIG` to its path. This keeps the secret
-out of the curl process arguments:
-
-```text
-header = "Authorization: Bearer <private-feed-token>"
-```
-
-Then run:
-
-```sh
-export MUSE_CODEX_RELEASE_MANIFEST_URL='https://private.example/releases/v1/manifest.json'
-export MUSE_CODEX_RELEASE_SIGNATURE_URL='https://private.example/releases/v1/manifest.json.sig'
-export MUSE_CODEX_RELEASE_PUBLIC_KEY_FILE="$PWD/release-private.pub"
-export MUSE_CODEX_RELEASE_CURL_CONFIG="$HOME/.config/muse-codex/release.curlrc"
-
-./scripts/install.sh
-```
-
-The default destination directory is `$HOME/.local/bin`. Override it with an
-absolute `MUSE_CODEX_INSTALL_DIR`. The installer:
-
-1. verifies that the machine is macOS arm64 and stock Muse is callable;
-2. downloads the manifest and detached signature over HTTPS;
-3. verifies the manifest with the out-of-band public key;
-4. downloads only the signed `macos_arm64` launcher and gateway artifacts;
-5. checks both exact sizes and SHA-256 digests;
-6. runs the staged gateway self-test and launcher-to-Muse version probe; and
-7. installs `muse-codex` and its sibling `muse-codex-gateway`, retaining one
-   `.previous` copy of each on update. The gateway is installed first and the
-   user-facing launcher last.
-
-It never invokes Meta's installer and never copies the stock Muse binary.
-
-## Use
-
-Authenticate with exactly one mode. Browser login is the default:
+Browser login is the default:
 
 ```sh
 muse-codex login
 ```
 
-For a terminal that cannot receive the browser callback, use device
-authorization:
+For a terminal that cannot receive a browser callback:
 
 ```sh
 muse-codex login --device-auth
 ```
 
-Or store an OpenAI API key supplied on standard input:
+Or store an OpenAI API key supplied over standard input:
 
 ```sh
 printf '%s' "$OPENAI_API_KEY" | \
   muse-codex auth set --provider codex --api-key-stdin
 ```
 
-Credentials are stored only in the operating-system keyring under a dedicated
-Muse Codex auth namespace. They are not copied to `~/.codex`, Muse auth, or an
-`auth.json` file. A custom OpenAI base URL is allowed only with API-key auth;
-subscription login always uses the approved ChatGPT backend.
+ChatGPT subscription authentication and API-key billing are separate modes.
+Muse Codex never silently falls back between them. Credentials are stored in an
+isolated operating-system keyring namespace rather than a plaintext
+`auth.json`.
 
-Then use Muse's normal commands through the wrapper:
+### Run Muse
 
 ```sh
 muse-codex
 muse-codex exec "Explain the failing tests, then propose a fix"
 muse-codex resume
-muse-codex logout
 ```
 
-Arguments unrelated to provider selection pass through to Muse. The public
-provider is either omitted or explicitly `--provider codex`; internal `meta`,
-`echo`, and unknown providers are rejected. A user `--base-url` or
-`OPENAI_BASE_URL` is forwarded only to the gateway as an API-key-authenticated
-upstream endpoint. Muse itself always receives the private loopback URL.
+Arguments unrelated to provider routing pass through to Muse. The public
+provider is either omitted or explicitly `--provider codex`; other provider
+values are rejected.
 
-## Build and test
+For complete setup, private signed-feed installation, environment variables,
+and endpoint rules, see [Installation](docs/INSTALLATION.md) and
+[Configuration](docs/CONFIGURATION.md).
+
+## Security and privacy
+
+The launcher removes inherited provider credentials before starting Muse. It
+binds the compatibility gateway only to `127.0.0.1`, authenticates the local
+hop with a random per-run token, and keeps OpenAI credentials inside the auth
+and gateway boundary. A custom upstream base URL is accepted only with explicit
+API-key authentication.
+
+Review the [Security policy](.github/SECURITY.md) before deploying or reporting
+an issue. Suspected vulnerabilities should be submitted through
+[private vulnerability reporting](https://github.com/Srimi1/muse-codex/security/advisories/new),
+not a public issue.
+
+## Known limits
+
+- The exact supported Muse build may no longer be the build served by Meta's
+  moving installer.
+- Transport compatibility does not imply that different models make identical
+  tool choices or produce identical output.
+- The ChatGPT backend is private and unstable. The vendored Codex source is open
+  source, but its Rust crates are not a stable library API.
+- Stock-vs-wrapped transcript tests and live OpenAI validation remain release
+  gates; the public automated suite currently covers first-party unit tests,
+  deterministic fixtures, and release tooling.
+- New response event types, auxiliary routes, and Muse releases require explicit
+  compatibility work before support is claimed.
+- Hooks, MCP servers, skills, and plugins retain Muse's existing trust model.
+
+Track planned qualification work in the [Roadmap](ROADMAP.md).
+
+## Documentation
+
+| Document | Contents |
+| --- | --- |
+| [Installation](docs/INSTALLATION.md) | Source builds and signed private-feed installation |
+| [Configuration](docs/CONFIGURATION.md) | Environment, authentication, and endpoint behavior |
+| [Architecture](docs/ARCHITECTURE.md) | Components, data flow, command routing, and failure rules |
+| [Security model](docs/SECURITY.md) | Trust boundaries, protected assets, and residual risks |
+| [Releasing](docs/RELEASING.md) | Private signed-release process and checklist |
+| [Contributing](CONTRIBUTING.md) | Development workflow and review expectations |
+| [Support](SUPPORT.md) | Supported scope and help channels |
+| [Changelog](CHANGELOG.md) | User-visible project changes |
+
+The official [Muse Code SDK](https://github.com/meta-models/muse-code-sdk) is a
+useful reference for the Muse Session Protocol. The exact OpenAI source snapshot
+used here is recorded under `vendor/openai-codex`.
+
+## Development
 
 ```sh
-cargo build --workspace --locked
-cargo test --workspace --locked
+cargo fmt -p codex-transport -p muse-codex -p muse-codex-gateway -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
 bash tests/scripts/release-tooling-test.sh
 ```
 
-For a release build on Apple silicon:
+CI runs the same quality gates and an Apple-silicon release build. Unit and
+fixture tests do not require live OpenAI or Meta credentials.
 
-```sh
-rustup target add aarch64-apple-darwin
-cargo build --workspace --release --locked --target aarch64-apple-darwin
-```
-
-Release generation is intentionally separate from compilation. See
-[Release process](#release-process).
-
-## Release process
-
-Generate a private signing key in protected release infrastructure. Distribute
-only its public key to installers:
-
-```sh
-ssh-keygen -t ed25519 -N '' -C muse-codex-release -f release-private
-chmod 0600 release-private
-```
-
-Create and locally verify an immutable release bundle:
-
-```sh
-export MUSE_CODEX_RELEASE_VERSION='0.1.0'
-export MUSE_CODEX_RELEASE_BASE_URL='https://private.example/releases/0.1.0'
-export MUSE_CODEX_RELEASE_SIGNING_KEY_FILE="$PWD/release-private"
-export MUSE_CODEX_RELEASE_LAUNCHER_BINARY="$PWD/target/aarch64-apple-darwin/release/muse-codex"
-export MUSE_CODEX_RELEASE_GATEWAY_BINARY="$PWD/target/aarch64-apple-darwin/release/muse-codex-gateway"
-export MUSE_CODEX_RELEASE_OUTPUT_DIR="$PWD/dist/0.1.0"
-
-./scripts/generate-release-manifest.sh
-./scripts/verify-release-manifest.sh \
-  "$MUSE_CODEX_RELEASE_OUTPUT_DIR/manifest.json" \
-  "$MUSE_CODEX_RELEASE_OUTPUT_DIR/manifest.json.sig" \
-  "$PWD/release-private.pub" \
-  "$MUSE_CODEX_RELEASE_OUTPUT_DIR"
-```
-
-Upload `muse-codex`, `muse-codex-gateway`, `manifest.json`, and
-`manifest.json.sig` without renaming them. The feed must use immutable,
-access-controlled HTTPS URLs. Never place the private signing key, OpenAI
-credentials, Meta credentials, or the stock Muse binary in `dist/`.
-
-## Known compatibility limits
-
-- Meta does not publish the Muse host source. Integration uses the supported
-  endpoint and session-protocol surfaces of the shipped executable.
-- Transport compatibility does not imply identical model behavior. Muse Spark
-  and Muse Code were co-trained; GPT behavior must be assessed separately.
-- The ChatGPT backend and pinned Codex Rust crates are private, unstable
-  interfaces. Any upstream revision requires a repin and full compatibility
-  run.
-- Web/search auxiliary routes, new response event types, and new Muse releases
-  require explicit compatibility fixtures before support is claimed.
-- Stock Muse hooks and MCP servers can execute outside its command sandbox.
-  Their existing trust model remains relevant when using this wrapper.
+Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), use the
+issue forms for scoped proposals and reproducible bugs, and keep security
+reports private.
 
 ## License and trademarks
 
-The source in this repository is licensed under the Apache License 2.0. Muse,
-Muse Code, Meta, OpenAI, ChatGPT, GPT, and Codex are trademarks of their
-respective owners. The license for this repository does not grant rights to
-redistribute third-party software.
+First-party source and project artwork are licensed under the
+[Apache License 2.0](LICENSE). See [Third-party notices](THIRD_PARTY_NOTICES.md)
+for vendored dependencies.
+
+Muse, Muse Code, Muse Spark, Meta, OpenAI, ChatGPT, GPT, and Codex are trademarks
+of their respective owners. This license does not grant rights to redistribute
+third-party software or imply endorsement by any trademark owner.

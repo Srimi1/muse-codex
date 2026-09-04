@@ -11,6 +11,11 @@ The supported Muse baseline is `1.0.3-R2198.1`. The Codex client is pinned by th
 workspace dependency graph; dependency upgrades and Muse upgrades are separate
 compatibility events.
 
+This document describes current behavior in the present tense. Statements
+labelled as release requirements or planned gates describe work that must be
+verified before a supported release; they are not claims about the current test
+suite.
+
 ## Component model
 
 ```text
@@ -39,7 +44,7 @@ The launcher owns only process and provider concerns:
 - load one explicit OpenAI authentication mode;
 - bind the gateway to an ephemeral `127.0.0.1` port;
 - mint a per-run bearer token for the Muse-to-gateway hop;
-- inject the gateway base URL, provider protocol selector, and chosen model;
+- inject the gateway base URL and the internal provider protocol selector;
 - remove provider-routing and credential environment variables that the Muse
   child must not inherit; and
 - forward signals and exit status.
@@ -47,6 +52,10 @@ The launcher owns only process and provider concerns:
 All non-provider CLI arguments pass through byte-for-byte. User-supplied
 provider or base-URL flags must be rejected or replaced deterministically; they
 cannot be permitted to bypass the gateway.
+
+The launcher does not select, inject, or rewrite a model. An explicit Muse model
+argument passes through unchanged; otherwise stock Muse selects from the model
+catalog returned by the gateway.
 
 ### Stock Muse child
 
@@ -69,15 +78,23 @@ Muse independently.
 Muse connects to the gateway using its existing endpoint transport. At minimum,
 the gateway exposes:
 
-- `GET /muse-code/models`: return a Muse-compatible model catalog backed by the
-  allowed Codex/GPT model set; and
-- `POST /responses`: map a Muse Responses request to the pinned Codex client and
-  translate the upstream event stream back to Muse.
+- `GET /muse-code/models`: fetch the authenticated upstream model catalog and
+  normalize it into Muse's catalog shape; and
+- `POST /responses`: forward a Muse Responses request through the pinned Codex
+  client and validate the upstream event stream before returning it to Muse.
 
-The translation layer preserves response IDs, item IDs, call IDs, tool names,
-JSON arguments, ordering, terminal state, usage, and typed errors. It must
-support fragmented text and function arguments. Unknown upstream event types
-are handled explicitly rather than reinterpreted as text.
+The gateway does not maintain a local model allowlist. Model availability and
+metadata originate upstream; the normalizer sorts on upstream priority, marks
+the first result as the Muse default, and omits optional limits that upstream
+does not provide instead of inventing them.
+
+For Responses requests, the gateway enforces streaming and sets `store` to
+`false`. Valid, known non-metadata SSE frames are forwarded without rewriting
+their response IDs, item IDs, call IDs, tool names, JSON arguments, or ordering.
+The validator supports fragmented text and function-argument events. It drops
+known transport metadata events and converts malformed, oversized, idle,
+interrupted, or unknown event streams into a terminal `response.failed` event
+instead of reinterpreting them as text or exposing a retryable bare EOF.
 
 The gateway does not execute model-requested tools. Muse receives the function
 call, performs its normal approval and sandbox flow, executes the tool, and
@@ -133,13 +150,14 @@ receives only the random loopback credential.
    mode before starting a session.
 2. It starts the loopback listener and waits until it is ready.
 3. It launches Muse with the loopback endpoint and ephemeral bearer token.
-4. Muse obtains the catalog and sends a Responses request.
+4. Muse obtains the upstream-derived catalog and sends a Responses request with
+   its selected model.
 5. The gateway authenticates upstream, maps the request, and streams typed
    events back with backpressure.
 6. Muse renders output or performs its ordinary tool approval/execution loop.
-7. On cancellation, the gateway cancels the upstream request and stops emitting
-   events. A call that might already have produced a tool request is never
-   replayed automatically.
+7. When Muse drops a response stream, the associated upstream stream is
+   dropped. End-to-end cancellation behavior remains a release gate; the
+   gateway does not retry a stream after exposing its response body.
 8. On child exit, the launcher stops the gateway, releases credentials from
    memory, and returns Muse's exit status.
 
@@ -149,30 +167,42 @@ Muse.
 
 ## Retry and failure rules
 
-- Authentication, authorization, quota, invalid request, and context-window
-  errors are terminal and retain their meaning.
-- A retry is allowed only before any externally observable response item or tool
-  call has been delivered to Muse.
-- Once a tool call can have been observed, an ambiguous disconnect is surfaced
-  as incomplete; the gateway must not retry and risk duplicate side effects.
+- Non-success upstream Responses statuses and bodies are forwarded through the
+  gateway's response-header allowlist. Failures raised inside catalog, search,
+  browser, or pre-stream transport handling return bounded gateway errors.
+- The current transport makes at most two pre-stream attempts for retryable send
+  failures or upstream 5xx responses and can perform upstream Codex 401
+  credential recovery. It does not retry after the response body has been
+  returned to Muse.
+- Once a stream is observable, an ambiguous disconnect becomes a terminal
+  `response.failed` event; the gateway does not retry and risk duplicate local
+  tool execution.
 - Malformed or unknown provider events fail the turn with a bounded diagnostic.
 - The launcher never falls back to a direct Meta endpoint or a different OpenAI
   billing mode.
-- Provider failure must leave Muse's append-only session recoverable.
+- A supported release must verify that provider failure leaves Muse's
+  append-only session recoverable.
 
 ## Compatibility strategy
 
-There are three test lanes:
+Current automated coverage consists of Rust unit and asynchronous fixture tests
+for routing, authentication, transport, catalog normalization, SSE validation,
+and gateway invariants, plus shell tests for release generation, verification,
+and installation. The repository also records the supported Muse schema/help
+baseline. This coverage does not yet constitute an end-to-end comparison with
+stock Muse or a live OpenAI run.
+
+A supported release requires three additional compatibility gates:
 
 1. stock Muse against a deterministic scripted endpoint;
 2. wrapped Muse against the same endpoint through the gateway; and
 3. wrapped Muse against the real OpenAI service.
 
-The first two lanes compare normalized MSP transcripts, session exports, hook
-logs, exit codes, and filesystem effects. Timestamps, random IDs, and provider
-model names are normalized; safety decisions and tool call identity are not.
-The third lane validates real authentication, streaming, cancellation, model
-catalog, usage, and error behavior.
+The planned first two gates compare normalized MSP transcripts, session exports,
+hook logs, exit codes, and filesystem effects. Timestamps, random IDs, and
+provider model names may be normalized; safety decisions and tool-call identity
+must not be. The planned live gate validates real authentication, streaming,
+cancellation, model discovery, usage, and error behavior.
 
 Feature parity means the provider-independent harness behavior is unchanged. It
 does not mean two different models produce identical prose or tool choices.
@@ -184,7 +214,8 @@ does not mean two different models produce identical prose or tool choices.
 | Muse settings, sessions, approvals, rules, and extensions | stock Muse |
 | OpenAI credentials and selected auth mode | `muse-codex` keyring namespace |
 | Ephemeral listener address and bearer token | launcher process |
-| Model mapping and protocol compatibility | gateway |
+| Model selection | stock Muse and user-supplied Muse arguments |
+| Upstream model discovery and protocol compatibility | gateway |
 | Private release URL and curl credentials | release operator/user |
 
 The launcher uses per-process flags plus a persistent, isolated stock-Muse
@@ -195,16 +226,18 @@ state.
 
 ## Upstream stability boundary
 
-The ChatGPT backend and the pinned Codex Rust crates are private, unstable
-interfaces. The initial pin is commit
-`9474e5cfc4494b0ba319352aa86ce436c59e65c8`. A repin requires the complete auth,
-transport, error, cancellation, and compatibility suite; semver compatibility
-must not be assumed.
+The ChatGPT backend is a private, evolving service interface. The Codex Rust
+crates used here are open-source and vendored from commit
+`9474e5cfc4494b0ba319352aa86ce436c59e65c8`, but their library APIs are not a
+stable compatibility contract for this project. A repin requires the complete
+auth, transport, error, cancellation, and compatibility suite; semver
+compatibility must not be assumed.
 
 ## Release boundary
 
-The release unit is the `muse-codex` launcher and `muse-codex-gateway` macOS
-arm64 executables plus a signed manifest. The manifest identifies exactly those
-two artifacts and their digests. The stock Muse binary is deliberately absent.
-`scripts/install.sh` checks for Muse as a prerequisite and installs only the
-two verified project binaries.
+The release unit contains the `muse-codex` launcher and `muse-codex-gateway`
+macOS arm64 executables, a signed manifest and signature, the project license,
+the third-party notices, and the vendored Codex notice. The manifest records
+sizes and digests for both executables and every legal payload. The stock Muse
+binary is deliberately absent. `scripts/install.sh` checks for Muse as a
+prerequisite and installs only the two verified project binaries.

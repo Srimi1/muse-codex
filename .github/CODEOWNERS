@@ -1,0 +1,9 @@
+# Default ownership
+* @Srimi1
+
+# Security-sensitive and release-critical areas
+/crates/ @Srimi1
+/scripts/ @Srimi1
+/.github/ @Srimi1
+/docs/ @Srimi1
+/vendor/openai-codex/ @Srimi1

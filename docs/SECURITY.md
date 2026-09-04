@@ -1,22 +1,48 @@
 # Security model
 
+## Status and scope
+
+This document separates controls enforced by the current code from properties
+that remain release requirements. "Enforced" means the repository contains an
+explicit implementation; focused automated coverage is identified separately.
+"Release requirement" means the property is required for a supported release
+but still needs end-to-end or operational verification.
+
+Current CI exercises Rust unit and fixture tests plus the release-tooling shell
+suite. Stock-versus-wrapped behavior and live OpenAI behavior are planned
+release gates; a green CI run does not yet prove those system-level properties.
+
+The local operating-system account is trusted to read its own processes and
+files. Root, debuggers, injected dynamic libraries, a compromised keyring, and a
+fully compromised user account are outside this threat model.
+
 ## Security contract
 
-The provider swap must not weaken Muse's existing approval, sandbox, workspace,
-or session behavior. It also introduces a stricter provider boundary:
+### Enforced controls
 
-- OpenAI credentials are visible only to `muse-codex` authentication code and
-  the local gateway.
-- The stock Muse child receives an ephemeral loopback token, never an OpenAI
-  token.
-- Prompts and model responses do not go to Meta model, authentication, or model
-  catalog endpoints during a wrapped run.
-- Authentication failures never silently change provider or billing mode.
-- A retry cannot duplicate a tool call or another externally visible action.
-- Release artifacts are accepted only after signature, platform, size, and
-  digest verification.
+- The launcher starts the gateway on `127.0.0.1` with an ephemeral port, and the
+  gateway rejects a non-loopback bind.
+- Every gateway route requires a per-process, 256-bit bearer token. Stock Muse
+  receives that loopback token rather than an OpenAI credential.
+- The launcher replaces Muse's provider endpoint with the loopback gateway and
+  removes inherited provider credentials and routing variables from both child
+  processes. The wrapper has no fallback route to a Meta model endpoint.
+- ChatGPT subscription credentials and API keys remain distinct modes. A custom
+  upstream base URL is accepted only with explicit API-key authentication.
+- The installer verifies the signed manifest and each executable's platform,
+  filename, byte length, and SHA-256 digest before installation.
 
-These are release gates, not optional hardening recommendations.
+### Release requirements
+
+- The provider swap must preserve stock Muse's approval, sandbox, workspace,
+  session, and extension behavior.
+- Retry and cancellation behavior must not cause Muse to execute an observable
+  tool call more than once.
+- Credentials and private-feed secrets must remain absent from diagnostics,
+  traces, session exports, crash reports, and future telemetry.
+- The stock-versus-wrapped fixture lanes and live OpenAI lane described in
+  [Architecture](ARCHITECTURE.md#compatibility-strategy) must pass before a
+  release is described as compatibility-verified.
 
 ## Trust boundaries
 
@@ -32,12 +58,12 @@ stock Muse process -- ephemeral bearer --> loopback gateway -- OpenAI auth --> O
 private feed -- signed manifest --> installer -- verified wrapper --> install directory
                     ^
                     |
-             out-of-band public key
+             independently supplied public key
 ```
 
-The local operating-system account is trusted to read its own processes and
-files. Root, debuggers, injected dynamic libraries, and a fully compromised user
-account are outside this threat model.
+The gateway is inside the local user's trust boundary but outside Muse's tool
+execution boundary. It authenticates provider traffic and validates transport
+framing; it does not approve or execute model-requested tools.
 
 ## Protected assets
 
@@ -45,140 +71,214 @@ account are outside this threat model.
 - OpenAI API keys
 - private-feed credentials and signed release URLs
 - prompts, repository content, tool outputs, images, and session history
-- the integrity of tool call IDs and arguments
+- the integrity of tool-call IDs and arguments
 - Muse approval decisions and sandbox configuration
-- the release signing private key
+- the release-signing private key
 
 ## Credential handling
 
-### OpenAI credentials
+### Enforced controls
 
-- Persist credentials through the upstream Codex keyring implementation only;
-  do not write a plaintext `auth.json`.
-- Use a stable canonical Muse Codex auth home, defaulting to the platform data
-  directory under `muse-codex/codex-home`. `MUSE_CODEX_HOME` may override it.
-- Namespace the keyring entry by that canonical path so it does not collide with
-  stock Codex state in `~/.codex`.
-- Remove `CODEX_ACCESS_TOKEN`, `CODEX_API_KEY`, `CODEX_HOME`,
-  `CODEX_INTERNAL_ORIGINATOR_OVERRIDE`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`,
-  `OPENAI_ORGANIZATION`, and `OPENAI_PROJECT` from inherited child
-  environments. An invocation-only `OPENAI_API_KEY`, when present, is consumed
-  once by the gateway over stdin and then cleared from launcher memory.
-- Accept API keys through bounded stdin, never a command-line value.
-- Do not put credentials in child argv, URLs, diagnostics, traces, session
-  exports, panic reports, or structured errors.
-- Redact authorization headers and token-shaped values before logging.
-- Keep subscription and API-key modes tagged; never infer one from the presence
-  of the other.
-- Reject a custom base URL for ChatGPT subscription auth. It is valid only for
-  explicitly selected API-key auth.
-- Delete only the namespaced `muse-codex` keyring entry on logout.
+- Persistent OpenAI credentials use the upstream Codex keyring implementation
+  with `Keyring` mode; this project does not persist them to `auth.json`.
+- The keyring namespace is derived from a canonical, isolated Muse Codex auth
+  home. It defaults to the platform data directory under
+  `muse-codex/codex-home`; `MUSE_CODEX_HOME` may override it subject to path,
+  ownership, and permission checks.
+- The launcher removes `CODEX_ACCESS_TOKEN`, `CODEX_API_KEY`, `CODEX_HOME`,
+  `CODEX_INTERNAL_ORIGINATOR_OVERRIDE`, `META_API_KEY`, `OPENAI_API_KEY`,
+  `OPENAI_BASE_URL`, `OPENAI_ORGANIZATION`, `OPENAI_PROJECT`, custom Muse
+  headers, and the configured OTLP endpoint from child environments.
+- An invocation-only `OPENAI_API_KEY` is copied into a bounded, zeroed-on-drop
+  buffer, delivered to the gateway through stdin, and omitted from child argv.
+  This does not claim that the operating system's original process-environment
+  storage can be securely erased.
+- Stored API keys are read from bounded stdin, trimmed, checked for emptiness and
+  whitespace, and never accepted as a command-line value.
+- Custom upstream base URLs require API-key mode, HTTPS, and no embedded user
+  information, query, or fragment. The HTTP client does not follow redirects.
+- Logout targets only the keyring record associated with the Muse Codex auth
+  home.
 
-Browser login exposes an authorization URL and normally opens a localhost
-callback listener. Device authorization exposes a verification URL and user
-code. Treat both as sensitive while the flow is pending; do not include them in
-persistent logs.
+Browser login uses the upstream Codex localhost callback flow. Device login
+prints the verification URL and user code. Those values are intentionally
+user-visible while the flow is active.
+
+### Operational requirements
+
+- Treat browser authorization URLs, device codes, API keys, and signed release
+  URLs as secrets while valid; do not paste them into issues or persistent logs.
+- If logging or telemetry is added, use field-level allowlists and tests that
+  prove authorization headers and token-shaped values are redacted.
+- Protect the operating-system account and keyring. The wrapper cannot defend
+  credentials against another process with equivalent user privileges.
 
 ### Muse child credential
 
 Each invocation receives a cryptographically random bearer token scoped to its
-loopback gateway. The token is short-lived, is not persisted, and is removed
-when the child exits. The gateway rejects a missing or mismatched token before
-reading a request body.
+gateway process. The token is written to a mode-`0600` readiness file in a
+private temporary directory, validated by the launcher, and supplied to stock
+Muse as the local endpoint credential. Gateway middleware compares it exactly
+and in constant time before dispatching a route. The launcher terminates the
+gateway and removes its temporary readiness directory during teardown.
 
 ### Private-feed credentials
 
-The installer requires exact manifest and signature URLs plus an out-of-band
-public-key file. Feed authentication belongs in a mode-`0600` curl config file
-referenced by `MUSE_CODEX_RELEASE_CURL_CONFIG`; do not place a bearer token in a
-URL or shell history. The installer supplies URLs to curl over standard input so
-they are not exposed in curl's process arguments.
+The installer accepts exact manifest and signature URLs plus a caller-supplied
+public-key file; it does not download its trust anchor. Optional feed
+authentication belongs in a regular, non-symlink, mode-`0600` curl config file
+selected by `MUSE_CODEX_RELEASE_CURL_CONFIG`. Download URLs are supplied to curl
+through standard input rather than as process arguments.
 
-The release signing private key must live only in protected release
-infrastructure. It is never accepted by or copied into the installer.
+The release-signing private key is an operational secret. It must remain in
+protected release infrastructure and is never an installer input.
 
 ## Network controls
 
-- Bind the gateway to `127.0.0.1` on an ephemeral port. Do not bind wildcard,
-  LAN, Unix-socket, or externally reachable listeners by default.
-- Authenticate every Muse-to-gateway request.
-- Send upstream requests only over HTTPS with certificate verification enabled.
-- Do not follow a redirect that downgrades HTTPS or changes to an unapproved
-  provider host.
-- Remove `META_API_KEY` and untrusted Muse provider/base-URL variables from the
-  child environment.
-- Treat proxy variables as explicit configuration because a proxy can observe
-  prompts and credentials.
-- Apply request-size, header-size, event-size, and idle-time limits.
-- Strip hop-by-hop headers before returning upstream Responses to Muse.
+### Enforced controls
 
-Provider-backed web or browser routes must use an explicitly implemented and
-tested OpenAI-compatible path. They may not fall back to Meta simply to preserve
-the appearance of feature parity.
+- Normal launches bind exactly `127.0.0.1:0`; the gateway independently rejects
+  any non-loopback listener address.
+- All gateway routes, including health and catalog discovery, pass through
+  bearer authentication.
+- Default upstream routing comes from the pinned Codex provider implementation.
+  A user-selected API-key endpoint may target any URL that passes the strict
+  HTTPS base-URL validation; there is no local upstream-host or model allowlist.
+- The upstream HTTP client uses certificate verification and disables redirects.
+- Inbound request bodies are limited to 64 MiB. Model catalogs are limited to
+  8 MiB, captured error bodies to 64 KiB, individual SSE events to 8 MiB, and
+  SSE idle periods to 120 seconds.
+- Only `accept-language` and `x-request-id` are copied from Muse to upstream
+  transport input. Authorization, cookie, proxy, host, connection, originator,
+  account, and user-agent headers are not forwarded.
+- Downstream response headers are allowlisted to content type, request ID,
+  retry metadata, and OpenAI/Codex rate-limit metadata; hop-by-hop headers are
+  not copied.
+- Search and browser-open requests have explicit Codex-compatible gateway
+  routes. Unknown routes fail locally; they do not fall back to Meta.
 
-## Tool-call integrity
+### Release requirements and known limits
 
-Tool execution remains in stock Muse. The gateway must preserve tool name,
-arguments, call ID, response ID, and event ordering exactly across translations.
-It must not repair malformed JSON heuristically.
+- The application does not currently set an explicit HTTP header-size limit;
+  dependency defaults apply. A supported release should define and test that
+  limit rather than imply one is already enforced.
+- Proxy and custom-CA behavior comes from the HTTP stack and process
+  environment. Operators must treat either as trusted configuration, and the
+  release suite must verify the intended deployment policy.
+- End-to-end traffic capture must confirm that wrapped model, authentication,
+  and catalog requests use only the loopback gateway and selected OpenAI
+  endpoint. Unit tests alone cannot establish that property for an opaque Muse
+  executable.
 
-Retries are permitted only before any response item has become observable to
-Muse. After a tool call or output item is observable, a disconnect is ambiguous
-and must terminate the attempt as incomplete. Retrying at that point could cause
-duplicate file changes or shell commands.
+## Tool-call integrity, retries, and cancellation
 
-Cancellation must close the upstream stream and suppress later events. It does
-not assert that an upstream service forgot already received prompt data.
+### Current behavior
+
+The gateway never executes tools. It forwards the Muse Responses JSON after
+forcing `store: false` and streaming mode. For successful Responses streams, it
+forwards known non-metadata SSE frames without rewriting response IDs, item IDs,
+call IDs, tool names, JSON arguments, or sequence numbers. It does not attempt
+to repair malformed JSON. Malformed, unknown, oversized, interrupted, or idle
+streams become a terminal `response.failed` event.
+
+The transport permits at most two attempts for retryable send failures or
+upstream 5xx responses before a response body is exposed, and supports the
+pinned Codex 401 credential-refresh flow. It performs no transport retry after
+the response body is returned to Muse. This prevents a locally observed tool
+call from being replayed by the gateway, but it does not claim that upstream
+compute was never attempted twice.
+
+Dropping the downstream stream tears down the associated upstream response
+stream. It does not assert that OpenAI forgot prompt data already received or
+that an upstream computation produced no side effects.
+
+### Release requirements
+
+- End-to-end fixture gates must prove byte-for-byte tool name, argument,
+  call-ID, item-ID, ordering, and terminal-state preservation across fragmented
+  streams.
+- Stock-versus-wrapped tests must prove that approval prompts and sandbox
+  decisions occur exactly once for each observable tool call.
+- Live tests must exercise cancellation before output, during text output, and
+  during fragmented function arguments without an automatic replay.
 
 ## Stock Muse safety boundary
 
-The wrapper does not reimplement or bypass Muse approval and sandbox controls.
-Security regression tests compare stock and wrapped behavior for command
-approval, writes outside the workspace, network access, resume, and export.
+Stock Muse remains the owner of tool schemas, approvals, execution, sandboxing,
+workspace trust, and sessions. The wrapper does not contain a tool executor and
+does not intentionally alter those controls. Equivalence is nevertheless a
+release requirement until the planned black-box stock-versus-wrapped tests cover
+command approval, writes outside the workspace, network access, resume, and
+export behavior.
 
-Muse hooks and MCP servers retain their native behavior. In particular, they can
-run outside portions of Muse's command sandbox and may access the network. A
-trusted provider does not make an untrusted hook, MCP server, skill, plugin, or
-repository safe. Keep workspace trust enabled and review these extensions.
+Muse hooks and MCP servers retain their native behavior. They may execute
+outside portions of Muse's command sandbox and may access the network. A trusted
+provider does not make an untrusted hook, MCP server, skill, plugin, or
+repository safe. Keep workspace trust enabled and review extensions before use.
 
 ## Release and installer security
 
-The private release manifest is signed with an Ed25519 SSHSIG key through the
-platform `ssh-keygen` implementation and contains SHA-256 artifact digests plus:
+### Enforced controls
 
-- schema and product identifiers;
-- release and minimum-tested-Muse versions;
-- the `macos_arm64` launcher and gateway filenames and immutable HTTPS URLs;
-- both exact byte lengths and SHA-256 digests; and
-- a publication timestamp.
+The release manifest is signed with an Ed25519 SSHSIG key through the platform
+`ssh-keygen` implementation. It identifies the schema, product, release and
+minimum-tested Muse versions, publication timestamp, and each required
+`macos_arm64` executable's fixed filename, HTTPS URL, byte length, and SHA-256
+digest, together with equivalent metadata for the legal payloads.
 
 `scripts/install.sh` verifies the detached manifest signature before parsing
-artifact metadata, then verifies both sizes and digests before installation. It
-refuses non-macOS-arm64 platforms, root execution, non-HTTPS URLs, malformed
-filenames, and a missing stock Muse prerequisite. Both downloaded executables
-must pass a staged self-test before installation. Installation stages both
-binaries on the destination filesystem, installs the gateway first and launcher
-last, and retains one previous copy of each for recovery.
+artifact metadata, then verifies artifact sizes and digests after download. It
+refuses non-macOS-arm64 platforms, root execution, non-HTTPS URLs, malformed or
+unexpected filenames, a missing exact-version stock Muse prerequisite, and an
+unsafe curl credential file. The staged gateway runs its self-test; the staged
+launcher must successfully report the expected stock Muse version. Installation
+stages files on the destination filesystem, installs the gateway first and the
+user-facing launcher last, and retains one previous copy of each for recovery.
 
-The signature protects metadata integrity; HTTPS and feed authorization protect
-confidentiality and availability. A public key downloaded from the same
-potentially compromised feed is not a trust anchor, which is why the installer
-requires a separately delivered key file.
+Release generation and verification reject a manifest that attempts to include
+the stock Muse binary. The release manifest also signs the repository license
+and required third-party notice payloads.
 
-The release bundle must never contain the stock Muse binary. Operators should
-inspect the generated directory before upload and retain build provenance for
-both project executables.
+### Operational requirements
+
+- Generate and use the signing key only in protected release infrastructure.
+- Deliver the public key independently from the release feed; a key fetched
+  from a compromised feed is not a trust anchor.
+- Publish immutable, access-controlled HTTPS URLs and retain build provenance.
+- Inspect the generated bundle before upload and confirm it contains no stock
+  Muse binary, signing key, provider credential, or private feed credential.
 
 ## Data flow and retention
 
-Prompts, repository excerpts, images, and tool results sent to the chosen OpenAI
-model are subject to the terms and retention policy of the selected OpenAI
-account and authentication mode. Local Muse sessions retain their ordinary
-content. `muse-codex` should avoid creating a second prompt transcript.
+Prompts, repository excerpts, images, and tool results sent to the selected
+OpenAI endpoint are subject to the terms and retention policy of the chosen
+account and authentication mode. The gateway requests `store: false`; that flag
+does not override provider security, abuse-monitoring, or legal-retention
+policies. Local Muse sessions retain their ordinary content.
 
-Private feeds and observability systems must not log authorization headers or
-signed URL query strings. Structured telemetry should be opt-in and must exclude
-prompt bodies and credentials by default.
+The isolated Muse profile has telemetry disabled, and this project does not
+currently implement a second prompt transcript or an observability pipeline. If
+either is introduced, it must be opt-in and exclude prompt bodies, authorization
+headers, signed URL query strings, and credentials by default.
+
+## Verification status
+
+The repository currently automates:
+
+- unit and async fixture coverage for argument routing, auth-home isolation,
+  catalog normalization, HTTP behavior, retry policy, SSE validation, bearer
+  checks, and readiness-file constraints;
+- release manifest generation, signature verification, tamper rejection,
+  installer staging, and previous-version retention; and
+- formatting and lint checks in CI.
+
+The following remain planned release gates:
+
+- deterministic stock Muse versus wrapped Muse transcript and filesystem
+  comparisons;
+- approval, sandbox, resume, export, and cancellation regression scenarios; and
+- live ChatGPT/API-key authentication, model discovery, streaming, usage, error,
+  search, and browser-route checks.
 
 ## Residual risks
 
@@ -186,11 +286,14 @@ prompt bodies and credentials by default.
 - Different models can make materially different tool choices even with a
   compatible transport.
 - The stock Muse binary and its updater remain third-party trusted code.
-- The ChatGPT backend and pinned Codex Rust crates are private, unstable
-  interfaces; upstream changes require a repin and full retest.
+- The ChatGPT backend is private and evolving. The vendored Codex crates are
+  open-source, but their Rust library APIs are not a stable integration contract;
+  upstream changes require a repin and full retest.
 - A malicious local process running as the same user can inspect memory or
   interfere with loopback traffic.
-- Subscription authorization behavior can change upstream.
+- Proxy or custom-CA configuration can observe provider traffic.
+- The absence of completed black-box and live release gates leaves integration
+  properties unverified.
 - Compromised release infrastructure can sign a malicious wrapper.
 
 Pin supported versions, preserve black-box fixtures, rotate signing and access
@@ -198,7 +301,13 @@ credentials, and fail closed when an invariant cannot be established.
 
 ## Reporting a vulnerability
 
+Use GitHub's [private vulnerability reporting][report-vulnerability] for
+security reports. The permanent repository is expected to enable that route; if
+it is not yet available, contact the repository owner privately rather than
+opening a public issue.
+
 Do not include live credentials, private-feed URLs, prompts, or proprietary Muse
-artifacts in a public report. Contact the repository owner through a private
-security channel and include the affected `muse-codex` version, stock Muse
-version, platform, and a redacted reproduction.
+artifacts. Include the affected `muse-codex` version, stock Muse version,
+platform, impact, and a redacted reproduction.
+
+[report-vulnerability]: https://github.com/Srimi1/muse-codex/security/advisories/new

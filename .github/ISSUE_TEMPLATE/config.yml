@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/Srimi1/muse-codex/security/advisories/new
+    about: Report vulnerabilities privately. Never post credentials or sensitive data in an issue.
+  - name: Questions and support
+    url: https://github.com/Srimi1/muse-codex/discussions
+    about: Ask setup and usage questions in GitHub Discussions.
+  - name: Support policy
+    url: https://github.com/Srimi1/muse-codex/blob/main/SUPPORT.md
+    about: Check the supported platform, version, and response expectations.

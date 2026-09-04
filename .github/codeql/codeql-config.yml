@@ -1,0 +1,6 @@
+name: Muse Codex CodeQL configuration
+
+# Analyze first-party code only. The pinned upstream snapshot is monitored in
+# its source project and would otherwise dominate this repository's results.
+paths:
+  - crates

@@ -6,3 +6,19 @@
 /dist/
 /release/
 
+# Local configuration and credentials
+/.env
+/.env.*
+!/.env.example
+/*.curlrc
+/release-private
+/release-private.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# IDE and local tooling state
+/.idea/
+/.vscode/
+.direnv/

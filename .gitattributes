@@ -1,0 +1,15 @@
+* text=auto
+
+*.rs text eol=lf
+*.sh text eol=lf
+*.toml text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+*.png binary
+
+# Keep the repository language breakdown focused on first-party code.
+vendor/openai-codex/** linguist-vendored=true
+
+# Recorded protocol data is test input, not generated project source.
+crates/codex-transport/tests/fixtures/** linguist-generated=true

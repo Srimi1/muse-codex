@@ -51,10 +51,39 @@ MUSE_CODEX_RELEASE_PUBLISHED_AT=2026-09-04T00:00:00Z \
 json_get() {
   plutil -extract "$1" raw -o - -- "$work_dir/release/manifest.json"
 }
-[ "$(json_get artifacts.macos_arm64.launcher.filename)" = muse-codex ] || \
-  fail "launcher artifact is missing"
-[ "$(json_get artifacts.macos_arm64.gateway.filename)" = muse-codex-gateway ] || \
-  fail "gateway artifact is missing"
+assert_manifest_file() {
+  field=$1
+  expected_name=$2
+  expected_source=$3
+  [ "$(json_get "$field.filename")" = "$expected_name" ] || \
+    fail "$expected_name manifest entry is missing"
+  expected_size=$(wc -c <"$expected_source" | tr -d '[:space:]')
+  [ "$(json_get "$field.size")" = "$expected_size" ] || \
+    fail "$expected_name manifest size is incorrect"
+  expected_sha=$(shasum -a 256 "$expected_source" | awk '{print $1}')
+  [ "$(json_get "$field.sha256")" = "$expected_sha" ] || \
+    fail "$expected_name manifest digest is incorrect"
+  [ "$(json_get "$field.url")" = \
+    "https://release.example.test/muse-codex/0.1.0/$expected_name" ] || \
+    fail "$expected_name manifest URL is incorrect"
+}
+
+assert_manifest_file artifacts.macos_arm64.launcher muse-codex "$launcher_source"
+assert_manifest_file artifacts.macos_arm64.gateway muse-codex-gateway "$gateway_source"
+assert_manifest_file legal.license LICENSE "$repo_dir/LICENSE"
+assert_manifest_file legal.third_party_notices THIRD_PARTY_NOTICES.md \
+  "$repo_dir/THIRD_PARTY_NOTICES.md"
+assert_manifest_file legal.openai_codex_notice NOTICE \
+  "$repo_dir/vendor/openai-codex/NOTICE"
+
+cmp "$repo_dir/LICENSE" "$work_dir/release/LICENSE" >/dev/null || \
+  fail "release bundle LICENSE differs from the repository source"
+cmp "$repo_dir/THIRD_PARTY_NOTICES.md" \
+  "$work_dir/release/THIRD_PARTY_NOTICES.md" >/dev/null || \
+  fail "release bundle THIRD_PARTY_NOTICES.md differs from the repository source"
+cmp "$repo_dir/vendor/openai-codex/NOTICE" \
+  "$work_dir/release/NOTICE" >/dev/null || \
+  fail "release bundle NOTICE differs from the vendored OpenAI Codex source"
 if grep -E 'muse-bin-|"filename"[[:space:]]*:[[:space:]]*"muse"' \
   "$work_dir/release/manifest.json" >/dev/null; then
   fail "release manifest contains a stock Muse artifact"
@@ -70,8 +99,11 @@ if "$repo_dir/scripts/verify-release-manifest.sh" \
 fi
 
 mkdir "$work_dir/tampered-bundle"
-cp "$work_dir/release/muse-codex" "$work_dir/tampered-bundle/muse-codex"
-cp "$work_dir/release/muse-codex-gateway" "$work_dir/tampered-bundle/muse-codex-gateway"
+for bundled_file in \
+  muse-codex muse-codex-gateway LICENSE THIRD_PARTY_NOTICES.md NOTICE
+do
+  cp "$work_dir/release/$bundled_file" "$work_dir/tampered-bundle/$bundled_file"
+done
 printf 'tamper' >>"$work_dir/tampered-bundle/muse-codex-gateway"
 if "$repo_dir/scripts/verify-release-manifest.sh" \
   "$work_dir/release/manifest.json" \
@@ -79,6 +111,37 @@ if "$repo_dir/scripts/verify-release-manifest.sh" \
   "$work_dir/release-private.pub" \
   "$work_dir/tampered-bundle" >/dev/null 2>&1; then
   fail "tampered gateway passed artifact verification"
+fi
+
+mkdir "$work_dir/tampered-legal-bundle"
+for bundled_file in \
+  muse-codex muse-codex-gateway LICENSE THIRD_PARTY_NOTICES.md NOTICE
+do
+  cp "$work_dir/release/$bundled_file" \
+    "$work_dir/tampered-legal-bundle/$bundled_file"
+done
+printf 'tamper' >>"$work_dir/tampered-legal-bundle/NOTICE"
+if "$repo_dir/scripts/verify-release-manifest.sh" \
+  "$work_dir/release/manifest.json" \
+  "$work_dir/release/manifest.json.sig" \
+  "$work_dir/release-private.pub" \
+  "$work_dir/tampered-legal-bundle" >/dev/null 2>&1; then
+  fail "tampered legal notice passed bundle verification"
+fi
+
+mkdir "$work_dir/incomplete-legal-bundle"
+for bundled_file in \
+  muse-codex muse-codex-gateway LICENSE THIRD_PARTY_NOTICES.md
+do
+  cp "$work_dir/release/$bundled_file" \
+    "$work_dir/incomplete-legal-bundle/$bundled_file"
+done
+if "$repo_dir/scripts/verify-release-manifest.sh" \
+  "$work_dir/release/manifest.json" \
+  "$work_dir/release/manifest.json.sig" \
+  "$work_dir/release-private.pub" \
+  "$work_dir/incomplete-legal-bundle" >/dev/null 2>&1; then
+  fail "incomplete legal payload passed bundle verification"
 fi
 
 # The installer is exercised without network access. The curl shim reads the
