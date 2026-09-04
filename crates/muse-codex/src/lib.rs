@@ -756,17 +756,29 @@ struct GatewayProcess {
     ready: GatewayReady,
 }
 
+fn create_gateway_temporary_directory() -> Result<TempDir> {
+    let mut builder = TempBuilder::new();
+    builder.prefix("muse-codex-gateway-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o700));
+    }
+
+    let temporary_directory = builder
+        .tempdir()
+        .context("failed to create gateway readiness directory")?;
+    create_private_dir(temporary_directory.path())?;
+    Ok(temporary_directory)
+}
+
 impl GatewayProcess {
     fn start(
         executable: &Path,
         upstream_base_url: Option<&OsStr>,
         api_key: Option<&SecretInput>,
     ) -> Result<Self> {
-        let temporary_directory = TempBuilder::new()
-            .prefix("muse-codex-gateway-")
-            .tempdir()
-            .context("failed to create gateway readiness directory")?;
-        create_private_dir(temporary_directory.path())?;
+        let temporary_directory = create_gateway_temporary_directory()?;
         let ready_file = temporary_directory.path().join("ready.json");
 
         let mut command = Command::new(executable);
@@ -1486,6 +1498,22 @@ mod tests {
         assert_eq!(
             fs::metadata(&permissive).unwrap().permissions().mode() & 0o777,
             0o755
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gateway_readiness_directory_is_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary_directory = create_gateway_temporary_directory().unwrap();
+        assert_eq!(
+            fs::metadata(temporary_directory.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
         );
     }
 
