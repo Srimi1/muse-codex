@@ -41,6 +41,7 @@ const MAX_MODELS_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_PRESTREAM_ATTEMPTS: usize = 2;
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(2);
+const CREDENTIAL_REFRESH_LOCK_NAME: &str = ".credential-refresh.lock";
 const MUSE_CODEX_USER_AGENT: &str = concat!("muse-codex/", env!("CARGO_PKG_VERSION"));
 static BROWSER_OPEN_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -408,11 +409,11 @@ impl Transport {
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<reqwest::Response>>,
     {
-        let lock_path = self
+        let lock_home = self
             .auth_manager
             .as_ref()
-            .map(|_| self.config.home().join(".credential-refresh.lock"));
-        execute_with_401_recovery(send, self.recovery(), lock_path).await
+            .map(|_| self.config.home().to_path_buf());
+        execute_with_401_recovery(send, self.recovery(), lock_home).await
     }
 }
 
@@ -553,7 +554,7 @@ impl ResponseStatus for reqwest::Response {
 async fn execute_with_401_recovery<T, F, Fut>(
     mut send: F,
     mut recovery: Option<Box<dyn Recovery>>,
-    refresh_lock_path: Option<PathBuf>,
+    refresh_lock_home: Option<PathBuf>,
 ) -> Result<T>
 where
     T: ResponseStatus,
@@ -598,9 +599,9 @@ where
         }
         drop(response);
         if refresh_lock.is_none()
-            && let Some(path) = refresh_lock_path.clone()
+            && let Some(home) = refresh_lock_home.clone()
         {
-            refresh_lock = Some(acquire_credential_refresh_lock(path).await?);
+            refresh_lock = Some(acquire_credential_refresh_lock(home).await?);
         }
         recovery.next().await?;
     }
@@ -624,13 +625,32 @@ impl Drop for CredentialRefreshLock {
     }
 }
 
-async fn acquire_credential_refresh_lock(path: PathBuf) -> Result<CredentialRefreshLock> {
-    tokio::task::spawn_blocking(move || acquire_credential_refresh_lock_blocking(path))
+async fn acquire_credential_refresh_lock(home: PathBuf) -> Result<CredentialRefreshLock> {
+    tokio::task::spawn_blocking(move || acquire_credential_refresh_lock_blocking(home))
         .await
         .map_err(|error| Error::CredentialRefreshLock(error.to_string()))?
 }
 
-fn acquire_credential_refresh_lock_blocking(path: PathBuf) -> Result<CredentialRefreshLock> {
+fn acquire_credential_refresh_lock_blocking(home: PathBuf) -> Result<CredentialRefreshLock> {
+    // AuthConfig stores a canonical home. Resolve it again immediately before
+    // the open so a post-validation rename or symlink replacement fails closed.
+    let canonical_home = std::fs::canonicalize(&home).map_err(|error| {
+        Error::CredentialRefreshLock(format!("could not canonicalize private home: {error}"))
+    })?;
+    if canonical_home != home {
+        return Err(Error::CredentialRefreshLock(
+            "private home changed after validation".to_string(),
+        ));
+    }
+    // The filename is internal and constant. Keep the containment check next to
+    // construction so both reviewers and static analysis can verify the sink.
+    let path = canonical_home.join(CREDENTIAL_REFRESH_LOCK_NAME);
+    if !path.starts_with(&canonical_home) {
+        return Err(Error::CredentialRefreshLock(
+            "private lock path escaped its validated home".to_string(),
+        ));
+    }
+
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
     #[cfg(unix)]
@@ -925,7 +945,8 @@ mod tests {
     #[tokio::test]
     async fn unauthorized_reload_and_refresh_share_a_private_process_lock() {
         let directory = tempfile::tempdir().unwrap();
-        let lock_path = directory.path().join("credential-refresh.lock");
+        let lock_home = std::fs::canonicalize(directory.path()).unwrap();
+        let lock_path = lock_home.join(CREDENTIAL_REFRESH_LOCK_NAME);
         let calls = Arc::new(AtomicUsize::new(0));
         let recovery_calls = Arc::new(AtomicUsize::new(0));
         let mut responses = VecDeque::from([
@@ -952,7 +973,7 @@ mod tests {
                 remaining: 2,
                 calls: Arc::clone(&recovery_calls),
             })),
-            Some(lock_path.clone()),
+            Some(lock_home),
         )
         .await
         .unwrap();
@@ -968,6 +989,27 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_refresh_lock_rejects_a_replaced_home() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("muse-codex");
+        let replacement = root.path().join("replacement");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        let canonical_home = std::fs::canonicalize(&home).unwrap();
+        std::fs::rename(&home, root.path().join("original")).unwrap();
+        symlink(&replacement, &home).unwrap();
+
+        let error = acquire_credential_refresh_lock_blocking(canonical_home)
+            .err()
+            .expect("a replaced home must be rejected");
+        assert!(matches!(error, Error::CredentialRefreshLock(_)));
+        assert!(!replacement.join(CREDENTIAL_REFRESH_LOCK_NAME).exists());
     }
 
     #[tokio::test]
