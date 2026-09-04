@@ -18,6 +18,6 @@ All notable project changes will be documented here. The format follows
 
 - Per-invocation loopback bearer tokens and provider credential scrubbing.
 - Size, digest, signature, platform, and filename checks for release artifacts.
-- Security-fixed OpenSSL, Quinn, serde_with, and gix dependency families.
+- Security-fixed OpenSSL, Quinn, serde_with, gix, and rand dependency families.
 
 [Unreleased]: https://github.com/Srimi1/muse-codex/commits/main
