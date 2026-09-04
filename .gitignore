@@ -1,0 +1,8 @@
+/target/
+/.DS_Store
+*.swp
+*.tmp
+*.log
+/dist/
+/release/
+

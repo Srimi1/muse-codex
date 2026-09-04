@@ -1,0 +1,7 @@
+{
+  "object": "list",
+  "data": [
+    { "id": "gpt-api-fixture-1", "object": "model", "created": 1, "owned_by": "openai" },
+    { "id": "gpt-api-fixture-2", "object": "model", "created": 2, "owned_by": "openai" }
+  ]
+}

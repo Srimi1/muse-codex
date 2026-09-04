@@ -1,0 +1,30 @@
+[package]
+name = "codex-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+async-trait = "0.1.89"
+bytes = "1.10.1"
+codex-client = { path = "../../vendor/openai-codex/codex-rs/codex-client" }
+codex-login = { path = "../../vendor/openai-codex/codex-rs/login" }
+codex-model-provider-info = { path = "../../vendor/openai-codex/codex-rs/model-provider-info" }
+dirs = "6"
+futures = "0.3"
+http = "1"
+libc = "0.2"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+secrecy = "0.10.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2.0.17"
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread"] }

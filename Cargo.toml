@@ -1,0 +1,26 @@
+[workspace]
+members = [
+    "crates/codex-transport",
+    "crates/muse-codex",
+    "crates/muse-codex-gateway",
+]
+exclude = ["vendor/openai-codex/codex-rs"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/Srimi1/muse--codex"
+rust-version = "1.93"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# Required by the pinned Codex rust-v0.133.0 dependency graph. These are the
+# exact revisions recorded by that upstream release.
+[patch.crates-io]
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "132f5b39c862e3a970f731d709608b3e6276d5f6" }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "9200079d3b54a1ff51072e24d81fd354f085156f" }

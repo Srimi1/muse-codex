@@ -1,0 +1,28 @@
+{
+  "models": [
+    {
+      "slug": "gpt-fixture-old",
+      "display_name": "GPT Fixture Old",
+      "description": "Fallback fixture",
+      "context_window": 128000,
+      "supported_reasoning_levels": [
+        { "effort": "medium", "description": "Balanced" }
+      ],
+      "default_reasoning_level": "medium",
+      "priority": 20
+    },
+    {
+      "slug": "gpt-fixture-new",
+      "display_name": "GPT Fixture New",
+      "description": "Default fixture",
+      "context_window": 200000,
+      "supported_reasoning_levels": [
+        { "effort": "low", "description": "Fast" },
+        { "effort": "high", "description": "Deep" }
+      ],
+      "default_reasoning_level": "high",
+      "priority": 10
+    }
+  ]
+}
+
