@@ -62,8 +62,9 @@ vendored Codex tree preserves its upstream formatting.
 
 ## Vendored source
 
-`vendor/openai-codex` is an immutable snapshot of the upstream OpenAI Codex
-repository. Avoid editing it directly. A vendor update must:
+`vendor/openai-codex` is a versioned snapshot of the upstream OpenAI Codex
+repository plus explicitly recorded downstream patches. Avoid editing it
+directly. A vendor or dependency-constraint update must:
 
 1. name an exact upstream commit and tag;
 2. update `vendor/openai-codex/MUSE_CODEX_VENDOR.md` and `PATCHES.md`;
