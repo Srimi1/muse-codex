@@ -713,6 +713,54 @@ mod tests {
         assert_eq!(output, original);
     }
 
+    /// Every event kind `codex_transport`'s Z.ai synthesizer can emit. It
+    /// mirrors `EMITTED_EVENT_KINDS` in that crate; both lists must stay in
+    /// sync, and this test is what fails if the gateway allowlist drifts.
+    const ZAI_SYNTHESIZED_EVENT_KINDS: &[&str] = &[
+        "error",
+        "response.created",
+        "response.in_progress",
+        "response.completed",
+        "response.incomplete",
+        "response.output_item.added",
+        "response.output_item.done",
+        "response.content_part.added",
+        "response.content_part.done",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.reasoning_summary_part.added",
+        "response.reasoning_summary_part.done",
+        "response.reasoning_summary_text.delta",
+        "response.reasoning_summary_text.done",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.custom_tool_call_input.delta",
+        "response.custom_tool_call_input.done",
+    ];
+
+    #[test]
+    fn every_zai_synthesized_event_kind_is_accepted_here() {
+        for kind in ZAI_SYNTHESIZED_EVENT_KINDS {
+            assert!(is_known_event(kind), "{kind} is not in the allowlist");
+        }
+    }
+
+    /// The Z.ai backend hands this validator a stream it synthesized rather
+    /// than one an upstream produced, so the two contracts have to agree
+    /// byte for byte.
+    #[tokio::test]
+    async fn a_synthesized_zai_stream_passes_through_unchanged() {
+        let golden =
+            include_bytes!("../../codex-transport/tests/fixtures/zai-responses.sse").as_slice();
+        // Odd chunk boundaries also exercise the frame reassembly path.
+        let chunks = golden
+            .chunks(3)
+            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+            .collect();
+        let output = collect(validated_stream(body(chunks))).await;
+        assert_eq!(output, golden);
+    }
+
     #[tokio::test]
     async fn interleaved_reasoning_text_and_parallel_tools_are_preserved() {
         let frames = [

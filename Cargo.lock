@@ -1347,6 +1347,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "codex-http-client",
+ "codex-keyring-store",
  "codex-login",
  "codex-model-provider-info",
  "codex-protocol",

@@ -175,11 +175,20 @@ billing paths. The controller supports:
 | `auth status` | Report the isolated saved credential mode without starting Muse |
 | `exec --api-key-stdin` | Use a bounded invocation-only key through the private pipe |
 
+| `auth set --provider zai --api-key-stdin` | Store a Z.ai key in its own keyring record |
+
 Credentials use the upstream Codex keyring store, never a plaintext
 `auth.json`. The default isolated Codex auth home is the platform data directory
 under `muse-codex/codex-home`, overridable with `MUSE_CODEX_HOME`. Its canonical
 path determines a stable, namespaced keyring account so it does not collide with
 `~/.codex`.
+
+Z.ai credentials live in a separate record: service `Muse Codex Z.ai`, account
+`zai|<first 16 hex of sha256 of the canonical isolated home>`. Both the service
+and the account prefix differ from the upstream Codex record (`Codex Auth` and
+`cli|<digest>`), so neither a service nor a digest collision can let one
+provider's credential satisfy the other. Deriving the account from the same home
+keeps separate `MUSE_CODEX_HOME` profiles isolated from each other as well.
 
 Before constructing auth or transport, the process removes `CODEX_ACCESS_TOKEN`,
 `CODEX_API_KEY`, `CODEX_HOME`, `CODEX_INTERNAL_ORIGINATOR_OVERRIDE`,
@@ -192,7 +201,38 @@ requested.
 A custom OpenAI base URL is valid only for API-key authentication. Subscription
 authorization is tied to the approved ChatGPT backend and rejects a custom base
 URL. The OpenAI credential is consumed by the gateway only; the Muse child
-receives only the random loopback credential.
+receives only the random loopback credential. The Z.ai provider is always
+API-key authenticated, so its base URL override is unconditional but still
+HTTPS-only with no credentials, query, or fragment.
+
+## Provider backends
+
+`codex-transport` owns both upstreams behind a `Backend` enum that the gateway
+holds in place of a bare `Transport`. It is an enum rather than a trait object
+so adding a route or a provider forces an explicit decision for every
+combination; a defaulted trait method is exactly the shape that produces a
+silent fallback between providers. Exactly one provider is selected per gateway
+process, named on the `serve` command line, and echoed in the private readiness
+file so the launcher can refuse a gateway that served a different upstream than
+it asked for.
+
+The Z.ai backend lives in `codex-transport::zai`. Z.ai speaks OpenAI
+chat-completions rather than the Responses API, so that module translates a Muse
+Responses request into a Z.ai chat request and synthesizes a Responses event
+stream back. The synthesized stream is then piped through the same SSE validator
+every upstream stream passes, so a synthesizer bug degrades to a terminal
+`response.failed` rather than corrupt output reaching Muse.
+
+Z.ai publishes no model-listing endpoint, so its catalog is pinned in the source
+rather than fetched. At startup the backend calls Z.ai's plan-usage endpoint,
+which confirms the credential and an active plan without spending a coding
+prompt; the usage figures it returns are never parsed, logged, or written to the
+readiness file.
+
+`codex-transport` is now the shared home for both providers as well as the
+vocabulary types (`Error`, `RawBody`, `RawResponse`, `ModelInfo`) the gateway
+depends on. If a third provider is added, extract those types into a neutral
+crate rather than growing this one further.
 
 ## Command routing
 
@@ -205,8 +245,11 @@ receives only the random loopback credential.
 | auth help or invalid auth forms | launcher | Show Codex auth help or a usage error without touching Meta auth |
 | local commands and help/version | stock Muse parser | Run offline in the isolated profile; provider help labels describe Codex |
 | `muse-codex [--fast] [Muse arguments]` | launcher then stock Muse | Start gateway and pass through; optionally request Fast for the whole process |
-| provider other than `codex` | launcher | Reject; `meta` is internal only |
-| base-URL override | launcher/gateway | Treat as API-key-only upstream; Muse still receives loopback |
+| `muse-codex --provider zai [Muse arguments]` | launcher then stock Muse | Start the Z.ai-backed gateway and pass through |
+| provider other than `codex` or `zai` | launcher | Reject; `meta` is internal only |
+| two different `--provider` values | launcher | Reject as ambiguous rather than taking the last one |
+| `--fast` with `--provider zai` | launcher, then gateway | Reject; GLM has no service tier |
+| base-URL override | launcher/gateway | API-key-only under `codex`, unconditional under `zai`; Muse still receives loopback |
 
 ## Turn lifecycle
 

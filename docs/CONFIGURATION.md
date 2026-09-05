@@ -10,7 +10,13 @@ isolated local profile, loopback-only networking, and explicit authentication.
 | ChatGPT browser | `muse-codex login` | Isolated Codex keyring namespace; ChatGPT account entitlement |
 | ChatGPT device | `muse-codex login --device-auth` | Same namespace; device authorization flow |
 | OpenAI API key | `muse-codex auth set --provider codex --api-key-stdin` | Keyring; OpenAI API billing |
-| Invocation-only API key | Set `OPENAI_API_KEY` for one launch | Sent to the gateway over stdin and removed from the Muse child environment |
+| Z.ai API key | `muse-codex auth set --provider zai --api-key-stdin` | Separate keyring record; Z.ai GLM Coding Plan |
+| Invocation-only API key | Set `OPENAI_API_KEY` (or `ZAI_API_KEY`) for one launch | Sent to the gateway over stdin and removed from the Muse child environment |
+
+Each provider owns a distinct keyring record, so `logout` removes only the
+record for the provider named on the command line and never both. Z.ai issues
+static keys and has no interactive sign-in, so `muse-codex login --provider zai`
+is rejected rather than silently treated as `auth set`.
 
 Use `muse-codex logout` to remove only the Muse Codex credential entry. The
 project does not read or delete stock Codex or Muse credentials.
@@ -29,6 +35,9 @@ arguments are handled by Muse Codex itself.
 | `MUSE_CODEX_GATEWAY_READY_TIMEOUT_MS` | Override gateway startup timeout | Positive integer milliseconds; invalid or zero values use the default |
 | `OPENAI_API_KEY` | Supply an invocation-only API key | Consumed by the gateway path and removed from the Muse child environment |
 | `OPENAI_BASE_URL` | Override the upstream OpenAI-compatible endpoint | Allowed only with explicit API-key authentication and must use HTTPS |
+| `ZAI_API_KEY` | Supply an invocation-only Z.ai key | Used only with `--provider zai`; consumed by the gateway and removed from the Muse child |
+| `ZAI_BASE_URL` | Override the Z.ai endpoint | Must use HTTPS; use `https://open.bigmodel.cn/api/coding/paas/v4` for the China plan |
+| `MUSE_CODEX_ZAI_SKIP_PROBE` | Skip the Z.ai startup plan check | Set to `1`; a bad key then surfaces on the first turn instead of at startup |
 
 The default state directory on macOS is:
 
@@ -39,15 +48,30 @@ The default state directory on macOS is:
 It is created with private permissions and contains isolated stock-Muse config
 and data directories. It is not stock Muse's normal profile.
 
+Each provider gets its own stock-Muse profile inside that directory
+(`stock-config`/`stock-data` for `codex`, `stock-config-zai`/`stock-data-zai`
+for `zai`). Muse's normalized catalog cache is keyed only by its internal
+provider name, so a shared profile would let one upstream overwrite the other's
+catalog and interleave their session histories.
+
 ## Command-line routing
 
-- Omitting `--provider` selects the Muse Codex route.
-- `--provider codex` is accepted and removed before Muse is started.
+- Omitting `--provider` selects `codex`.
+- `--provider codex` and `--provider zai` are accepted and removed before Muse
+  is started. Naming two different providers in one invocation is rejected
+  rather than resolved last-flag-wins.
 - Other provider values, including `meta` and `echo`, are rejected at the public
   wrapper boundary.
-- `--base-url HTTPS_URL` is an API-key-only upstream override. Muse still sees
-  the private loopback URL.
-- `--fast` requests OpenAI Fast mode for every model turn in that process.
+- `--base-url HTTPS_URL` overrides the upstream endpoint. Under `codex` it is
+  API-key-only; under `zai` it is always available because that provider is
+  always API-key authenticated. Muse still sees the private loopback URL.
+- `--fast` requests OpenAI Fast mode for every model turn in that process. It is
+  rejected with `--provider zai`: the GLM Coding Plan has no service tier, and
+  accepting a billing-affecting flag that cannot be honored would misreport what
+  the user bought.
+- Under `--provider zai` the `/muse-code/search` and `/muse-code/browser_open`
+  routes answer `501`, because Z.ai offers no equivalent and an empty success
+  would let the model reason from a false premise.
 - Other arguments pass through to the stock Muse parser.
 
 Use `muse-codex exec --json "prompt"` for headless JSONL output and
@@ -122,7 +146,19 @@ OPENAI_API_KEY
 OPENAI_BASE_URL
 OPENAI_ORGANIZATION
 OPENAI_PROJECT
+ZAI_API_KEY
+Z_AI_API_KEY
+ZHIPUAI_API_KEY
+ZAI_BASE_URL
+ANTHROPIC_API_KEY
+ANTHROPIC_AUTH_TOKEN
+ANTHROPIC_BASE_URL
 ```
+
+The `ANTHROPIC_*` names are on this list because the Z.ai GLM Coding Plan is
+commonly wired into other agents through `ANTHROPIC_BASE_URL` and
+`ANTHROPIC_AUTH_TOKEN`. A developer's shell therefore often holds a live Z.ai
+credential under those names, and it must not reach the tool-executing child.
 
 The launcher later sets a new `META_API_KEY` containing only the random,
 short-lived credential for the local Muse-to-gateway hop.

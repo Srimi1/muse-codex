@@ -1,0 +1,6 @@
+data: {"id":"20260905fixture02","model":"glm-5.3","choices":[{"index":0,"delta":{"content":"partial"}}]}
+
+data: {"id":"20260905fixture02","model":"glm-5.3","choices":[{"index":0,"delta":{},"finish_reason":"length"}],"usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13}}
+
+data: [DONE]
+

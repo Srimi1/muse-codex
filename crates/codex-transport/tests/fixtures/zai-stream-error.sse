@@ -1,0 +1,4 @@
+data: {"id":"20260905fixture03","model":"glm-5.3","choices":[{"index":0,"delta":{"content":"start"}}]}
+
+data: {"error":{"code":"1113","message":"Insufficient balance for account 42"}}
+

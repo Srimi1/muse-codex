@@ -650,7 +650,7 @@ fn request_contains_image(body: &Value) -> bool {
         })
 }
 
-fn build_http_client() -> Result<reqwest::Client> {
+pub(crate) fn build_http_client() -> Result<reqwest::Client> {
     let builder = reqwest::Client::builder()
         .default_headers(codex_login::default_client::default_headers())
         .connect_timeout(Duration::from_secs(15))
@@ -1403,7 +1403,7 @@ fn validate_optional_positive_integer(object: &Map<String, Value>, field: &str) 
     Ok(())
 }
 
-fn validate_base_url(url: &Url) -> Result<()> {
+pub(crate) fn validate_base_url(url: &Url) -> Result<()> {
     let secure_scheme = url.scheme() == "https";
     #[cfg(test)]
     let secure_scheme = secure_scheme
