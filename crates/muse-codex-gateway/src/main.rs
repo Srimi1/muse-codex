@@ -69,10 +69,83 @@ enum AuthCommand {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve(args) => serve(args).await,
+        Command::Serve(args) => serve_with_error_reporting(args).await,
         Command::Auth(args) => auth(args).await,
         Command::SelfTest => self_test(),
     }
+}
+
+async fn serve_with_error_reporting(args: ServeArgs) -> Result<()> {
+    let ready_file = args.ready_file.clone();
+    match serve(args).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let code = classify_startup_error(&error);
+            let _ = server::write_startup_error_file(&ready_file, code);
+            Err(error)
+        }
+    }
+}
+
+fn classify_startup_error(error: &anyhow::Error) -> server::StartupErrorCode {
+    use codex_transport::Error as TransportError;
+    use server::StartupErrorCode;
+
+    if error
+        .chain()
+        .any(|cause| cause.is::<tokio::time::error::Elapsed>())
+    {
+        return StartupErrorCode::CatalogTimeout;
+    }
+
+    for cause in error.chain() {
+        let Some(error) = cause.downcast_ref::<TransportError>() else {
+            continue;
+        };
+        return match error {
+            TransportError::NotAuthenticated => StartupErrorCode::AuthenticationRequired,
+            TransportError::Authentication(_)
+            | TransportError::UnsupportedAuthMode
+            | TransportError::EmptyApiKey
+            | TransportError::ApiKeyTooLong(_)
+            | TransportError::ApiKeyNotUtf8
+            | TransportError::ApiKeyContainsWhitespace
+            | TransportError::ApiKeyContainsControlCharacters => {
+                StartupErrorCode::AuthenticationFailed
+            }
+            TransportError::CustomBaseUrlRequiresApiKey => {
+                StartupErrorCode::CustomBaseUrlRequiresApiKey
+            }
+            TransportError::InvalidBaseUrl => StartupErrorCode::InvalidBaseUrl,
+            TransportError::DataDirectoryUnavailable
+            | TransportError::InvalidAuthHome(_)
+            | TransportError::CredentialRefreshLock(_)
+            | TransportError::Io(_) => StartupErrorCode::CredentialStoreUnavailable,
+            TransportError::Upstream { status, .. }
+                if *status == http::StatusCode::UNAUTHORIZED
+                    || *status == http::StatusCode::FORBIDDEN =>
+            {
+                StartupErrorCode::AuthenticationFailed
+            }
+            TransportError::Upstream { status, .. }
+                if *status == http::StatusCode::TOO_MANY_REQUESTS =>
+            {
+                StartupErrorCode::CatalogRateLimited
+            }
+            TransportError::Upstream { status, .. } if status.is_client_error() => {
+                StartupErrorCode::CatalogRejected
+            }
+            TransportError::Upstream { .. } | TransportError::Http(_) => {
+                StartupErrorCode::NetworkUnavailable
+            }
+            TransportError::InvalidUpstreamResponse(_) => StartupErrorCode::CatalogInvalid,
+            TransportError::InvalidRequest(_)
+            | TransportError::InvalidHeader(_)
+            | TransportError::Provider(_)
+            | TransportError::HttpClient(_) => StartupErrorCode::GatewayStartFailed,
+        };
+    }
+    server::StartupErrorCode::GatewayStartFailed
 }
 
 async fn serve(args: ServeArgs) -> Result<()> {
@@ -82,6 +155,12 @@ async fn serve(args: ServeArgs) -> Result<()> {
     if args.parent_pid == 0 {
         bail!("--parent-pid must be a live process id");
     }
+
+    // This OS thread deliberately starts before stdin, Keychain, or network
+    // access. If the launcher disappears while any of those operations is
+    // blocked, it terminates the gateway process rather than waiting for the
+    // async runtime (or a blocking credential task) to unwind.
+    server::start_parent_exit_watchdog(args.parent_pid, args.ready_file.clone())?;
 
     let invocation_key = if args.api_key_stdin {
         Some(read_secret_line(&mut io::stdin().lock())?)
@@ -161,14 +240,19 @@ fn read_secret_line(reader: &mut dyn io::BufRead) -> Result<SecretString> {
         bail!("API key stdin exceeds {MAX_API_KEY_BYTES} bytes");
     }
     let value = String::from_utf8(bytes).context("API key stdin is not UTF-8")?;
-    let value = value.trim().to_owned();
+    // A terminal contributes line endings, but silently trimming any other
+    // character could turn an accidental paste into a different credential.
+    let value = value.trim_end_matches(['\r', '\n']);
     if value.is_empty() {
         bail!("API key stdin was empty");
     }
     if value.chars().any(char::is_whitespace) {
         bail!("API key stdin contains whitespace");
     }
-    Ok(SecretString::from(value))
+    if value.chars().any(char::is_control) {
+        bail!("API key stdin contains control characters");
+    }
+    Ok(SecretString::from(value.to_owned()))
 }
 
 fn self_test() -> Result<()> {
@@ -185,21 +269,71 @@ fn self_test() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::time::Duration;
 
     use secrecy::ExposeSecret;
 
     use super::*;
 
     #[test]
-    fn secret_input_is_trimmed_but_not_logged() {
+    fn secret_input_strips_only_terminal_line_endings() {
         let mut input = Cursor::new(b"sk-test-secret\r\n");
         let secret = read_secret_line(&mut input).unwrap();
         assert_eq!(secret.expose_secret(), "sk-test-secret");
+
+        for bytes in [
+            b" sk-test-secret\n".as_slice(),
+            b"sk-test-secret \n".as_slice(),
+            b"sk-test\tsecret\n".as_slice(),
+            b"sk-test\0secret\n".as_slice(),
+        ] {
+            assert!(read_secret_line(&mut Cursor::new(bytes)).is_err());
+        }
     }
 
     #[test]
     fn empty_secret_is_rejected() {
         let mut input = Cursor::new(b"\n");
         assert!(read_secret_line(&mut input).is_err());
+    }
+
+    #[test]
+    fn startup_errors_are_classified_without_exposing_details() {
+        use codex_transport::Error as TransportError;
+
+        let error = anyhow::Error::new(TransportError::NotAuthenticated);
+        assert_eq!(
+            classify_startup_error(&error),
+            server::StartupErrorCode::AuthenticationRequired
+        );
+
+        let error = anyhow::Error::new(TransportError::CustomBaseUrlRequiresApiKey);
+        assert_eq!(
+            classify_startup_error(&error),
+            server::StartupErrorCode::CustomBaseUrlRequiresApiKey
+        );
+
+        let error = anyhow::Error::new(TransportError::Upstream {
+            status: http::StatusCode::TOO_MANY_REQUESTS,
+            summary: "untrusted upstream detail".to_string(),
+        });
+        assert_eq!(
+            classify_startup_error(&error),
+            server::StartupErrorCode::CatalogRateLimited
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_catalog_timeout_has_a_distinct_static_code() {
+        let elapsed = tokio::time::timeout(
+            Duration::from_millis(1),
+            futures_util::future::pending::<()>(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            classify_startup_error(&anyhow::Error::new(elapsed)),
+            server::StartupErrorCode::CatalogTimeout
+        );
     }
 }

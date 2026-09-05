@@ -9,8 +9,10 @@ explicit implementation; focused automated coverage is identified separately.
 but still needs end-to-end or operational verification.
 
 Current CI exercises Rust unit and fixture tests plus the release-tooling shell
-suite. Stock-versus-wrapped behavior and live OpenAI behavior are planned
-release gates; a green CI run does not yet prove those system-level properties.
+suite. A separate exact-stock CLI/MSP fixture harness covers selected
+stock-versus-wrapped paths, and live subscription smoke tests run locally.
+Broader system-level qualification remains a release gate; green public CI
+does not prove complete harness parity.
 
 The local operating-system account is trusted to read its own processes and
 files. Root, debuggers, injected dynamic libraries, a compromised keyring, and a
@@ -93,8 +95,9 @@ framing; it does not approve or execute model-requested tools.
   buffer, delivered to the gateway through stdin, and omitted from child argv.
   This does not claim that the operating system's original process-environment
   storage can be securely erased.
-- Stored API keys are read from bounded stdin, trimmed, checked for emptiness and
-  whitespace, and never accepted as a command-line value.
+- Stored API keys are read from bounded stdin, stripped of trailing CR/LF,
+  checked for emptiness and other whitespace, and never accepted as a
+  command-line value.
 - Custom upstream base URLs require API-key mode, HTTPS, and no embedded user
   information, query, or fragment. The HTTP client does not follow redirects.
 - Logout targets only the keyring record associated with the Muse Codex auth
@@ -175,19 +178,21 @@ protected release infrastructure and is never an installer input.
 
 ### Current behavior
 
-The gateway never executes tools. It forwards the Muse Responses JSON after
-forcing `store: false` and streaming mode. For successful Responses streams, it
+The gateway never executes tools. It normalizes Muse history into the pinned
+Responses item types while forcing `store: false` and streaming mode. For successful Responses streams, it
 forwards known non-metadata SSE frames without rewriting response IDs, item IDs,
 call IDs, tool names, JSON arguments, or sequence numbers. It does not attempt
 to repair malformed JSON. Malformed, unknown, oversized, interrupted, or idle
-streams become a terminal `response.failed` event.
+streams become a terminal `response.failed` event. Provider error text is
+replaced by fixed diagnostics rather than copied from untrusted response bodies.
 
 The transport permits at most two attempts for retryable send failures or
 upstream 5xx responses before a response body is exposed, and supports the
 pinned Codex 401 credential-refresh flow. It performs no transport retry after
 the response body is returned to Muse. This prevents a locally observed tool
 call from being replayed by the gateway, but it does not claim that upstream
-compute was never attempted twice.
+compute was never attempted twice. Muse's additional provider retry budget is
+disabled in isolated settings so it cannot replay these terminal failures.
 
 Dropping the downstream stream tears down the associated upstream response
 stream. It does not assert that OpenAI forgot prompt data already received or

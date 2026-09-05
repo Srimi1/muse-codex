@@ -15,6 +15,10 @@ isolated local profile, loopback-only networking, and explicit authentication.
 Use `muse-codex logout` to remove only the Muse Codex credential entry. The
 project does not read or delete stock Codex or Muse credentials.
 
+`muse-codex auth status` reports the saved authentication mode without starting
+Muse or fetching the model catalog. Authentication help and invalid auth
+arguments are handled by Muse Codex itself.
+
 ## Runtime environment
 
 | Variable | Purpose | Rules |
@@ -44,6 +48,27 @@ and data directories. It is not stock Muse's normal profile.
 - `--base-url HTTPS_URL` is an API-key-only upstream override. Muse still sees
   the private loopback URL.
 - Other arguments pass through to the stock Muse parser.
+
+Use `muse-codex exec --json "prompt"` for headless JSONL output and
+`muse-codex serve` for MSP over stdin/stdout. Muse 1.0.3 requires the subcommand
+before its startup flags; the launcher places provider flags in the correct
+scope. The `serve` command gets its endpoint from isolated settings because
+its parser does not accept provider flags.
+
+Use durable sessions for MSP: `serve --no-session-log` is rejected because the
+pinned Muse host cannot deliver turn events in that mode. Normal `serve` keeps
+sessions in the isolated profile; `exec --no-session-log` remains available.
+
+Local commands (`schema`, `export`, `trace`, `config`, `skills`, `sandbox`,
+`session-message`, and `init`) and help/version output work without starting
+the gateway. They operate on the Muse Codex profile.
+
+`exec --api-key-stdin` reads an invocation-only key in the launcher and passes
+it through the private gateway pipe. It is removed from Muse's arguments and
+stdin. An explicit stdin key takes precedence over `OPENAI_API_KEY`; neither
+choice changes saved credentials. API-key input is limited to 16 KiB.
+Only trailing CR/LF line endings are removed; spaces and other whitespace are
+rejected rather than silently changing the credential.
 
 An explicit Muse `--model` argument remains unchanged. Without one, stock Muse
 uses the first picker-visible default in the authenticated upstream catalog.

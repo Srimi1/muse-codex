@@ -24,6 +24,30 @@ cargo test --workspace --all-targets --locked
 bash tests/scripts/release-tooling-test.sh
 ```
 
+With the exact separately licensed stock binary and debug wrapper installed:
+
+```sh
+cargo build --workspace --locked
+MUSE_CODEX_MUSE_BIN=/absolute/path/to/muse-bin-1.0.3-R2198.1 \
+  python3 tests/scripts/cli-msp-parity-test.py
+```
+
+This credential-free suite does not replace opt-in subscription and API-key
+smoke tests or the full harness qualification matrix. Review the open pinned
+dependency alerts in [DEPENDENCY_REVIEW.md](DEPENDENCY_REVIEW.md) as well.
+
+To run the opt-in subscription text/tool/result/restart/resume smoke test after
+login (never in CI):
+
+```sh
+python3 tests/scripts/live-msp-subscription-smoke.py --run \
+  --wrapper target/debug/muse-codex \
+  --gateway target/debug/muse-codex-gateway
+```
+
+It refuses API-key mode and leaves one uniquely identified test session in the
+selected profile. It does not alter or copy credentials.
+
 Complete the compatibility gates in [ROADMAP.md](../ROADMAP.md) before calling a
 bundle supported. Record the exact Git commit, Rust toolchain, Muse baseline,
 and Codex vendor revision in operator release notes.

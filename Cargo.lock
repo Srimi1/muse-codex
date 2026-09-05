@@ -1190,6 +1190,7 @@ dependencies = [
  "codex-client",
  "codex-login",
  "codex-model-provider-info",
+ "codex-protocol",
  "dirs",
  "futures",
  "http",
@@ -4470,6 +4471,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "clap",
  "libc",
  "serde",
  "serde_json",

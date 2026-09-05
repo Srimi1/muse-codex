@@ -2,6 +2,7 @@ use crate::CODEX_CLIENT_VERSION;
 use crate::Error;
 use crate::Result;
 use crate::auth::AuthConfig;
+use crate::auth::validate_api_key;
 use async_trait::async_trait;
 use bytes::Bytes;
 use bytes::BytesMut;
@@ -9,6 +10,7 @@ use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::UnauthorizedRecovery;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_protocol::models::ResponseItem;
 use futures::Stream;
 use futures::StreamExt;
 use http::HeaderMap;
@@ -24,7 +26,10 @@ use secrecy::ExposeSecret;
 use secrecy::SecretString;
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::Map;
 use serde_json::Value;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -39,6 +44,8 @@ use url::Url;
 
 const MAX_MODELS_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_MODEL_ID_BYTES: usize = 256;
+const MAX_MODELS: usize = 4096;
 const MAX_PRESTREAM_ATTEMPTS: usize = 2;
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(2);
 const CREDENTIAL_REFRESH_LOCK_NAME: &str = ".credential-refresh.lock";
@@ -62,7 +69,8 @@ impl fmt::Debug for RawResponse {
         formatter
             .debug_struct("RawResponse")
             .field("status", &self.status)
-            .field("headers", &self.headers)
+            .field("header_count", &self.headers.len())
+            .field("headers", &"<redacted>")
             .field("body", &"<stream>")
             .finish()
     }
@@ -109,12 +117,12 @@ pub struct SearchRequest {
 impl SearchRequest {
     fn to_upstream(&self) -> Result<Value> {
         if self.query.trim().is_empty() {
-            return Err(Error::InvalidUpstreamResponse(
+            return Err(Error::InvalidRequest(
                 "search query cannot be empty".to_string(),
             ));
         }
         if self.request_id.trim().is_empty() {
-            return Err(Error::InvalidUpstreamResponse(
+            return Err(Error::InvalidRequest(
                 "search request_id cannot be empty".to_string(),
             ));
         }
@@ -139,9 +147,9 @@ impl fmt::Debug for Transport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Transport")
-            .field("config", &self.config)
+            .field("auth_home", &"<redacted>")
             .field("has_api_key_override", &self.api_key_override.is_some())
-            .field("api_key_base_url", &self.api_key_base_url)
+            .field("has_custom_base_url", &self.api_key_base_url.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -154,6 +162,9 @@ impl Transport {
         api_key_override: Option<SecretString>,
         api_key_base_url: Option<Url>,
     ) -> Result<Self> {
+        if let Some(api_key) = api_key_override.as_ref() {
+            validate_api_key(api_key.expose_secret())?;
+        }
         if let Some(base_url) = api_key_base_url.as_ref() {
             validate_base_url(base_url)?;
         }
@@ -197,6 +208,8 @@ impl Transport {
         body: Value,
         extra_headers: HeaderMap,
     ) -> Result<RawResponse> {
+        let api_key_auth = self.resolve_auth().await?.is_api_key_auth();
+        let body = normalize_responses_request(body, api_key_auth)?;
         let response = self
             .execute_with_401_recovery(|| async {
                 self.send_json_once(
@@ -242,7 +255,7 @@ impl Transport {
         extra_headers: HeaderMap,
     ) -> Result<RawResponse> {
         let request: SearchRequest = serde_json::from_value(request).map_err(|error| {
-            Error::InvalidUpstreamResponse(format!("invalid Muse search request: {error}"))
+            Error::InvalidRequest(format!("invalid Muse search request: {error}"))
         })?;
         self.search(request, extra_headers).await
     }
@@ -255,24 +268,21 @@ impl Transport {
         extra_headers: HeaderMap,
     ) -> Result<RawResponse> {
         let object = request.as_object().ok_or_else(|| {
-            Error::InvalidUpstreamResponse(
-                "Muse browser_open request must be an object".to_string(),
-            )
+            Error::InvalidRequest("Muse browser_open request must be an object".to_string())
         })?;
         let url = object
             .get("url")
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| {
-                Error::InvalidUpstreamResponse(
+                Error::InvalidRequest(
                     "Muse browser_open request must contain a non-empty url".to_string(),
                 )
             })?;
-        let parsed_url = Url::parse(url).map_err(|error| {
-            Error::InvalidUpstreamResponse(format!("invalid browser_open URL: {error}"))
-        })?;
+        let parsed_url = Url::parse(url)
+            .map_err(|error| Error::InvalidRequest(format!("invalid browser_open URL: {error}")))?;
         if !matches!(parsed_url.scheme(), "http" | "https") {
-            return Err(Error::InvalidUpstreamResponse(
+            return Err(Error::InvalidRequest(
                 "browser_open URL must use http or https".to_string(),
             ));
         }
@@ -429,6 +439,494 @@ fn build_http_client() -> Result<reqwest::Client> {
         .map_err(|error| Error::HttpClient(error.to_string()))
 }
 
+/// Converts Muse's provider-neutral Responses body into the stateless request
+/// shape emitted by the pinned Codex client. Public API-key requests retain
+/// standard API parameters that the ChatGPT subscription backend does not
+/// accept.
+fn normalize_responses_request(mut body: Value, api_key_auth: bool) -> Result<Value> {
+    let object = body
+        .as_object_mut()
+        .ok_or_else(|| Error::InvalidRequest("request body must be an object".to_string()))?;
+
+    let model = object
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::InvalidRequest("model must be a string".to_string()))?;
+    validate_model_id(model).map_err(Error::InvalidRequest)?;
+
+    match object.get("instructions") {
+        None => {
+            object.insert("instructions".to_string(), Value::String(String::new()));
+        }
+        Some(Value::String(_)) => {}
+        Some(_) => {
+            return Err(Error::InvalidRequest(
+                "instructions must be a string".to_string(),
+            ));
+        }
+    }
+
+    reject_stateful_reference(object, "previous_response_id")?;
+    reject_stateful_reference(object, "conversation")?;
+
+    match object.get("tools") {
+        None => {
+            object.insert("tools".to_string(), Value::Array(Vec::new()));
+        }
+        Some(Value::Array(tools))
+            if tools.iter().all(|tool| {
+                tool.as_object()
+                    .is_some_and(|tool| tool.get("type").is_some_and(Value::is_string))
+            }) => {}
+        Some(Value::Array(_)) => {
+            return Err(Error::InvalidRequest(
+                "each tool must be an object with a string type".to_string(),
+            ));
+        }
+        Some(_) => {
+            return Err(Error::InvalidRequest("tools must be an array".to_string()));
+        }
+    }
+    let namespace_calls = collect_namespace_calls(
+        object
+            .get("tools")
+            .and_then(Value::as_array)
+            .expect("tools was normalized to an array"),
+    )?;
+
+    let input = object
+        .remove("input")
+        .ok_or_else(|| Error::InvalidRequest("input is required".to_string()))?;
+    object.insert(
+        "input".to_string(),
+        normalize_response_input(input, &namespace_calls)?,
+    );
+
+    match object.get("tool_choice") {
+        None => {
+            object.insert("tool_choice".to_string(), Value::String("auto".to_string()));
+        }
+        Some(Value::String(_)) => {}
+        Some(Value::Object(_)) if api_key_auth => {}
+        Some(_) => {
+            return Err(Error::InvalidRequest(
+                "tool_choice has an unsupported shape".to_string(),
+            ));
+        }
+    }
+
+    match object.get("parallel_tool_calls") {
+        None => {
+            object.insert("parallel_tool_calls".to_string(), Value::Bool(true));
+        }
+        Some(Value::Bool(_)) => {}
+        Some(_) => {
+            return Err(Error::InvalidRequest(
+                "parallel_tool_calls must be a boolean".to_string(),
+            ));
+        }
+    }
+
+    let has_reasoning = normalize_reasoning(object, api_key_auth)?;
+    normalize_include(object, has_reasoning)?;
+
+    if api_key_auth {
+        validate_optional_positive_integer(object, "max_output_tokens")?;
+    } else {
+        // The pinned ChatGPT Codex request does not send this standard public
+        // API parameter. Muse always supplied it for the Meta provider.
+        object.remove("max_output_tokens");
+        // Do not forward legacy provider telemetry through subscription auth.
+        object.remove("client_metadata");
+        object.remove("metadata");
+    }
+
+    // Muse owns persistence and always replays the complete normalized history.
+    object.insert("store".to_string(), Value::Bool(false));
+    object.insert("stream".to_string(), Value::Bool(true));
+    Ok(body)
+}
+
+fn validate_model_id(model: &str) -> std::result::Result<(), String> {
+    if model.is_empty() || model.len() > MAX_MODEL_ID_BYTES || model.starts_with('-') {
+        return Err(format!(
+            "model must contain between 1 and {MAX_MODEL_ID_BYTES} bytes"
+        ));
+    }
+    if model.chars().any(char::is_whitespace) || model.chars().any(char::is_control) {
+        return Err("model must not contain whitespace or control characters".to_string());
+    }
+    Ok(())
+}
+
+fn reject_stateful_reference(object: &mut Map<String, Value>, field: &str) -> Result<()> {
+    match object.remove(field) {
+        None | Some(Value::Null) => Ok(()),
+        Some(_) => Err(Error::InvalidRequest(format!(
+            "{field} cannot be used because Muse sends complete stateless history"
+        ))),
+    }
+}
+
+type NamespaceCallMap = BTreeMap<String, (String, String)>;
+
+fn collect_namespace_calls(tools: &[Value]) -> Result<NamespaceCallMap> {
+    let mut calls = NamespaceCallMap::new();
+    let standalone_names = tools
+        .iter()
+        .filter_map(Value::as_object)
+        .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    for tool in tools {
+        let Some(tool) = tool.as_object() else {
+            continue;
+        };
+        if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+            continue;
+        }
+        let Some(namespace) = tool.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(namespace_tools) = tool.get("tools").and_then(Value::as_array) else {
+            continue;
+        };
+        for namespace_tool in namespace_tools {
+            let Some(namespace_tool) = namespace_tool.as_object() else {
+                continue;
+            };
+            if namespace_tool.get("type").and_then(Value::as_str) != Some("function") {
+                continue;
+            }
+            let Some(name) = namespace_tool.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let flattened = format!("{namespace}.{name}");
+            if standalone_names.contains(flattened.as_str()) {
+                return Err(Error::InvalidRequest(format!(
+                    "namespace tool conflicts with standalone function {flattened}"
+                )));
+            }
+            let split = (namespace.to_string(), name.to_string());
+            if let Some(previous) = calls.insert(flattened.clone(), split.clone())
+                && previous != split
+            {
+                return Err(Error::InvalidRequest(format!(
+                    "namespace tools have ambiguous flattened call name {flattened}"
+                )));
+            }
+        }
+    }
+    Ok(calls)
+}
+
+fn normalize_response_input(input: Value, namespace_calls: &NamespaceCallMap) -> Result<Value> {
+    let items = match input {
+        Value::String(text) => vec![serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+        })],
+        Value::Array(items) if !items.is_empty() => items,
+        Value::Array(_) => {
+            return Err(Error::InvalidRequest(
+                "input must contain at least one item".to_string(),
+            ));
+        }
+        _ => {
+            return Err(Error::InvalidRequest(
+                "input must be a string or an array".to_string(),
+            ));
+        }
+    };
+
+    let normalized = items
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| normalize_response_item(item, index, namespace_calls))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Value::Array(normalized))
+}
+
+fn normalize_response_item(
+    mut item: Value,
+    index: usize,
+    namespace_calls: &NamespaceCallMap,
+) -> Result<Value> {
+    let object = item
+        .as_object_mut()
+        .ok_or_else(|| Error::InvalidRequest(format!("input item {index} must be an object")))?;
+    let item_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::InvalidRequest(format!("input item {index} has no string type")))?;
+    if !matches!(
+        item_type,
+        "message"
+            | "reasoning"
+            | "local_shell_call"
+            | "function_call"
+            | "function_call_output"
+            | "custom_tool_call"
+            | "custom_tool_call_output"
+            | "tool_search_call"
+            | "tool_search_output"
+            | "web_search_call"
+            | "image_generation_call"
+            | "compaction"
+            | "compaction_summary"
+            | "compaction_trigger"
+            | "context_compaction"
+    ) {
+        return Err(Error::InvalidRequest(format!(
+            "input item {index} has unsupported type"
+        )));
+    }
+    if item_type == "message" {
+        normalize_message_item(object, index)?;
+    }
+
+    let parsed: ResponseItem = serde_json::from_value(item).map_err(|error| {
+        Error::InvalidRequest(format!("input item {index} is invalid: {error}"))
+    })?;
+    if matches!(parsed, ResponseItem::Other) {
+        return Err(Error::InvalidRequest(format!(
+            "input item {index} has unsupported type"
+        )));
+    }
+    let mut normalized = serde_json::to_value(parsed).map_err(|error| {
+        Error::InvalidRequest(format!(
+            "input item {index} could not be normalized: {error}"
+        ))
+    })?;
+
+    // Stock Muse flattens namespaced calls when it records history (for
+    // example `namespace:muse, name:read_file` becomes `name:muse.read_file`).
+    // The Responses API requires the original split when replaying that call.
+    // Reverse only exact aliases from the request's advertised namespace tools
+    // so ordinary dotted function names are left untouched.
+    let namespace_split = (normalized.get("type").and_then(Value::as_str) == Some("function_call")
+        && normalized.get("namespace").is_none())
+    .then(|| normalized.get("name").and_then(Value::as_str))
+    .flatten()
+    .and_then(|flattened| namespace_calls.get(flattened))
+    .cloned();
+    if let Some((namespace, name)) = namespace_split
+        && let Some(object) = normalized.as_object_mut()
+    {
+        object.insert("namespace".to_string(), Value::String(namespace.clone()));
+        object.insert("name".to_string(), Value::String(name.clone()));
+    }
+
+    // Muse can attach the invoked tool name to result-history items. The
+    // Responses input schema identifies results solely by `call_id`; `name`
+    // belongs on the preceding call item and is rejected on the result item by
+    // the ChatGPT backend. Keep the filter type-specific so call names remain
+    // intact.
+    if matches!(
+        normalized.get("type").and_then(Value::as_str),
+        Some("function_call_output" | "custom_tool_call_output")
+    ) && let Some(object) = normalized.as_object_mut()
+    {
+        object.remove("name");
+    }
+
+    Ok(normalized)
+}
+
+fn normalize_message_item(object: &mut Map<String, Value>, index: usize) -> Result<()> {
+    let role = object
+        .get("role")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::InvalidRequest(format!("message item {index} has no string role")))?;
+    if !matches!(role, "assistant" | "developer" | "system" | "user") {
+        return Err(Error::InvalidRequest(format!(
+            "message item {index} has unsupported role"
+        )));
+    }
+    let assistant = role == "assistant";
+    let content = object
+        .get_mut("content")
+        .ok_or_else(|| Error::InvalidRequest(format!("message item {index} has no content")))?;
+    if let Value::String(text) = content {
+        *content = Value::Array(vec![serde_json::json!({
+            "type": if assistant { "output_text" } else { "input_text" },
+            "text": std::mem::take(text),
+        })]);
+    }
+    let Value::Array(parts) = content else {
+        return Err(Error::InvalidRequest(format!(
+            "message item {index} content must be a string or array"
+        )));
+    };
+    for (part_index, part) in parts.iter_mut().enumerate() {
+        normalize_content_part(part, assistant, index, part_index)?;
+    }
+    Ok(())
+}
+
+fn normalize_content_part(
+    part: &mut Value,
+    assistant: bool,
+    item_index: usize,
+    part_index: usize,
+) -> Result<()> {
+    let object = part.as_object_mut().ok_or_else(|| {
+        Error::InvalidRequest(format!(
+            "message item {item_index} content part {part_index} must be an object"
+        ))
+    })?;
+    let part_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            Error::InvalidRequest(format!(
+                "message item {item_index} content part {part_index} has no string type"
+            ))
+        })?
+        .to_string();
+    let expected_text_type = if assistant {
+        "output_text"
+    } else {
+        "input_text"
+    };
+    match part_type.as_str() {
+        "text" | "input_text" | "output_text" => {
+            if !object.get("text").is_some_and(Value::is_string) {
+                return Err(Error::InvalidRequest(format!(
+                    "message item {item_index} content part {part_index} has no string text"
+                )));
+            }
+            object.insert(
+                "type".to_string(),
+                Value::String(expected_text_type.to_string()),
+            );
+        }
+        "image_url" => {
+            let image = object.remove("image_url").ok_or_else(|| {
+                Error::InvalidRequest(format!(
+                    "message item {item_index} content part {part_index} has no image_url"
+                ))
+            })?;
+            match image {
+                Value::String(url) => {
+                    object.insert("image_url".to_string(), Value::String(url));
+                }
+                Value::Object(mut image) => {
+                    let url = image.remove("url").filter(Value::is_string).ok_or_else(|| {
+                        Error::InvalidRequest(format!(
+                            "message item {item_index} content part {part_index} has no image URL"
+                        ))
+                    })?;
+                    object.insert("image_url".to_string(), url);
+                    if let Some(detail) = image.remove("detail") {
+                        object.insert("detail".to_string(), detail);
+                    }
+                }
+                _ => {
+                    return Err(Error::InvalidRequest(format!(
+                        "message item {item_index} content part {part_index} has invalid image_url"
+                    )));
+                }
+            }
+            object.insert("type".to_string(), Value::String("input_image".to_string()));
+        }
+        "input_image" if !assistant => {}
+        _ => {
+            return Err(Error::InvalidRequest(format!(
+                "message item {item_index} content part {part_index} has unsupported type"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_reasoning(object: &mut Map<String, Value>, api_key_auth: bool) -> Result<bool> {
+    let Some(reasoning) = object.get_mut("reasoning") else {
+        return Ok(false);
+    };
+    if reasoning.is_null() {
+        return Ok(false);
+    }
+    let reasoning = reasoning
+        .as_object_mut()
+        .ok_or_else(|| Error::InvalidRequest("reasoning must be an object or null".to_string()))?;
+    if let Some(effort) = reasoning.get("effort")
+        && !effort.is_null()
+        && !effort.as_str().is_some_and(is_reasoning_effort)
+    {
+        return Err(Error::InvalidRequest(
+            "reasoning effort is not supported".to_string(),
+        ));
+    }
+    if let Some(summary) = reasoning.get("summary")
+        && !summary.is_null()
+        && !summary.as_str().is_some_and(is_reasoning_summary)
+    {
+        return Err(Error::InvalidRequest(
+            "reasoning summary is not supported".to_string(),
+        ));
+    }
+    if !api_key_auth {
+        reasoning.retain(|key, _| matches!(key.as_str(), "effort" | "summary"));
+        if reasoning.get("summary").and_then(Value::as_str) == Some("none") {
+            reasoning.remove("summary");
+        }
+    }
+    Ok(true)
+}
+
+fn is_reasoning_effort(value: &str) -> bool {
+    matches!(
+        value,
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+    )
+}
+
+fn is_reasoning_summary(value: &str) -> bool {
+    matches!(value, "auto" | "concise" | "detailed" | "none")
+}
+
+fn normalize_include(object: &mut Map<String, Value>, has_reasoning: bool) -> Result<()> {
+    let include = object
+        .entry("include".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Value::Array(include) = include else {
+        return Err(Error::InvalidRequest(
+            "include must be an array".to_string(),
+        ));
+    };
+    if !include.iter().all(Value::is_string) {
+        return Err(Error::InvalidRequest(
+            "include entries must be strings".to_string(),
+        ));
+    }
+    let mut unique = Vec::with_capacity(include.len() + usize::from(has_reasoning));
+    for value in std::mem::take(include) {
+        if !unique.contains(&value) {
+            unique.push(value);
+        }
+    }
+    let encrypted_reasoning = Value::String("reasoning.encrypted_content".to_string());
+    if has_reasoning && !unique.contains(&encrypted_reasoning) {
+        unique.push(encrypted_reasoning);
+    }
+    *include = unique;
+    Ok(())
+}
+
+fn validate_optional_positive_integer(object: &Map<String, Value>, field: &str) -> Result<()> {
+    if let Some(value) = object.get(field)
+        && !value.is_null()
+        && value.as_u64().is_none_or(|value| value == 0)
+    {
+        return Err(Error::InvalidRequest(format!(
+            "{field} must be a positive integer or null"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_base_url(url: &Url) -> Result<()> {
     let secure_scheme = url.scheme() == "https";
     #[cfg(test)]
@@ -440,6 +938,7 @@ fn validate_base_url(url: &Url) -> Result<()> {
                 .is_some_and(|host| host.is_loopback()));
 
     if !secure_scheme
+        || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
@@ -500,6 +999,10 @@ fn is_forbidden_forwarded_header(name: &HeaderName) -> bool {
             | "upgrade"
             | "chatgpt-account-id"
             | "x-openai-fedramp"
+            | "x-api-key"
+            | "api-key"
+            | "openai-organization"
+            | "openai-project"
             | "originator"
             | "user-agent"
             | "version"
@@ -521,11 +1024,11 @@ impl Recovery for CodexRecovery {
     }
 
     async fn next(&mut self) -> Result<()> {
-        self.0
-            .next()
-            .await
-            .map(|_| ())
-            .map_err(|error| Error::Authentication(format!("credential refresh failed: {error}")))
+        self.0.next().await.map(|_| ()).map_err(|_| {
+            Error::Authentication(
+                "credential refresh failed; run `muse-codex login` again".to_string(),
+            )
+        })
     }
 }
 
@@ -719,11 +1222,43 @@ async fn collect_response(response: reqwest::Response, limit: usize) -> Result<B
 
 async fn upstream_error(response: reqwest::Response) -> Error {
     let status = response.status();
-    let body = match collect_response(response, MAX_ERROR_RESPONSE_BYTES).await {
-        Ok(body) => String::from_utf8_lossy(&body).into_owned(),
-        Err(_) => "<error body exceeded limit or could not be read>".to_string(),
+    let summary = match collect_response(response, MAX_ERROR_RESPONSE_BYTES).await {
+        Ok(body) => summarize_upstream_error(&body),
+        Err(_) => "response body omitted".to_string(),
     };
-    Error::Upstream { status, body }
+    Error::Upstream { status, summary }
+}
+
+fn summarize_upstream_error(body: &[u8]) -> String {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return "response body omitted".to_string();
+    };
+    let error = value.get("error").unwrap_or(&value);
+    let error_type = error
+        .get("type")
+        .and_then(Value::as_str)
+        .and_then(safe_error_token);
+    let error_code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .and_then(safe_error_token);
+    match (error_type, error_code) {
+        (Some(error_type), Some(error_code)) => {
+            format!("type={error_type}, code={error_code}")
+        }
+        (Some(error_type), None) => format!("type={error_type}"),
+        (None, Some(error_code)) => format!("code={error_code}"),
+        (None, None) => "response body omitted".to_string(),
+    }
+}
+
+fn safe_error_token(value: &str) -> Option<&str> {
+    (!value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')))
+    .then_some(value)
 }
 
 #[derive(Debug, Deserialize)]
@@ -762,46 +1297,81 @@ struct UpstreamReasoningPreset {
 }
 
 fn normalize_models(bytes: &[u8]) -> Result<Vec<ModelInfo>> {
-    let mut upstream: UpstreamModelsResponse = serde_json::from_slice(bytes).map_err(|error| {
+    let upstream: UpstreamModelsResponse = serde_json::from_slice(bytes).map_err(|error| {
         Error::InvalidUpstreamResponse(format!("could not decode models response: {error}"))
     })?;
-    upstream.models.extend(upstream.data);
-    if upstream.models.is_empty() {
+    if !upstream.models.is_empty() && !upstream.data.is_empty() {
+        return Err(Error::InvalidUpstreamResponse(
+            "models response mixed subscription and public API catalog shapes".to_string(),
+        ));
+    }
+    let subscription_catalog = !upstream.models.is_empty();
+    let mut upstream_models = if subscription_catalog {
+        upstream.models
+    } else {
+        upstream.data
+    };
+    if upstream_models.is_empty() {
         return Err(Error::InvalidUpstreamResponse(
             "models response contained no models".to_string(),
         ));
     }
-    upstream.models.sort_by_key(|model| model.priority);
+    if upstream_models.len() > MAX_MODELS {
+        return Err(Error::InvalidUpstreamResponse(format!(
+            "models response exceeded the {MAX_MODELS}-model limit"
+        )));
+    }
+    if subscription_catalog {
+        upstream_models.sort_by_key(|model| model.priority);
+    }
 
-    let mut models = upstream
-        .models
+    let mut seen_ids = std::collections::HashSet::with_capacity(upstream_models.len());
+    let mut models = upstream_models
         .into_iter()
         .map(|model| -> Result<ModelInfo> {
+            validate_model_id(&model.slug).map_err(|_| {
+                Error::InvalidUpstreamResponse("model catalog returned an invalid id".to_string())
+            })?;
+            if !seen_ids.insert(model.slug.clone()) {
+                return Err(Error::InvalidUpstreamResponse(
+                    "model catalog returned duplicate ids".to_string(),
+                ));
+            }
             let is_visible = match model.visibility.as_deref() {
                 None | Some("list") => true,
                 Some("hide" | "none") => false,
-                Some(value) => {
-                    return Err(Error::InvalidUpstreamResponse(format!(
-                        "model catalog returned unknown visibility {value:?}"
-                    )));
+                Some(_) => {
+                    return Err(Error::InvalidUpstreamResponse(
+                        "model catalog returned unknown visibility".to_string(),
+                    ));
                 }
             };
             let mut supported_reasoning_efforts = Vec::new();
             for preset in model.supported_reasoning_levels {
+                if !is_reasoning_effort(&preset.effort) {
+                    return Err(Error::InvalidUpstreamResponse(
+                        "model catalog returned an invalid reasoning effort".to_string(),
+                    ));
+                }
                 if !supported_reasoning_efforts.contains(&preset.effort) {
                     supported_reasoning_efforts.push(preset.effort);
                 }
             }
+            if let Some(default) = model.default_reasoning_level.as_deref()
+                && !supported_reasoning_efforts
+                    .iter()
+                    .any(|supported| supported == default)
+            {
+                return Err(Error::InvalidUpstreamResponse(
+                    "model catalog default reasoning effort is not supported".to_string(),
+                ));
+            }
             Ok(ModelInfo {
                 id: model.slug,
-                display_name: model.display_name.filter(|value| !value.is_empty()),
-                description: model.description,
-                context_window: model
-                    .context_window
-                    .and_then(|value| u64::try_from(value).ok()),
-                max_output_tokens: model
-                    .max_output_tokens
-                    .and_then(|value| u64::try_from(value).ok()),
+                display_name: normalize_catalog_text(model.display_name, 512, false)?,
+                description: normalize_catalog_text(model.description, 16 * 1024, true)?,
+                context_window: normalize_model_limit(model.context_window)?,
+                max_output_tokens: normalize_model_limit(model.max_output_tokens)?,
                 supported_reasoning_efforts,
                 default_reasoning_effort: model.default_reasoning_level,
                 is_visible,
@@ -817,6 +1387,39 @@ fn normalize_models(bytes: &[u8]) -> Result<Vec<ModelInfo>> {
         })?;
     models[default_index].is_default = true;
     Ok(models)
+}
+
+fn normalize_catalog_text(
+    value: Option<String>,
+    max_bytes: usize,
+    allow_newlines: bool,
+) -> Result<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    if value.len() > max_bytes
+        || value.chars().any(|character| {
+            character.is_control() && !(allow_newlines && matches!(character, '\n' | '\r' | '\t'))
+        })
+    {
+        return Err(Error::InvalidUpstreamResponse(
+            "model catalog returned invalid display text".to_string(),
+        ));
+    }
+    Ok(Some(value))
+}
+
+fn normalize_model_limit(value: Option<i64>) -> Result<Option<u64>> {
+    match value {
+        None => Ok(None),
+        Some(value) if value > 0 => Ok(Some(value as u64)),
+        Some(_) => Err(Error::InvalidUpstreamResponse(
+            "model catalog returned a non-positive token limit".to_string(),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -854,6 +1457,216 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    #[test]
+    fn normalizes_stock_muse_request_for_subscription_transport() {
+        let request: Value = serde_json::from_slice(include_bytes!(
+            "../tests/fixtures/muse-responses-request.json"
+        ))
+        .expect("request fixture");
+        let normalized =
+            normalize_responses_request(request, false).expect("normalized subscription request");
+
+        assert_eq!(normalized["store"], false);
+        assert_eq!(normalized["stream"], true);
+        assert_eq!(normalized["tool_choice"], "auto");
+        assert_eq!(normalized["parallel_tool_calls"], false);
+        assert!(normalized.get("max_output_tokens").is_none());
+        assert!(normalized.get("previous_response_id").is_none());
+        assert!(normalized.get("conversation").is_none());
+        assert!(normalized.get("client_metadata").is_none());
+        assert!(normalized.get("metadata").is_none());
+        assert_eq!(
+            normalized["include"],
+            serde_json::json!(["reasoning.encrypted_content"])
+        );
+
+        let input = normalized["input"].as_array().expect("input array");
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(
+            input[1]["content"][1]["image_url"],
+            "data:image/png;base64,iVBORw0KGgo="
+        );
+        assert_eq!(input[3]["content"][0]["type"], "output_text");
+        assert!(input[2].get("id").is_none());
+        assert_eq!(input[2]["encrypted_content"], "encrypted-fixture");
+        assert!(input[3].get("id").is_none());
+        assert!(input[4].get("id").is_none());
+        assert_eq!(input[4]["call_id"], "call_fixture");
+        assert_eq!(input[5]["call_id"], "call_fixture");
+        assert_eq!(input[5]["output"], "fixture output");
+        assert_eq!(normalized["tools"][0]["type"], "namespace");
+    }
+
+    #[test]
+    fn tool_result_followup_keeps_call_names_but_strips_result_names() {
+        let request: Value = serde_json::from_slice(include_bytes!(
+            "../tests/fixtures/muse-tool-result-followup.json"
+        ))
+        .expect("tool-result followup fixture");
+        let normalized =
+            normalize_responses_request(request, false).expect("normalized tool-result followup");
+        let input = normalized["input"].as_array().expect("input array");
+
+        assert_eq!(input[2]["type"], "reasoning");
+        assert_eq!(input[2]["encrypted_content"], "encrypted-fixture");
+        assert_eq!(input[3]["type"], "function_call");
+        assert_eq!(input[3]["namespace"], "muse");
+        assert_eq!(input[3]["name"], "read_file");
+        assert_eq!(input[3]["call_id"], "call_fixture");
+        assert_eq!(input[3]["arguments"], r#"{"path":"fixture.txt"}"#);
+        assert_eq!(input[4]["type"], "function_call_output");
+        assert!(input[4].get("name").is_none());
+        assert_eq!(input[4]["call_id"], "call_fixture");
+        assert_eq!(input[4]["output"], "fixture contents");
+
+        assert_eq!(input[5]["type"], "custom_tool_call");
+        assert_eq!(input[5]["name"], "exec");
+        assert_eq!(input[6]["type"], "custom_tool_call_output");
+        assert!(input[6].get("name").is_none());
+        assert_eq!(input[6]["call_id"], "custom_fixture");
+        assert_eq!(input[6]["output"], "fixture output");
+    }
+
+    #[test]
+    fn namespace_reverse_mapping_preserves_unadvertised_dotted_function_names() {
+        let normalized = normalize_responses_request(
+            serde_json::json!({
+                "model": "gpt-fixture",
+                "input": [{
+                    "type": "function_call",
+                    "call_id": "call_fixture",
+                    "name": "standalone.dotted_name",
+                    "arguments": "{}"
+                }],
+                "tools": [{
+                    "type": "namespace",
+                    "name": "muse",
+                    "tools": [{"type":"function", "name":"read_file", "parameters":{}}]
+                }]
+            }),
+            false,
+        )
+        .expect("normalized dotted standalone function");
+
+        assert_eq!(normalized["input"][0]["name"], "standalone.dotted_name");
+        assert!(normalized["input"][0].get("namespace").is_none());
+    }
+
+    #[test]
+    fn namespace_reverse_mapping_rejects_ambiguous_standalone_name() {
+        let error = normalize_responses_request(
+            serde_json::json!({
+                "model": "gpt-fixture",
+                "input": "hello",
+                "tools": [
+                    {"type":"function", "name":"muse.read_file", "parameters":{}},
+                    {
+                        "type":"namespace",
+                        "name":"muse",
+                        "tools":[{"type":"function", "name":"read_file", "parameters":{}}]
+                    }
+                ]
+            }),
+            false,
+        )
+        .expect_err("ambiguous flattened name must fail closed");
+
+        assert!(matches!(error, Error::InvalidRequest(message) if message.contains("conflicts")));
+    }
+
+    #[test]
+    fn api_key_request_preserves_public_parameters_and_explicit_parallel_choice() {
+        let request: Value = serde_json::from_slice(include_bytes!(
+            "../tests/fixtures/muse-responses-request.json"
+        ))
+        .expect("request fixture");
+        let normalized =
+            normalize_responses_request(request, true).expect("normalized API request");
+
+        assert_eq!(normalized["max_output_tokens"], 4096);
+        assert_eq!(normalized["parallel_tool_calls"], false);
+        assert_eq!(
+            normalized["client_metadata"]["fixture"],
+            "legacy-provider-value"
+        );
+        assert_eq!(normalized["metadata"]["fixture"], "public-api-value");
+    }
+
+    #[test]
+    fn response_normalizer_rejects_server_side_history_and_malformed_items() {
+        for field in ["previous_response_id", "conversation"] {
+            let mut request = serde_json::json!({
+                "model": "gpt-fixture",
+                "input": "hello"
+            });
+            request[field] = Value::String("secret-state-id".to_string());
+            let error = normalize_responses_request(request, false)
+                .expect_err("stateful request must fail closed");
+            assert!(matches!(error, Error::InvalidRequest(message) if message.contains(field)));
+        }
+
+        let error = normalize_responses_request(
+            serde_json::json!({
+                "model": "gpt-fixture",
+                "input": [{"type":"future_private_item","secret":"do-not-log"}]
+            }),
+            false,
+        )
+        .expect_err("unknown input item must fail closed");
+        let rendered = error.to_string();
+        assert!(rendered.contains("unsupported type"));
+        assert!(!rendered.contains("do-not-log"));
+    }
+
+    #[test]
+    fn subscription_reasoning_none_uses_the_pinned_omitted_summary_shape() {
+        let request = serde_json::json!({
+            "model": "gpt-fixture",
+            "input": "hello",
+            "reasoning": {"effort":"low", "summary":"none"}
+        });
+        let subscription =
+            normalize_responses_request(request.clone(), false).expect("subscription request");
+        let api = normalize_responses_request(request, true).expect("API request");
+
+        assert!(subscription["reasoning"].get("summary").is_none());
+        assert_eq!(api["reasoning"]["summary"], "none");
+        assert_eq!(
+            subscription["include"],
+            serde_json::json!(["reasoning.encrypted_content"])
+        );
+    }
+
+    #[test]
+    fn response_normalizer_maps_image_alias_and_defaults_parallel_calls_on() {
+        let normalized = normalize_responses_request(
+            serde_json::json!({
+                "model": "gpt-fixture",
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type":"text", "text":"hello"},
+                        {"type":"image_url", "image_url": {
+                            "url":"data:image/png;base64,AA==", "detail":"original"
+                        }}
+                    ]
+                }]
+            }),
+            false,
+        )
+        .expect("normalized request");
+
+        assert_eq!(normalized["instructions"], "");
+        assert_eq!(normalized["parallel_tool_calls"], true);
+        assert_eq!(normalized["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(normalized["input"][0]["content"][1]["type"], "input_image");
+        assert_eq!(
+            normalized["input"][0]["content"][1]["image_url"],
+            "data:image/png;base64,AA=="
+        );
     }
 
     #[test]
@@ -931,6 +1744,22 @@ mod tests {
     }
 
     #[test]
+    fn rejects_ambiguous_duplicate_or_inconsistent_model_catalogs() {
+        for fixture in [
+            br#"{"models":[{"slug":"one"}],"data":[{"id":"two"}]}"#.as_slice(),
+            br#"{"models":[{"slug":"same"},{"slug":"same"}]}"#.as_slice(),
+            br#"{"models":[{"slug":"bad","context_window":0}]}"#.as_slice(),
+            br#"{"models":[{"slug":"bad","supported_reasoning_levels":[{"effort":"low"}],"default_reasoning_level":"high"}]}"#.as_slice(),
+            br#"{"models":[{"slug":"bad","supported_reasoning_levels":[{"effort":"future"}]}]}"#.as_slice(),
+        ] {
+            assert!(matches!(
+                normalize_models(fixture),
+                Err(Error::InvalidUpstreamResponse(_))
+            ));
+        }
+    }
+
+    #[test]
     fn custom_base_url_requires_https() {
         assert!(validate_base_url(&Url::parse("http://example.com/v1").unwrap()).is_err());
         assert!(validate_base_url(&Url::parse("https://example.com/v1").unwrap()).is_ok());
@@ -965,13 +1794,90 @@ mod tests {
             HeaderValue::from_static("wrong"),
         );
         source.insert(
+            HeaderName::from_static("x-api-key"),
+            HeaderValue::from_static("also-stolen"),
+        );
+        source.insert(
             HeaderName::from_static("x-muse-session"),
             HeaderValue::from_static("preserved"),
         );
         merge_safe_request_headers(&mut destination, &source);
         assert!(!destination.contains_key(AUTHORIZATION));
         assert!(!destination.contains_key("chatgpt-account-id"));
+        assert!(!destination.contains_key("x-api-key"));
         assert_eq!(destination["x-muse-session"], "preserved");
+    }
+
+    #[test]
+    fn upstream_error_summary_never_echoes_messages_or_unknown_fields() {
+        let body = br#"{
+            "error": {
+                "type": "invalid_request_error",
+                "code": "bad_request",
+                "message": "Bearer super-secret-token",
+                "param": "private-user-value"
+            }
+        }"#;
+        let summary = summarize_upstream_error(body);
+        assert_eq!(summary, "type=invalid_request_error, code=bad_request");
+        assert!(!summary.contains("super-secret-token"));
+        assert!(!summary.contains("private-user-value"));
+        assert_eq!(
+            summarize_upstream_error(br#"{"error":{"code":"not safe! secret"}}"#),
+            "response body omitted"
+        );
+        assert_eq!(
+            summarize_upstream_error(b"not json and contains secret"),
+            "response body omitted"
+        );
+    }
+
+    #[test]
+    fn raw_response_debug_redacts_all_header_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::SET_COOKIE,
+            HeaderValue::from_static("session=super-secret"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-private-account"),
+            HeaderValue::from_static("account-secret"),
+        );
+        let response = RawResponse {
+            status: StatusCode::OK,
+            headers,
+            body: Box::pin(futures::stream::empty()),
+        };
+
+        let debug = format!("{response:?}");
+        assert!(debug.contains("header_count: 2"));
+        assert!(!debug.contains("super-secret"));
+        assert!(!debug.contains("account-secret"));
+        assert!(!debug.contains("x-private-account"));
+    }
+
+    #[test]
+    fn transport_debug_redacts_auth_paths_and_custom_endpoints() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = AuthConfig::with_home(temporary.path().join("muse-codex"))
+            .expect("private auth directory");
+        let private_path = config.home().display().to_string();
+        let transport = Transport {
+            config,
+            api_key_override: Some(SecretString::from("sk-super-secret".to_string())),
+            api_key_base_url: Some(
+                Url::parse("https://private-api.example/v1").expect("private endpoint"),
+            ),
+            auth_manager: None,
+            client: build_http_client().expect("HTTP client"),
+        };
+
+        let debug = format!("{transport:?}");
+        assert!(debug.contains("has_api_key_override: true"));
+        assert!(debug.contains("has_custom_base_url: true"));
+        assert!(!debug.contains(&private_path));
+        assert!(!debug.contains("private-api.example"));
+        assert!(!debug.contains("sk-super-secret"));
     }
 
     #[tokio::test]
@@ -1054,6 +1960,45 @@ mod tests {
             assert_eq!(
                 std::fs::metadata(lock_path).unwrap().permissions().mode() & 0o777,
                 0o600
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unauthorized_without_or_after_recovery_is_returned_without_looping() {
+        for recovery_steps in [None, Some(1_usize)] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let recovery_calls = Arc::new(AtomicUsize::new(0));
+            let recovery = recovery_steps.map(|remaining| {
+                Box::new(FixtureRecovery {
+                    remaining,
+                    calls: Arc::clone(&recovery_calls),
+                }) as Box<dyn Recovery>
+            });
+            let response = execute_with_401_recovery(
+                || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    async {
+                        Ok(FixtureResponse {
+                            status: StatusCode::UNAUTHORIZED,
+                            body: "unauthorized",
+                        })
+                    }
+                },
+                recovery,
+                None,
+            )
+            .await
+            .expect("terminal unauthorized response");
+
+            assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                recovery_steps.unwrap_or(0) + 1
+            );
+            assert_eq!(
+                recovery_calls.load(Ordering::SeqCst),
+                recovery_steps.unwrap_or(0)
             );
         }
     }

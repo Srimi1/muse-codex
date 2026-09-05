@@ -39,6 +39,12 @@ pub enum Error {
     #[error("API key input contains whitespace")]
     ApiKeyContainsWhitespace,
 
+    #[error("API key input contains control characters")]
+    ApiKeyContainsControlCharacters,
+
+    #[error("Muse produced an invalid Responses request: {0}")]
+    InvalidRequest(String),
+
     #[error("invalid request header: {0}")]
     InvalidHeader(String),
 
@@ -54,8 +60,8 @@ pub enum Error {
     #[error("credential refresh lock failed: {0}")]
     CredentialRefreshLock(String),
 
-    #[error("upstream returned HTTP {status}: {body}")]
-    Upstream { status: StatusCode, body: String },
+    #[error("upstream returned HTTP {status}: {summary}")]
+    Upstream { status: StatusCode, summary: String },
 
     #[error("upstream response was invalid: {0}")]
     InvalidUpstreamResponse(String),

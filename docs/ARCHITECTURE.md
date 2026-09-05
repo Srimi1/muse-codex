@@ -50,8 +50,17 @@ The launcher owns only process and provider concerns:
   child must not inherit; and
 - forward signals and exit status.
 
-All non-provider CLI arguments pass through byte-for-byte. User-supplied
-provider or base-URL flags must be rejected or replaced deterministically; they
+Non-provider argument values are preserved, including literal arguments after
+`--`. The launcher places `exec` and `resume` before their startup options,
+because the pinned Muse parser otherwise fails to dispatch `exec`. `serve`
+receives its endpoint through isolated settings rather than unsupported flags.
+For MSP, a schema-aware JSONL relay maps only provider fields and retains
+request IDs. It rejects explicit unsupported providers and duplicate IDs without
+rewriting prompts, tool payloads, or extension data. The stable schema is
+unchanged. `serve --no-session-log` fails before startup because the pinned
+host cannot deliver turn events without durable session storage.
+
+User-supplied provider or base-URL flags are rejected or replaced deterministically; they
 cannot be permitted to bypass the gateway.
 
 Model arguments pass through unchanged. When no model was specified, stock Muse
@@ -121,8 +130,10 @@ billing paths. The controller supports:
 | --- | --- |
 | `login` | Browser authorization with local callback |
 | `login --device-auth` | Verification URL and user-code flow |
-| `auth set --provider codex --api-key-stdin` | Bounded, trimmed, non-empty API key from stdin |
+| `auth set --provider codex --api-key-stdin` | Bounded, non-empty API key from stdin; strip only trailing CR/LF |
 | `logout` | Remove only the namespaced Muse Codex keyring entry |
+| `auth status` | Report the isolated saved credential mode without starting Muse |
+| `exec --api-key-stdin` | Use a bounded invocation-only key through the private pipe |
 
 Credentials use the upstream Codex keyring store, never a plaintext
 `auth.json`. The default isolated Codex auth home is the platform data directory
@@ -151,7 +162,8 @@ receives only the random loopback credential.
 | `muse-codex login --device-auth` | launcher/auth | OpenAI device authorization |
 | `muse-codex auth set --provider codex --api-key-stdin` | launcher/auth | Store a bounded API key from stdin |
 | `muse-codex logout` | launcher/auth | Remove only `muse-codex` credentials |
-| other auth/help forms | stock Muse parser | Preserve stock validation and help in the isolated profile |
+| auth help or invalid auth forms | launcher | Show Codex auth help or a usage error without touching Meta auth |
+| local commands and help/version | stock Muse parser | Run offline in the isolated profile; provider help labels describe Codex |
 | `muse-codex [Muse arguments]` | launcher then stock Muse | Start gateway and pass through |
 | provider other than `codex` | launcher | Reject; `meta` is internal only |
 | base-URL override | launcher/gateway | Treat as API-key-only upstream; Muse still receives loopback |
@@ -183,9 +195,13 @@ Muse.
 
 ## Retry and failure rules
 
-- Non-success upstream Responses statuses and bodies are forwarded through the
-  gateway's response-header allowlist. Failures raised inside catalog, search,
-  browser, or pre-stream transport handling return bounded gateway errors.
+- Final upstream Responses HTTP failures become a sanitized terminal SSE
+  failure. The pinned Muse host retries bare HTTP errors, even HTTP 400;
+  translating the final failure prevents a second retry loop in the harness.
+  Rate-limit and request headers pass through the response-header allowlist.
+  Search and browser failures use bounded gateway errors.
+- Isolated Muse settings use `provider_retry.max_retries = 0` so the stock
+  host cannot add a second provider retry loop to the transport's budget.
 - The current transport makes at most two pre-stream attempts for retryable send
   failures or upstream 5xx responses and can perform upstream Codex 401
   credential recovery. It does not retry after the response body has been
@@ -203,21 +219,24 @@ Muse.
 
 Current automated coverage consists of Rust unit and asynchronous fixture tests
 for routing, authentication, transport, catalog normalization, SSE validation,
-and gateway invariants, plus shell tests for release generation, verification,
-and installation. The repository also records the supported Muse schema/help
-baseline. This coverage does not yet constitute an end-to-end comparison with
-stock Muse or a live OpenAI run.
+MSP translation, and gateway invariants, plus shell tests for release generation,
+verification, and installation. The repository records the supported Muse
+schema/help baseline. `tests/scripts/cli-msp-parity-test.py` additionally compares
+the exact stock and wrapped executables against a deterministic endpoint:
+command routing, text, tool/result loops, terminal failures, request counts, and
+MSP turn events. It requires a separately installed Muse binary and runs outside
+public CI. Selected live subscription flows are also tested locally, not in CI.
 
-A supported release requires three additional compatibility gates:
+A supported release requires broader qualification across three lanes:
 
 1. stock Muse against a deterministic scripted endpoint;
 2. wrapped Muse against the same endpoint through the gateway; and
 3. wrapped Muse against the real OpenAI service.
 
-The planned first two gates compare normalized MSP transcripts, session exports,
+The first two lanes must expand to compare normalized MSP transcripts, session exports,
 hook logs, exit codes, and filesystem effects. Timestamps, random IDs, and
 provider model names may be normalized; safety decisions and tool-call identity
-must not be. The planned live gate validates real authentication, streaming,
+must not be. The full live gate validates real authentication, streaming,
 cancellation, model discovery, usage, and error behavior.
 
 Feature parity means the provider-independent harness behavior is unchanged. It

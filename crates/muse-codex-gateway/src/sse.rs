@@ -16,19 +16,45 @@ const EVENT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// because stock Muse retries a bare EOF even after observable output. A
 /// terminal provider event instead leaves the session resumable without
 /// replaying a completed tool call.
+#[cfg(test)]
 pub fn validated_stream(
     body: RawBody,
 ) -> impl Stream<Item = Result<Bytes, codex_transport::Error>> + Send + 'static {
-    validated_stream_with_options(body, EVENT_IDLE_TIMEOUT, MAX_EVENT_BYTES)
+    validated_stream_with_options_and_media_type(body, EVENT_IDLE_TIMEOUT, MAX_EVENT_BYTES, None)
 }
 
+/// Validates a Responses stream while retaining a pre-sanitized upstream MIME
+/// type solely as a protocol-failure diagnostic. A mismatched header never
+/// rejects an otherwise valid typed SSE stream.
+pub fn validated_stream_with_media_type(
+    body: RawBody,
+    upstream_media_type: Option<String>,
+) -> impl Stream<Item = Result<Bytes, codex_transport::Error>> + Send + 'static {
+    validated_stream_with_options_and_media_type(
+        body,
+        EVENT_IDLE_TIMEOUT,
+        MAX_EVENT_BYTES,
+        upstream_media_type,
+    )
+}
+
+#[cfg(test)]
 fn validated_stream_with_options(
     body: RawBody,
     idle_timeout: Duration,
     max_event_bytes: usize,
 ) -> impl Stream<Item = Result<Bytes, codex_transport::Error>> + Send + 'static {
+    validated_stream_with_options_and_media_type(body, idle_timeout, max_event_bytes, None)
+}
+
+fn validated_stream_with_options_and_media_type(
+    body: RawBody,
+    idle_timeout: Duration,
+    max_event_bytes: usize,
+    upstream_media_type: Option<String>,
+) -> impl Stream<Item = Result<Bytes, codex_transport::Error>> + Send + 'static {
     futures_util::stream::unfold(
-        State::new(body, idle_timeout, max_event_bytes),
+        State::new(body, idle_timeout, max_event_bytes, upstream_media_type),
         |mut state| async move {
             loop {
                 if let Some(frame) = state.pending.pop_front() {
@@ -84,10 +110,16 @@ struct State {
     response_id: Option<String>,
     model: Option<String>,
     last_sequence: u64,
+    upstream_media_type: Option<String>,
 }
 
 impl State {
-    fn new(body: RawBody, idle_timeout: Duration, max_event_bytes: usize) -> Self {
+    fn new(
+        body: RawBody,
+        idle_timeout: Duration,
+        max_event_bytes: usize,
+        upstream_media_type: Option<String>,
+    ) -> Self {
         Self {
             body,
             buffer: BytesMut::new(),
@@ -98,6 +130,7 @@ impl State {
             response_id: None,
             model: None,
             last_sequence: 0,
+            upstream_media_type,
         }
     }
 
@@ -115,6 +148,26 @@ impl State {
             match inspect_frame(&frame) {
                 Ok(FrameDisposition::Keep(event)) => {
                     self.observe(&event);
+                    if matches!(event.kind.as_str(), "error" | "response.failed") {
+                        // Provider error messages can echo request or account
+                        // data. Replace both supported failure shapes with a
+                        // complete static terminal event, retaining only the
+                        // small code/parameter allowlist Muse needs for error
+                        // handling and compaction.
+                        let failure = sanitize_stream_failure(&event.value);
+                        let frame = failure_frame(
+                            self.response_id.as_deref(),
+                            self.model.as_deref(),
+                            self.last_sequence,
+                            failure.code,
+                            failure.message,
+                            failure.parameter.as_deref(),
+                        );
+                        self.pending.push_back(frame);
+                        self.finished = true;
+                        self.buffer.clear();
+                        continue;
+                    }
                     let terminal = is_terminal_event(&event.kind);
                     self.pending.push_back(frame);
                     if terminal {
@@ -122,7 +175,11 @@ impl State {
                         self.buffer.clear();
                     }
                 }
-                Ok(FrameDisposition::Drop) => {}
+                Ok(FrameDisposition::Drop(event)) => {
+                    // Metadata is intentionally not exposed to Muse 1.0.3, but
+                    // it still participates in identity and sequence tracking.
+                    self.observe(&event);
+                }
                 Err(reason) => {
                     self.fail(reason);
                 }
@@ -135,12 +192,33 @@ impl State {
             self.last_sequence = self.last_sequence.max(sequence);
         }
         if let Some(response) = event.value.get("response") {
-            if let Some(id) = response.get("id").and_then(Value::as_str) {
+            if let Some(id) = response
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|value| safe_protocol_identifier(value))
+            {
                 self.response_id = Some(id.to_owned());
             }
-            if let Some(model) = response.get("model").and_then(Value::as_str) {
+            if let Some(model) = response
+                .get("model")
+                .and_then(Value::as_str)
+                .filter(|value| safe_protocol_identifier(value))
+            {
                 self.model = Some(model.to_owned());
             }
+        }
+        if let Some(id) = event
+            .value
+            .get("response_id")
+            .and_then(Value::as_str)
+            .filter(|value| safe_protocol_identifier(value))
+        {
+            self.response_id = Some(id.to_owned());
+        }
+        if let Some(model) =
+            event_reported_model(&event.value).filter(|value| safe_protocol_identifier(value))
+        {
+            self.model = Some(model.to_owned());
         }
     }
 
@@ -148,11 +226,15 @@ impl State {
         if self.finished {
             return;
         }
+        let reason = self.upstream_media_type.as_deref().map_or_else(
+            || reason.to_string(),
+            |media_type| format!("{reason} (upstream media type {media_type})"),
+        );
         self.pending.push_back(protocol_failure_frame(
             self.response_id.as_deref(),
             self.model.as_deref(),
             self.last_sequence.saturating_add(1),
-            reason,
+            &reason,
         ));
         self.finished = true;
         self.buffer.clear();
@@ -168,7 +250,7 @@ struct InspectedEvent {
 
 enum FrameDisposition {
     Keep(InspectedEvent),
-    Drop,
+    Drop(InspectedEvent),
 }
 
 fn inspect_frame(frame: &[u8]) -> Result<FrameDisposition, &'static str> {
@@ -194,7 +276,11 @@ fn inspect_frame(frame: &[u8]) -> Result<FrameDisposition, &'static str> {
 
     if data_lines.is_empty() {
         return if event_name.is_none() {
-            Ok(FrameDisposition::Drop)
+            Ok(FrameDisposition::Drop(InspectedEvent {
+                kind: "sse.comment".to_string(),
+                sequence_number: None,
+                value: Value::Null,
+            }))
         } else {
             Err("upstream SSE event contained no data")
         };
@@ -217,25 +303,184 @@ fn inspect_frame(frame: &[u8]) -> Result<FrameDisposition, &'static str> {
         return Err("upstream SSE event name did not match its JSON type");
     }
 
-    if is_metadata_event(kind) {
-        return Ok(FrameDisposition::Drop);
-    }
-    if !is_known_event(kind) {
+    let metadata = is_metadata_event(kind);
+    if !metadata && !is_known_event(kind) {
         return Err("upstream emitted an unknown non-metadata event");
     }
 
-    let sequence_number = value.get("sequence_number").and_then(Value::as_u64);
-    Ok(FrameDisposition::Keep(InspectedEvent {
+    let sequence_number = match value.get("sequence_number") {
+        Some(sequence) => Some(
+            sequence
+                .as_u64()
+                .ok_or("upstream SSE event had an invalid sequence_number")?,
+        ),
+        None => None,
+    };
+    validate_event_shape(kind, &value)?;
+    let event = InspectedEvent {
         kind: kind.to_owned(),
         sequence_number,
         value,
-    }))
+    };
+    if metadata {
+        Ok(FrameDisposition::Drop(event))
+    } else {
+        Ok(FrameDisposition::Keep(event))
+    }
+}
+
+fn validate_event_shape(kind: &str, value: &Value) -> Result<(), &'static str> {
+    if matches!(
+        kind,
+        "response.created" | "response.completed" | "response.failed" | "response.incomplete"
+    ) {
+        let response = value
+            .get("response")
+            .and_then(Value::as_object)
+            .ok_or("upstream response lifecycle event had no response object")?;
+        response
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| safe_protocol_identifier(id))
+            .ok_or("upstream response lifecycle event had no valid response id")?;
+    }
+
+    if matches!(
+        kind,
+        "response.output_text.delta"
+            | "response.refusal.delta"
+            | "response.function_call_arguments.delta"
+            | "response.custom_tool_call_input.delta"
+            | "response.reasoning_summary_text.delta"
+            | "response.reasoning_text.delta"
+            | "response.audio.delta"
+            | "response.audio.transcript.delta"
+            | "response.output_audio.delta"
+            | "response.output_audio_transcript.delta"
+            | "response.code_interpreter_call_code.delta"
+            | "response.mcp_call_arguments.delta"
+    ) && !value.get("delta").is_some_and(Value::is_string)
+    {
+        return Err("upstream response delta event had no string delta");
+    }
+
+    if matches!(
+        kind,
+        "response.output_item.added" | "response.output_item.done"
+    ) && !value.get("item").is_some_and(Value::is_object)
+    {
+        return Err("upstream response item event had no item object");
+    }
+
+    if kind == "error"
+        && value
+            .get("message")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+    {
+        return Err("upstream error event had no message");
+    }
+    Ok(())
+}
+
+fn safe_protocol_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 512
+        && !value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+}
+
+struct SanitizedStreamFailure {
+    code: &'static str,
+    message: &'static str,
+    parameter: Option<String>,
+}
+
+fn sanitize_stream_failure(value: &Value) -> SanitizedStreamFailure {
+    let error = value
+        .get("response")
+        .and_then(|response| response.get("error"))
+        .or_else(|| value.get("error"))
+        .unwrap_or(value);
+    let code = match error.get("code").and_then(Value::as_str) {
+        Some("context_length_exceeded") => "context_length_exceeded",
+        Some("rate_limit_exceeded" | "usage_limit_reached") => "rate_limit_exceeded",
+        Some("invalid_api_key") => "invalid_api_key",
+        Some("model_not_found") => "model_not_found",
+        Some("insufficient_quota") => "insufficient_quota",
+        Some("invalid_request") => "invalid_request",
+        _ => "invalid_request",
+    };
+    let message = match code {
+        "context_length_exceeded" => {
+            "The Codex stream reported that the model context window was exceeded; the request was not replayed and the session is resumable."
+        }
+        "rate_limit_exceeded" => {
+            "The Codex stream reported a rate limit; the request was not replayed and the session is resumable."
+        }
+        "invalid_api_key" => {
+            "The Codex stream rejected authentication; the request was not replayed and login is required."
+        }
+        "model_not_found" => {
+            "The Codex stream reported that the requested model was unavailable; the request was not replayed and the session is resumable."
+        }
+        "insufficient_quota" => {
+            "The Codex stream reported insufficient quota; the request was not replayed and the session is resumable."
+        }
+        _ => {
+            "The Codex stream reported a terminal provider error; the request was not replayed and the session is resumable."
+        }
+    };
+    let parameter = error
+        .get("param")
+        .and_then(Value::as_str)
+        .filter(|value| safe_error_parameter(value))
+        .map(ToOwned::to_owned);
+    SanitizedStreamFailure {
+        code,
+        message,
+        parameter,
+    }
+}
+
+fn safe_error_parameter(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'[' | b']')
+        })
+}
+
+fn event_reported_model(value: &Value) -> Option<&str> {
+    value
+        .get("response")
+        .and_then(|response| response.get("headers"))
+        .and_then(header_model)
+        .or_else(|| value.get("headers").and_then(header_model))
+}
+
+fn header_model(value: &Value) -> Option<&str> {
+    let headers = value.as_object()?;
+    headers.iter().find_map(|(name, value)| {
+        (name.eq_ignore_ascii_case("openai-model") || name.eq_ignore_ascii_case("x-openai-model"))
+            .then(|| json_string_or_first(value))
+            .flatten()
+    })
+}
+
+fn json_string_or_first(value: &Value) -> Option<&str> {
+    match value {
+        Value::String(value) => Some(value),
+        Value::Array(values) => values.first().and_then(json_string_or_first),
+        _ => None,
+    }
 }
 
 fn is_terminal_event(kind: &str) -> bool {
     matches!(
         kind,
-        "error" | "response.completed" | "response.failed" | "response.incomplete"
+        "response.completed" | "response.failed" | "response.incomplete"
     )
 }
 
@@ -336,13 +581,44 @@ fn protocol_failure_frame(
     sequence_number: u64,
     reason: &str,
 ) -> Bytes {
+    let message = format!("muse_codex_protocol_error: {reason}; session is resumable");
+    failure_frame(
+        response_id,
+        model,
+        sequence_number,
+        "invalid_request",
+        &message,
+        None,
+    )
+}
+
+pub(crate) fn gateway_failure_frame(
+    model: Option<&str>,
+    code: &'static str,
+    message: &str,
+    parameter: Option<&str>,
+) -> Bytes {
+    failure_frame(None, model, 0, code, message, parameter)
+}
+
+fn failure_frame(
+    response_id: Option<&str>,
+    model: Option<&str>,
+    sequence_number: u64,
+    code: &'static str,
+    message: &str,
+    parameter: Option<&str>,
+) -> Bytes {
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let response_id = response_id.unwrap_or("resp_muse_codex_protocol_error");
-    let model = model.unwrap_or("muse-codex");
-    let message = format!("muse_codex_protocol_error: {reason}; session is resumable");
+    let response_id = response_id
+        .filter(|value| safe_protocol_identifier(value))
+        .unwrap_or("resp_muse_codex_protocol_error");
+    let model = model
+        .filter(|value| safe_protocol_identifier(value))
+        .unwrap_or("muse-codex");
     let event = json!({
         "type": "response.failed",
         "sequence_number": sequence_number,
@@ -355,8 +631,9 @@ fn protocol_failure_frame(
             "output": [],
             "usage": Value::Null,
             "error": {
-                "code": "invalid_request",
+                "code": code,
                 "message": message,
+                "param": parameter,
             },
             "previous_response_id": Value::Null,
             "model": model,
@@ -370,6 +647,10 @@ fn protocol_failure_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
 
     fn body(chunks: Vec<Result<Bytes, codex_transport::Error>>) -> RawBody {
         Box::pin(futures_util::stream::iter(chunks))
@@ -461,7 +742,10 @@ mod tests {
     async fn rejects_unknown_non_metadata_event_but_drops_metadata() {
         let input = format!(
             "{}{}{}",
-            event("response.metadata", ",\"metadata\":{}"),
+            event(
+                "response.metadata",
+                ",\"metadata\":{\"future_secret\":\"must-not-cross\"}",
+            ),
             event("response.future_mutation", ",\"secret\":\"not reflected\""),
             event(
                 "response.completed",
@@ -472,6 +756,7 @@ mod tests {
             String::from_utf8(collect(validated_stream(body(vec![Ok(Bytes::from(input))]))).await)
                 .unwrap();
         assert!(!output.contains("response.metadata"));
+        assert!(!output.contains("must-not-cross"));
         assert!(!output.contains("response.future_mutation"));
         assert!(!output.contains("not reflected"));
         assert!(output.contains("muse_codex_protocol_error"));
@@ -532,5 +817,158 @@ mod tests {
         let input = format!("{completed}this must not be forwarded");
         let output = collect(validated_stream(body(vec![Ok(Bytes::from(input))]))).await;
         assert_eq!(output, completed.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn metadata_is_dropped_but_advances_failure_identity_and_sequence() {
+        let input = format!(
+            "{}{}",
+            event(
+                "response.metadata",
+                ",\"sequence_number\":9,\"response_id\":\"resp-meta\",\"headers\":{\"OpenAI-Model\":\"gpt-rerouted\"}",
+            ),
+            event("response.future_mutation", ",\"sequence_number\":10"),
+        );
+        let output =
+            String::from_utf8(collect(validated_stream(body(vec![Ok(Bytes::from(input))]))).await)
+                .unwrap();
+        assert!(!output.contains("response.metadata"));
+        assert!(output.contains("\"sequence_number\":10"));
+        assert!(output.contains("\"id\":\"resp-meta\""));
+        assert!(output.contains("\"model\":\"gpt-rerouted\""));
+    }
+
+    #[tokio::test]
+    async fn response_headers_override_top_level_metadata_model_arrays() {
+        let input = format!(
+            "{}{}",
+            event(
+                "response.created",
+                ",\"sequence_number\":3,\"headers\":{\"openai-model\":\"top-level\"},\"response\":{\"id\":\"resp-meta\",\"headers\":{\"OpenAI-Model\":[\"gpt-effective\"]}}",
+            ),
+            event("response.future_mutation", ",\"sequence_number\":4"),
+        );
+        let output =
+            String::from_utf8(collect(validated_stream(body(vec![Ok(Bytes::from(input))]))).await)
+                .unwrap();
+        assert!(output.contains("\"model\":\"gpt-effective\""));
+        assert!(!output.contains("\"model\":\"top-level\""));
+    }
+
+    #[tokio::test]
+    async fn raw_error_event_becomes_sanitized_terminal_failure() {
+        let input = event(
+            "error",
+            ",\"sequence_number\":4,\"message\":\"sensitive provider detail\"",
+        );
+        let output =
+            String::from_utf8(collect(validated_stream(body(vec![Ok(Bytes::from(input))]))).await)
+                .unwrap();
+        assert_eq!(output.matches("event: response.failed").count(), 1);
+        assert!(output.contains("\"sequence_number\":4"));
+        assert!(output.contains("terminal provider error"));
+        assert!(!output.contains("sensitive provider detail"));
+    }
+
+    #[tokio::test]
+    async fn response_failed_is_rebuilt_without_untrusted_error_details() {
+        let input = event(
+            "response.failed",
+            concat!(
+                ",\"sequence_number\":8,",
+                "\"response\":{",
+                "\"id\":\"resp-failed\",",
+                "\"model\":\"gpt-effective\",",
+                "\"error\":{",
+                "\"code\":\"context_length_exceeded\",",
+                "\"param\":\"input[0].content\",",
+                "\"message\":\"secret echoed prompt and account detail\"",
+                "},",
+                "\"output\":[{\"secret\":\"must not cross failure boundary\"}]",
+                "}",
+            ),
+        );
+        let output =
+            String::from_utf8(collect(validated_stream(body(vec![Ok(Bytes::from(input))]))).await)
+                .unwrap();
+        assert_eq!(output.matches("event: response.failed").count(), 1);
+        assert!(output.contains("\"sequence_number\":8"));
+        assert!(output.contains("\"id\":\"resp-failed\""));
+        assert!(output.contains("\"model\":\"gpt-effective\""));
+        assert!(output.contains("\"code\":\"context_length_exceeded\""));
+        assert!(output.contains("\"param\":\"input[0].content\""));
+        assert!(!output.contains("secret echoed prompt"));
+        assert!(!output.contains("must not cross failure boundary"));
+    }
+
+    #[tokio::test]
+    async fn malformed_known_event_shapes_fail_closed() {
+        for input in [
+            event("response.output_text.delta", ",\"delta\":null"),
+            event("response.output_item.done", ",\"item\":null"),
+            event("response.completed", ",\"response\":{}"),
+            event(
+                "response.output_text.delta",
+                ",\"sequence_number\":-1,\"delta\":\"bad sequence\"",
+            ),
+        ] {
+            let output = String::from_utf8(
+                collect(validated_stream(body(vec![Ok(Bytes::from(input))]))).await,
+            )
+            .unwrap();
+            assert!(output.contains("response.failed"), "{output}");
+            assert!(output.contains("muse_codex_protocol_error"), "{output}");
+        }
+    }
+
+    #[test]
+    fn frame_scanner_accepts_all_sse_line_endings_and_odd_offsets() {
+        assert_eq!(complete_frame_len(b"data: x\n\ntrailing"), Some(9));
+        assert_eq!(complete_frame_len(b"data: x\r\n\r\ntrailing"), Some(11));
+        assert_eq!(complete_frame_len(b"data: x\r\rtrailing"), Some(9));
+        assert_eq!(complete_frame_len(b"odd: 1234\ndata: x\n\n"), Some(19));
+        assert_eq!(complete_frame_len(b"data: x\r"), None);
+    }
+
+    struct DropObservedStream {
+        chunk: Option<Bytes>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Stream for DropObservedStream {
+        type Item = Result<Bytes, codex_transport::Error>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            match self.chunk.take() {
+                Some(chunk) => Poll::Ready(Some(Ok(chunk))),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    impl Drop for DropObservedStream {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_downstream_stream_cancels_the_upstream_body() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let upstream: RawBody = Box::pin(DropObservedStream {
+            chunk: Some(Bytes::from(event(
+                "response.created",
+                ",\"response\":{\"id\":\"resp-cancel\"}",
+            ))),
+            dropped: Arc::clone(&dropped),
+        });
+        let mut downstream = Box::pin(validated_stream(upstream));
+        assert!(downstream.next().await.is_some());
+        assert!(!dropped.load(Ordering::SeqCst));
+        drop(downstream);
+        assert!(dropped.load(Ordering::SeqCst));
     }
 }

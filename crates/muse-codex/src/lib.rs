@@ -7,13 +7,15 @@ use std::collections::HashSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::{Builder as TempBuilder, NamedTempFile, TempDir};
+
+mod msp;
 
 pub const SUPPORTED_MUSE_VERSION: &str = "1.0.3-R2198.1";
 pub const STOCK_MUSE_BASENAME: &str = "muse-bin-1.0.3-R2198.1";
@@ -35,6 +37,8 @@ const SECRET_ENVIRONMENT: &[&str] = &[
     "OPENAI_BASE_URL",
     "OPENAI_ORGANIZATION",
     "OPENAI_PROJECT",
+    "TBH_AUTH_BASE_URL",
+    "TBH_MINT_BASE_URL",
     "MUSE_CUSTOM_HEADERS",
     "OTEL_EXPORTER_OTLP_ENDPOINT",
 ];
@@ -43,39 +47,90 @@ const SECRET_ENVIRONMENT: &[&str] = &[
 pub enum Invocation {
     GatewayAuth(Vec<OsString>),
     Muse(Vec<OsString>),
+    Output { text: String, code: i32 },
 }
 
-/// Validates the public provider and classifies only the auth forms owned by
-/// muse-codex. Help and malformed auth invocations otherwise fall through to
-/// stock Muse so its parser and help text remain authoritative.
+/// Authentication always belongs to the wrapper, including help and invalid
+/// arguments. It must never reach the stock provider's credential handlers.
 pub fn classify_invocation(args: &[OsString]) -> Result<Invocation> {
-    let (provider_selected, without_provider) = validate_and_remove_provider(args)?;
-
-    if without_provider == [OsString::from("login")] {
-        return Ok(Invocation::GatewayAuth(os_args(&["auth", "login"])));
-    }
-    if without_provider == [OsString::from("login"), OsString::from("--device-auth")] {
-        return Ok(Invocation::GatewayAuth(os_args(&[
-            "auth",
-            "login",
-            "--device-auth",
-        ])));
-    }
-    if without_provider == [OsString::from("logout")] {
-        return Ok(Invocation::GatewayAuth(os_args(&["auth", "logout"])));
-    }
-    if provider_selected
-        && without_provider
-            == [
-                OsString::from("auth"),
-                OsString::from("set"),
-                OsString::from("--api-key-stdin"),
-            ]
+    let (_, without_provider) = validate_and_remove_provider(args)?;
+    if let Some(index) = stock_subcommand_index(&without_provider)
+        && matches!(
+            without_provider[index].to_str(),
+            Some("auth" | "login" | "logout")
+        )
     {
-        return Ok(Invocation::GatewayAuth(os_args(&["auth", "set-api-key"])));
+        if index != 0 {
+            return Ok(Invocation::Output {
+                text: "muse-codex: authentication commands accept --provider codex but no other startup options\n".into(),
+                code: 2,
+            });
+        }
+        return Ok(classify_auth_invocation(&without_provider));
     }
-
     Ok(Invocation::Muse(args.to_vec()))
+}
+
+fn classify_auth_invocation(args: &[OsString]) -> Invocation {
+    use clap::{Arg, ArgAction, Command};
+
+    let login = || {
+        Command::new("login")
+            .about("Sign in with a ChatGPT/Codex subscription")
+            .arg(
+                Arg::new("device-auth")
+                    .long("device-auth")
+                    .help("Use device authorization for a headless terminal")
+                    .action(ArgAction::SetTrue),
+            )
+    };
+    let logout = || Command::new("logout").about("Remove only saved Muse Codex credentials");
+    let parser = Command::new("muse-codex")
+        .disable_help_subcommand(true)
+        .subcommand(login())
+        .subcommand(logout())
+        .subcommand(
+            Command::new("auth")
+                .about("Manage isolated OpenAI credentials")
+                .subcommand_required(true)
+                .arg_required_else_help(true)
+                .subcommand(login())
+                .subcommand(logout())
+                .subcommand(Command::new("status").about("Show the saved authentication mode"))
+                .subcommand(
+                    Command::new("set")
+                        .about("Store an OpenAI API key in macOS Keychain")
+                        .after_help("The optional --provider codex flag is accepted. API keys are read only from stdin.")
+                        .arg(
+                            Arg::new("api-key-stdin")
+                                .long("api-key-stdin")
+                                .required(true)
+                                .action(ArgAction::SetTrue),
+                        ),
+                ),
+        );
+    let parsed = match parser.try_get_matches_from(
+        std::iter::once(OsString::from("muse-codex")).chain(args.iter().cloned()),
+    ) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return Invocation::Output {
+                text: error.to_string(),
+                code: error.exit_code(),
+            };
+        }
+    };
+    let (name, matches) = parsed.subcommand().expect("an auth command was selected");
+    let (name, matches) = if name == "auth" {
+        matches.subcommand().expect("auth subcommand is required")
+    } else {
+        (name, matches)
+    };
+    let mut arguments = os_args(&["auth", if name == "set" { "set-api-key" } else { name }]);
+    if name == "login" && matches.get_flag("device-auth") {
+        arguments.push("--device-auth".into());
+    }
+    Invocation::GatewayAuth(arguments)
 }
 
 fn os_args(values: &[&str]) -> Vec<OsString> {
@@ -123,6 +178,11 @@ fn validate_and_remove_provider(args: &[OsString]) -> Result<(bool, Vec<OsString
             index += 1;
             continue;
         }
+        if option_takes_value(arg) && index + 1 < args.len() {
+            remaining.extend(args[index..=index + 1].iter().cloned());
+            index += 2;
+            continue;
+        }
         remaining.push(arg.clone());
         index += 1;
     }
@@ -141,9 +201,7 @@ fn require_codex_provider(value: &OsStr) -> Result<()> {
 /// Replaces provider-routing flags while preserving every other argument and
 /// treating everything after `--` as opaque user input.
 pub fn rewrite_muse_args(args: &[OsString], base_url: &str) -> Vec<OsString> {
-    let mut rewritten = os_args(&["--provider", "meta", "--base-url"]);
-    rewritten.push(base_url.into());
-
+    let mut rewritten = Vec::with_capacity(args.len() + 4);
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -164,21 +222,206 @@ pub fn rewrite_muse_args(args: &[OsString], base_url: &str) -> Vec<OsString> {
             continue;
         }
 
+        if option_takes_value(arg) && index + 1 < args.len() {
+            rewritten.extend(args[index..=index + 1].iter().cloned());
+            index += 2;
+            continue;
+        }
+
         rewritten.push(arg.clone());
         index += 1;
     }
 
+    // Muse 1.0.3 dispatches a subcommand only when it is argv[1]. Injecting
+    // startup flags before `exec` or `serve` silently enters the TUI instead.
+    if let Some(index) = stock_subcommand_index(&rewritten) {
+        let subcommand = rewritten.remove(index);
+        let needs_routing_flags = subcommand == "exec" || subcommand == "resume";
+        rewritten.insert(0, subcommand);
+        if needs_routing_flags {
+            rewritten.splice(
+                1..1,
+                os_args(&["--provider", "meta", "--base-url", base_url]),
+            );
+        }
+        // `serve` does not accept provider flags. It uses the
+        // isolated endpoint settings and the private bearer environment.
+    } else {
+        rewritten.splice(
+            0..0,
+            os_args(&["--provider", "meta", "--base-url", base_url]),
+        );
+    }
     rewritten
 }
 
+fn take_exec_api_key_stdin(args: &[OsString]) -> (bool, Vec<OsString>) {
+    let is_exec = stock_subcommand_index(args).is_some_and(|index| args[index] == "exec");
+    if !is_exec {
+        return (false, args.to_vec());
+    }
+    let mut remaining = Vec::with_capacity(args.len());
+    let mut selected = false;
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" {
+            remaining.extend(args[index..].iter().cloned());
+            break;
+        }
+        if argument == "--api-key-stdin" {
+            selected = true;
+            index += 1;
+            continue;
+        }
+        let count = if option_takes_value(argument) && index + 1 < args.len() {
+            2
+        } else {
+            1
+        };
+        remaining.extend(args[index..index + count].iter().cloned());
+        index += count;
+    }
+    (selected, remaining)
+}
+
 /// Information-only calls do not need authentication or a running gateway.
-/// Keeping their argv untouched preserves stock Muse's exact help/version text.
+/// The stock parser owns help/version content; only provider labels are mapped.
 pub fn is_informational_invocation(args: &[OsString]) -> bool {
-    args.iter()
-        .take_while(|argument| *argument != "--")
-        .any(|argument| {
-            argument == "-h" || argument == "--help" || argument == "-V" || argument == "--version"
-        })
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" {
+            break;
+        }
+        if argument == "-h" || argument == "--help" || argument == "-V" || argument == "--version" {
+            return true;
+        }
+        index += if option_takes_value(argument) { 2 } else { 1 };
+    }
+    false
+}
+
+/// These commands inspect or change local harness state without a model turn.
+/// In particular, exporting the stable MSP schema must work while signed out.
+pub fn is_local_invocation(args: &[OsString]) -> bool {
+    stock_subcommand_index(args).is_some_and(|index| {
+        matches!(
+            args[index].to_str(),
+            Some(
+                "config"
+                    | "export"
+                    | "trace"
+                    | "skills"
+                    | "sandbox"
+                    | "schema"
+                    | "session-message"
+                    | "init"
+            )
+        )
+    })
+}
+
+fn stock_subcommand_index(args: &[OsString]) -> Option<usize> {
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" {
+            return None;
+        }
+        if option_takes_value(argument) {
+            index += 2;
+            continue;
+        }
+        if argument == "-w" || argument == "--worktree" {
+            index += 1;
+            if args
+                .get(index)
+                .is_some_and(|value| value == "off" || value == "create" || value == "existing")
+            {
+                index += 1;
+            }
+            continue;
+        }
+        if !is_option_like(argument) {
+            return matches!(
+                argument.to_str(),
+                Some(
+                    "config"
+                        | "export"
+                        | "trace"
+                        | "skills"
+                        | "sandbox"
+                        | "schema"
+                        | "session-message"
+                        | "init"
+                        | "exec"
+                        | "serve"
+                        | "resume"
+                        | "auth"
+                        | "login"
+                        | "logout"
+                )
+            )
+            .then_some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn option_takes_value(argument: &OsStr) -> bool {
+    matches!(
+        argument.to_str(),
+        Some(
+            "--provider"
+                | "--base-url"
+                | "--agents"
+                | "--preset"
+                | "--model"
+                | "--reasoning-effort"
+                | "--image"
+                | "--workspace"
+                | "--worktree-base"
+                | "--worktree-existing"
+                | "--approval-mode"
+                | "--permission-profile"
+                | "--approval-judge"
+                | "--echo-delay-ms"
+                | "--sandbox-network"
+                | "--prompt-file"
+                | "--context-compaction-strategy"
+                | "--context-compaction-soft-threshold"
+                | "--context-compaction-hard-threshold"
+                | "--max-model-steps"
+                | "--max-tool-output-bytes"
+                | "--session-id"
+                | "--out"
+                | "--format"
+        )
+    )
+}
+
+fn has_option(args: &[OsString], name: &str) -> bool {
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" {
+            break;
+        }
+        if argument == name {
+            return true;
+        }
+        index += if option_takes_value(argument) { 2 } else { 1 };
+    }
+    false
+}
+
+fn validate_msp_options(arguments: &[OsString]) -> Result<()> {
+    if stock_subcommand_index(arguments).is_some_and(|index| arguments[index] == "serve")
+        && has_option(arguments, "--no-session-log")
+    {
+        bail!(
+            "Muse 1.0.3 cannot deliver MSP turn events with --no-session-log. Run `muse-codex serve` without that flag; sessions stay in the isolated Muse Codex profile."
+        );
+    }
+    Ok(())
 }
 
 /// Returns the custom OpenAI-compatible upstream requested by the user. Muse
@@ -211,7 +454,7 @@ pub fn resolve_upstream_base_url(
             }
             merge_cli_base_url(&mut cli_value, OsStr::new(value))?;
         }
-        index += 1;
+        index += if option_takes_value(arg) { 2 } else { 1 };
     }
 
     let environment_value = environment_value.filter(|value| !value.is_empty());
@@ -309,6 +552,13 @@ pub fn discover_stock_muse(inputs: &DiscoveryInputs) -> Result<PathBuf> {
 /// Confirms that an independently installed stock executable is the exact
 /// compatibility baseline before it is allowed to own a session.
 pub fn verify_stock_muse_version(path: &Path) -> Result<()> {
+    if let Ok(current_exe) = env::current_exe()
+        && let (Ok(candidate), Ok(launcher)) =
+            (fs::canonicalize(path), fs::canonicalize(current_exe))
+        && candidate == launcher
+    {
+        bail!("MUSE_CODEX_MUSE_BIN must point to stock Muse, not the muse-codex launcher");
+    }
     let mut command = Command::new(path);
     command
         .arg("--version")
@@ -618,6 +868,15 @@ pub fn seed_stock_settings(config_home: &Path, base_url: &str) -> Result<PathBuf
         "endpoint_transport".into(),
         json!({"base_url": base_url, "auth": "bearer"}),
     );
+    // The gateway owns the bounded pre-stream retry budget. Muse's default
+    // policy retries HTTP 400 and disconnected streams up to ten times.
+    let retry = root.entry("provider_retry").or_insert_with(|| json!({}));
+    if !retry.is_object() {
+        *retry = json!({});
+    }
+    let retry = retry.as_object_mut().expect("provider retry is an object");
+    retry.remove("max_attempts");
+    retry.insert("max_retries".into(), json!(0));
     match root.get_mut("telemetry") {
         Some(Value::Object(telemetry)) => {
             telemetry.insert("enabled".into(), Value::Bool(false));
@@ -972,15 +1231,42 @@ impl SecretInput {
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStringExt;
-            Ok(Some(Self(value.into_vec())))
+            Self::parse(value.into_vec()).map(Some)
         }
         #[cfg(not(unix))]
         {
             let value = value
                 .into_string()
                 .map_err(|_| anyhow!("{name} is not valid Unicode"))?;
-            Ok(Some(Self(value.into_bytes())))
+            Self::parse(value.into_bytes()).map(Some)
         }
+    }
+
+    fn parse(bytes: Vec<u8>) -> Result<Self> {
+        const MAX_API_KEY_BYTES: usize = 16 * 1024;
+        let mut secret = Self(bytes);
+        if secret.0.len() > MAX_API_KEY_BYTES {
+            bail!("API key input exceeds the 16384-byte limit");
+        }
+        let value = std::str::from_utf8(&secret.0).context("API key input must be UTF-8")?;
+        let value = value.trim_end_matches(['\r', '\n']);
+        if value.is_empty()
+            || value
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control())
+        {
+            bail!("API key input must be non-empty and contain no whitespace");
+        }
+        let trimmed = value.as_bytes().to_vec();
+        secret.0.fill(0);
+        secret.0 = trimmed;
+        Ok(secret)
+    }
+
+    fn from_reader(reader: impl Read) -> Result<Self> {
+        let mut secret = Self(Vec::new());
+        reader.take(16 * 1024 + 1).read_to_end(&mut secret.0)?;
+        Self::parse(std::mem::take(&mut secret.0))
     }
 }
 
@@ -1113,10 +1399,17 @@ fn wait_for_gateway_ready(child: &mut Child, ready_file: &Path) -> Result<Gatewa
     let mut last_parse_error = None;
     loop {
         if let Some(status) = child.try_wait()? {
+            if let Some(message) = read_gateway_startup_failure(ready_file)? {
+                bail!("{message}");
+            }
             bail!(
                 "gateway could not initialize authentication or load the Codex model catalog ({}); run `muse-codex auth status`, then `muse-codex login` if needed",
                 display_exit_status(status)
             );
+        }
+
+        if let Some(message) = read_gateway_startup_failure(ready_file)? {
+            bail!("{message}");
         }
 
         match read_gateway_ready(ready_file) {
@@ -1136,6 +1429,66 @@ fn wait_for_gateway_ready(child: &mut Child, ready_file: &Path) -> Result<Gatewa
     }
 }
 
+fn read_gateway_startup_failure(ready_file: &Path) -> Result<Option<&'static str>> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StartupFailure {
+        schema_version: u32,
+        error: StartupError,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StartupError {
+        code: String,
+    }
+    let mut path = ready_file.as_os_str().to_os_string();
+    path.push(".error");
+    let Some(file) = open_private_gateway_file(Path::new(&path), 4096)? else {
+        return Ok(None);
+    };
+    let failure: StartupFailure = serde_json::from_reader(file.take(4097))
+        .context("invalid private gateway startup error")?;
+    if failure.schema_version != 1 {
+        bail!("unsupported gateway startup error schema");
+    }
+    let message = match failure.error.code.as_str() {
+        "authentication_required" => {
+            "No Codex credentials are saved. Run `muse-codex login` or `muse-codex auth set --provider codex --api-key-stdin`."
+        }
+        "authentication_failed" => {
+            "Codex authentication was rejected. Run `muse-codex login` to sign in again."
+        }
+        "custom_base_url_requires_api_key" => {
+            "A custom base URL is allowed only with API-key authentication. Remove --base-url/OPENAI_BASE_URL to use your ChatGPT subscription."
+        }
+        "invalid_base_url" => {
+            "The custom API base URL must use HTTPS and contain no credentials, query, or fragment."
+        }
+        "credential_store_unavailable" => {
+            "The isolated credential store could not be opened. Check macOS Keychain access and run `muse-codex auth status`."
+        }
+        "catalog_rate_limited" => {
+            "Codex model discovery is rate limited. Wait for the account limit to reset and retry."
+        }
+        "catalog_rejected" => {
+            "The provider rejected model discovery. Check account access with `muse-codex auth status`."
+        }
+        "catalog_invalid" => {
+            "The provider returned an incompatible model catalog. Update muse-codex before retrying."
+        }
+        "catalog_timeout" => {
+            "Codex model discovery timed out. Check your connection and any pending macOS Keychain prompt, then retry."
+        }
+        "network_unavailable" => {
+            "Could not reach the Codex provider. Check your connection and retry."
+        }
+        _ => {
+            "The private gateway could not start. Check the installed launcher/gateway pair and retry."
+        }
+    };
+    Ok(Some(message))
+}
+
 fn gateway_ready_timeout() -> Duration {
     env::var("MUSE_CODEX_GATEWAY_READY_TIMEOUT_MS")
         .ok()
@@ -1146,15 +1499,41 @@ fn gateway_ready_timeout() -> Duration {
 }
 
 fn read_gateway_ready(path: &Path) -> Result<Option<GatewayReady>> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
+    let Some(mut file) = open_private_gateway_file(path, MAX_GATEWAY_READY_BYTES)? else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_GATEWAY_READY_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_GATEWAY_READY_BYTES {
+        bail!("gateway readiness file exceeds the size limit");
+    }
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let ready = serde_json::from_slice(&bytes).context("invalid gateway readiness JSON")?;
+    Ok(Some(ready))
+}
+
+fn open_private_gateway_file(path: &Path, limit: u64) -> Result<Option<File>> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         bail!("gateway readiness path is not a regular file");
     }
-    if metadata.len() > MAX_GATEWAY_READY_BYTES {
+    if metadata.len() > limit {
         bail!("gateway readiness file exceeds the size limit");
     }
     #[cfg(unix)]
@@ -1166,20 +1545,19 @@ fn read_gateway_ready(path: &Path) -> Result<Option<GatewayReady>> {
         if metadata.nlink() != 1 {
             bail!("gateway readiness file has an unexpected link count");
         }
+        // SAFETY: geteuid has no arguments or preconditions.
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            bail!("gateway readiness file is not owned by the current user");
+        }
     }
-
-    let bytes = fs::read(path)?;
-    if bytes.is_empty() {
-        return Ok(None);
-    }
-    let ready = serde_json::from_slice(&bytes).context("invalid gateway readiness JSON")?;
-    Ok(Some(ready))
+    Ok(Some(file))
 }
 
 fn scrub_secret_environment(command: &mut Command) {
     for variable in SECRET_ENVIRONMENT {
         command.env_remove(variable);
     }
+    command.env("TBH_DISABLE_TELEMETRY", "1");
 }
 
 fn configure_hidden_gateway(command: &mut Command) {
@@ -1201,6 +1579,14 @@ pub fn run() -> Result<i32> {
     let discovery = DiscoveryInputs::from_environment();
 
     match classify_invocation(&arguments)? {
+        Invocation::Output { text, code } => {
+            if code == 0 {
+                print!("{text}");
+            } else {
+                eprint!("{text}");
+            }
+            Ok(code)
+        }
         Invocation::GatewayAuth(gateway_arguments) => {
             let gateway = discover_gateway(&discovery)?;
             run_gateway_auth(&gateway, &gateway_arguments)
@@ -1208,7 +1594,8 @@ pub fn run() -> Result<i32> {
         Invocation::Muse(muse_arguments) => {
             let stock_muse = discover_stock_muse(&discovery)?;
             verify_stock_muse_version(&stock_muse)?;
-            if is_informational_invocation(&muse_arguments) {
+            if is_informational_invocation(&muse_arguments) || is_local_invocation(&muse_arguments)
+            {
                 let stock_arguments = strip_public_provider_args(&muse_arguments)?;
                 run_stock_information(&stock_muse, &stock_arguments)
             } else {
@@ -1238,9 +1625,15 @@ fn run_stock_muse(
     stock_muse: &Path,
     arguments: &[OsString],
 ) -> Result<i32> {
+    validate_msp_options(arguments)?;
+    let (api_key_stdin, arguments) = take_exec_api_key_stdin(arguments);
     let upstream_base_url =
-        resolve_upstream_base_url(arguments, env::var_os("OPENAI_BASE_URL").as_deref())?;
-    let api_key = SecretInput::from_environment("OPENAI_API_KEY")?;
+        resolve_upstream_base_url(&arguments, env::var_os("OPENAI_BASE_URL").as_deref())?;
+    let api_key = if api_key_stdin {
+        Some(SecretInput::from_reader(std::io::stdin().lock())?)
+    } else {
+        SecretInput::from_environment("OPENAI_API_KEY")?
+    };
     let gateway = GatewayProcess::start(
         gateway_executable,
         upstream_base_url.as_deref(),
@@ -1257,7 +1650,10 @@ fn run_stock_muse(
     )?;
     let settings_path = seed_stock_settings(&directories.config_home, &gateway.ready.base_url)?;
     let auth_path = directories.config_home.join("muse").join("auth.json");
-    let rewritten = rewrite_muse_args(arguments, &gateway.ready.base_url);
+    let rewritten = rewrite_muse_args(&arguments, &gateway.ready.base_url);
+    let is_msp = rewritten
+        .first()
+        .is_some_and(|argument| argument == "serve");
 
     let mut command = Command::new(stock_muse);
     command
@@ -1271,6 +1667,12 @@ fn run_stock_muse(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     scrub_secret_environment(&mut command);
+    if api_key_stdin {
+        command.stdin(Stdio::null());
+    }
+    if is_msp {
+        command.stdin(Stdio::piped()).stdout(Stdio::piped());
+    }
     // META_API_KEY is intentionally reintroduced only after the inherited value
     // was removed; it authenticates exclusively to the private loopback gateway.
     command.env("META_API_KEY", &gateway.ready.token);
@@ -1282,22 +1684,44 @@ fn run_stock_muse(
             settings_path.display()
         )
     })?;
+    let relay = if is_msp {
+        match msp::MspRelay::start(&mut child) {
+            Ok(relay) => Some(relay),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
     let result = wait_with_signal_forwarding(&mut child);
+    let protocol_result = relay.map(msp::MspRelay::finish).transpose();
     drop(gateway);
+    protocol_result?;
     result
 }
 
 fn run_stock_information(stock_muse: &Path, arguments: &[OsString]) -> Result<i32> {
+    let mut arguments = arguments.to_vec();
+    if let Some(index) = stock_subcommand_index(&arguments) {
+        let command = arguments.remove(index);
+        arguments.insert(0, command);
+    }
     let directories = StockDirectories::discover()?;
     directories.create_private()?;
     // The endpoint is deliberately unroutable and remains inside the isolated
     // profile. Information-only calls do not make provider requests.
-    seed_stock_settings(&directories.config_home, "http://127.0.0.1:9")?;
+    // A help/schema command must not overwrite a running session's endpoint.
+    if !directories.config_home.join("muse/settings.json").exists() {
+        seed_stock_settings(&directories.config_home, "http://127.0.0.1:9")?;
+    }
     let auth_path = directories.config_home.join("muse").join("auth.json");
 
     let mut command = Command::new(stock_muse);
     command
-        .args(arguments)
+        .args(&arguments)
         .env("MUSE_NO_AUTO_UPDATE", "1")
         .env("XDG_CONFIG_HOME", &directories.config_home)
         .env("XDG_DATA_HOME", &directories.data_home)
@@ -1306,10 +1730,54 @@ fn run_stock_information(stock_muse: &Path, arguments: &[OsString]) -> Result<i3
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     scrub_secret_environment(&mut command);
+    if is_informational_invocation(&arguments) {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = command.output().context("failed to read stock Muse help")?;
+        std::io::stdout().write_all(&rewrite_provider_help(&output.stdout))?;
+        std::io::stderr().write_all(&rewrite_provider_help(&output.stderr))?;
+        return Ok(exit_status_code(output.status));
+    }
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to run stock Muse {}", stock_muse.display()))?;
     wait_with_signal_forwarding(&mut child)
+}
+
+fn rewrite_provider_help(bytes: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return bytes.to_vec();
+    };
+    text.replace("muse ", "muse-codex ")
+        .replace(
+            "Startup provider: echo or meta (default: meta)",
+            "Startup provider: codex (default: codex)",
+        )
+        .replace(
+            "Model id for non-echo providers",
+            "Model id from the authenticated Codex catalog",
+        )
+        .replace("Meta reasoning effort:", "Model reasoning effort:")
+        .replace(
+            "Override the Meta provider base URL",
+            "Override the OpenAI API base URL (API-key auth only)",
+        )
+        .replace(
+            "Override the provider base URL",
+            "Override the OpenAI API base URL (API-key auth only)",
+        )
+        .replace("Meta API parallel tool calls", "parallel tool calls")
+        .replace(
+            "Deterministic echo reply delay (echo provider only)",
+            "Inactive compatibility option; the test provider is unavailable",
+        )
+        .replace(
+            "Use memory-only sessions",
+            "Unavailable for MSP turns with the pinned Muse 1.0.3 host",
+        )
+        .into_bytes()
 }
 
 fn wait_with_signal_forwarding(child: &mut Child) -> Result<i32> {
@@ -1498,17 +1966,31 @@ mod tests {
     }
 
     #[test]
-    fn auth_help_and_unknown_forms_remain_stock_muse_commands() {
+    fn auth_help_status_and_invalid_forms_never_reach_stock_auth() {
         let help = args(&["login", "--help"]);
-        assert_eq!(
+        assert!(matches!(
             classify_invocation(&help).unwrap(),
-            Invocation::Muse(help.clone())
-        );
-        let incomplete = args(&["auth", "set", "--api-key-stdin"]);
+            Invocation::Output { code: 0, .. }
+        ));
         assert_eq!(
-            classify_invocation(&incomplete).unwrap(),
-            Invocation::Muse(incomplete.clone())
+            classify_invocation(&args(&["auth", "set", "--api-key-stdin"])).unwrap(),
+            Invocation::GatewayAuth(args(&["auth", "set-api-key"]))
         );
+        assert_eq!(
+            classify_invocation(&args(&["auth", "status"])).unwrap(),
+            Invocation::GatewayAuth(args(&["auth", "status"]))
+        );
+        for command in [
+            args(&["auth", "set"]),
+            args(&["login", "--bad"]),
+            args(&["logout", "extra"]),
+            args(&["--model", "gpt-test", "auth", "set"]),
+        ] {
+            assert!(matches!(
+                classify_invocation(&command).unwrap(),
+                Invocation::Output { code: 2, .. }
+            ));
+        }
     }
 
     #[test]
@@ -1553,11 +2035,11 @@ mod tests {
         assert_eq!(
             rewrite_muse_args(&original, "http://127.0.0.1:4321"),
             args(&[
+                "exec",
                 "--provider",
                 "meta",
                 "--base-url",
                 "http://127.0.0.1:4321",
-                "exec",
                 "--json",
                 "prompt",
             ])
@@ -1576,11 +2058,11 @@ mod tests {
         assert_eq!(
             rewrite_muse_args(&original, "http://127.0.0.1:4321"),
             args(&[
+                "exec",
                 "--provider",
                 "meta",
                 "--base-url",
                 "http://127.0.0.1:4321",
-                "exec",
                 "--",
                 "--provider",
                 "openai",
@@ -1595,12 +2077,12 @@ mod tests {
         assert_eq!(
             rewrite_muse_args(&original, "http://127.0.0.1:4321"),
             args(&[
+                "exec",
                 "--provider",
                 "meta",
                 "--base-url",
                 "http://127.0.0.1:4321",
                 "--model=gpt-explicit",
-                "exec",
                 "prompt",
             ])
         );
@@ -1613,11 +2095,11 @@ mod tests {
         assert_eq!(
             rewritten,
             args(&[
+                "exec",
                 "--provider",
                 "meta",
                 "--base-url",
                 "http://127.0.0.1:4321",
-                "exec",
                 "--",
                 "--model",
                 "literal",
@@ -1632,6 +2114,134 @@ mod tests {
         assert!(!is_informational_invocation(&args(&[
             "exec", "--", "--help"
         ])));
+        assert!(!is_informational_invocation(&args(&[
+            "exec",
+            "--prompt-file",
+            "--help"
+        ])));
+    }
+
+    #[test]
+    fn model_free_commands_and_serve_preserve_their_parser_scope() {
+        assert!(is_local_invocation(&args(&[
+            "schema",
+            "generate-json-schema",
+            "--out",
+            "schema"
+        ])));
+        assert!(is_local_invocation(&args(&[
+            "--provider",
+            "codex",
+            "skills",
+            "list"
+        ])));
+        assert!(!is_local_invocation(&args(&["--model", "schema", "hello"])));
+        assert!(!is_local_invocation(&args(&["exec", "schema"])));
+        assert_eq!(
+            rewrite_muse_args(
+                &args(&["serve", "--no-session-log"]),
+                "http://127.0.0.1:1234"
+            ),
+            args(&["serve", "--no-session-log"])
+        );
+        let resumed = rewrite_muse_args(&args(&["resume", "--last"]), "http://127.0.0.1:1234");
+        assert_eq!(&resumed[..3], &args(&["resume", "--provider", "meta"]));
+        assert!(validate_msp_options(&args(&["serve", "--no-session-log"])).is_err());
+        assert!(validate_msp_options(&args(&["serve"])).is_ok());
+        assert!(validate_msp_options(&args(&["exec", "--no-session-log", "hello"])).is_ok());
+    }
+
+    #[test]
+    fn routing_never_consumes_another_options_literal_value() {
+        let original = args(&[
+            "exec",
+            "--prompt-file",
+            "--base-url=https://literal.invalid",
+        ]);
+        assert_eq!(resolve_upstream_base_url(&original, None).unwrap(), None);
+        let rewritten = rewrite_muse_args(&original, "http://127.0.0.1:1234");
+        assert_eq!(&rewritten[5..], &original[1..]);
+        let literal_provider = args(&["exec", "--prompt-file", "--provider=meta"]);
+        assert_eq!(
+            strip_public_provider_args(&literal_provider).unwrap(),
+            literal_provider
+        );
+    }
+
+    #[test]
+    fn exec_stdin_credentials_are_consumed_only_by_the_wrapper() {
+        assert_eq!(
+            take_exec_api_key_stdin(&args(&["exec", "--api-key-stdin", "hello"])),
+            (true, args(&["exec", "hello"]))
+        );
+        for original in [
+            args(&["exec", "--", "--api-key-stdin"]),
+            args(&["exec", "--prompt-file", "--api-key-stdin"]),
+        ] {
+            assert_eq!(take_exec_api_key_stdin(&original), (false, original));
+        }
+        assert_eq!(
+            SecretInput::from_reader(&b"sk-fixture\n"[..]).unwrap().0,
+            b"sk-fixture"
+        );
+        assert!(SecretInput::parse(vec![b'x'; 16 * 1024 + 1]).is_err());
+        assert!(SecretInput::parse(b"sk-one sk-two".to_vec()).is_err());
+        assert!(SecretInput::parse(b" sk-fixture".to_vec()).is_err());
+        assert!(SecretInput::parse(b"sk-fixture \n".to_vec()).is_err());
+        assert!(SecretInput::parse(b"\nsk-fixture".to_vec()).is_err());
+        assert!(SecretInput::parse(vec![0xff]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readiness_open_rejects_links_and_nonprivate_files() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("ready.json");
+        fs::write(&path, b"{}").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(open_private_gateway_file(&path, 10).unwrap().is_some());
+        assert!(open_private_gateway_file(&path, 1).is_err());
+        let link = temporary.path().join("link");
+        symlink(&path, &link).unwrap();
+        assert!(open_private_gateway_file(&link, 10).is_err());
+        fs::hard_link(&path, temporary.path().join("hard-link")).unwrap();
+        assert!(open_private_gateway_file(&path, 10).is_err());
+        fs::remove_file(temporary.path().join("hard-link")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(open_private_gateway_file(&path, 10).is_err());
+    }
+
+    #[test]
+    fn startup_diagnostics_are_static_and_never_echo_provider_payloads() {
+        let temporary = tempfile::tempdir().unwrap();
+        let ready = temporary.path().join("ready.json");
+        let error_path = temporary.path().join("ready.json.error");
+        fs::write(
+            &error_path,
+            br#"{"schema_version":1,"error":{"code":"custom_base_url_requires_api_key"}}"#,
+        )
+        .unwrap();
+        set_file_mode_0600(&error_path).unwrap();
+        assert!(
+            read_gateway_startup_failure(&ready)
+                .unwrap()
+                .unwrap()
+                .contains("API-key authentication")
+        );
+        fs::write(
+            &error_path,
+            br#"{"schema_version":1,"error":{"code":"untrusted-secret-value"}}"#,
+        )
+        .unwrap();
+        assert!(
+            !read_gateway_startup_failure(&ready)
+                .unwrap()
+                .unwrap()
+                .contains("untrusted-secret-value")
+        );
+        fs::write(&error_path, br#"{"schema_version":1,"error":{"code":"authentication_failed","body":"untrusted-secret-value"}}"#).unwrap();
+        assert!(read_gateway_startup_failure(&ready).is_err());
     }
 
     #[test]
@@ -1765,6 +2375,7 @@ mod tests {
         assert_eq!(value["theme"], "dark");
         assert_eq!(value["telemetry"]["detail"], "keep");
         assert_eq!(value["telemetry"]["enabled"], false);
+        assert_eq!(value["provider_retry"]["max_retries"], 0);
         assert_eq!(
             value["endpoint_transport"],
             json!({"base_url": "http://127.0.0.1:4321", "auth": "bearer"})

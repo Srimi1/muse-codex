@@ -375,17 +375,26 @@ fn read_api_key(reader: &mut dyn Read) -> Result<SecretString> {
         return Err(Error::ApiKeyTooLong(MAX_API_KEY_BYTES));
     }
     let raw = String::from_utf8(bytes).map_err(|_| Error::ApiKeyNotUtf8)?;
-    let trimmed = raw.trim();
-    validate_api_key(trimmed)?;
-    Ok(SecretString::from(trimmed.to_owned()))
+    // A terminal contributes line endings, but spaces and tabs may be part of
+    // an accidental paste. Do not silently alter those characters into a
+    // different credential.
+    let without_line_ending = raw.trim_end_matches(['\r', '\n']);
+    validate_api_key(without_line_ending)?;
+    Ok(SecretString::from(without_line_ending.to_owned()))
 }
 
-fn validate_api_key(api_key: &str) -> Result<()> {
+pub(crate) fn validate_api_key(api_key: &str) -> Result<()> {
     if api_key.is_empty() {
         return Err(Error::EmptyApiKey);
     }
+    if api_key.len() > MAX_API_KEY_BYTES {
+        return Err(Error::ApiKeyTooLong(MAX_API_KEY_BYTES));
+    }
     if api_key.chars().any(char::is_whitespace) {
         return Err(Error::ApiKeyContainsWhitespace);
+    }
+    if api_key.chars().any(char::is_control) {
+        return Err(Error::ApiKeyContainsControlCharacters);
     }
     Ok(())
 }
@@ -408,6 +417,33 @@ mod tests {
         assert!(matches!(
             read_api_key(&mut input),
             Err(Error::ApiKeyContainsWhitespace)
+        ));
+    }
+
+    #[test]
+    fn reader_does_not_silently_trim_spaces_or_tabs() {
+        for bytes in [
+            &b" sk-fixture\n"[..],
+            &b"sk-fixture \n"[..],
+            &b"sk-fixture\t\n"[..],
+        ] {
+            let mut input = bytes;
+            assert!(matches!(
+                read_api_key(&mut input),
+                Err(Error::ApiKeyContainsWhitespace)
+            ));
+        }
+    }
+
+    #[test]
+    fn direct_validation_enforces_size_and_control_character_limits() {
+        assert!(matches!(
+            validate_api_key(&"x".repeat(MAX_API_KEY_BYTES + 1)),
+            Err(Error::ApiKeyTooLong(MAX_API_KEY_BYTES))
+        ));
+        assert!(matches!(
+            validate_api_key("sk-fixture\0suffix"),
+            Err(Error::ApiKeyContainsControlCharacters)
         ));
     }
 

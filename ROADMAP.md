@@ -10,6 +10,9 @@ before a broader release.
 - Browser, device, and API-key authentication with isolated credential state.
 - Exact Muse Code `1.0.3-R2198.1` version gate.
 - Unit and deterministic fixture coverage for first-party crates.
+- Credential-free stock-vs-wrapped CLI/MSP differential harness, including
+  tool loops and single-request terminal failure checks.
+- Schema-preserving MSP provider-label adapter and protocol command routing.
 - Signed private-release manifest and installer tooling.
 - Architecture, security, installation, configuration, and contribution docs.
 

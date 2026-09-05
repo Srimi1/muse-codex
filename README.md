@@ -138,6 +138,7 @@ isolated operating-system keyring namespace rather than a plaintext
 muse-codex
 muse-codex exec "Explain the failing tests, then propose a fix"
 muse-codex resume
+muse-codex serve
 ```
 
 Arguments unrelated to provider routing pass through to Muse. The public
@@ -169,9 +170,13 @@ not a public issue.
   tool choices or produce identical output.
 - The ChatGPT backend is private and unstable. The vendored Codex source is open
   source, but its Rust crates are not a stable library API.
-- Stock-vs-wrapped transcript tests and live OpenAI validation remain release
-  gates; the public automated suite currently covers first-party unit tests,
-  deterministic fixtures, and release tooling.
+- Deterministic stock-vs-wrapped CLI/MSP tests cover text, tools, terminal
+  failures, and protocol routing. Full feature parity remains a release gate;
+  the public CI suite cannot run the separately licensed stock binary.
+- Live subscription text, tool/result, and MSP restart/resume smoke tests pass
+  locally. These checks do not qualify every model, account, or Muse feature.
+- `serve --no-session-log` is unsupported because the pinned host does not
+  deliver MSP turn events in memory-only mode. Use normal `serve` instead.
 - New response event types, auxiliary routes, and Muse releases require explicit
   compatibility work before support is claimed.
 - Hooks, MCP servers, skills, and plugins retain Muse's existing trust model.
@@ -185,7 +190,9 @@ Track planned qualification work in the [Roadmap](ROADMAP.md).
 | [Installation](docs/INSTALLATION.md) | Source builds and signed private-feed installation |
 | [Configuration](docs/CONFIGURATION.md) | Environment, authentication, and endpoint behavior |
 | [Architecture](docs/ARCHITECTURE.md) | Components, data flow, command routing, and failure rules |
+| [CLI and protocol](docs/PROTOCOL.md) | MSP provider mapping, streaming, and qualification limits |
 | [Security model](docs/SECURITY.md) | Trust boundaries, protected assets, and residual risks |
+| [Dependency review](docs/DEPENDENCY_REVIEW.md) | Reachability review of open pinned-dependency alerts |
 | [Releasing](docs/RELEASING.md) | Private signed-release process and checklist |
 | [Contributing](CONTRIBUTING.md) | Development workflow and review expectations |
 | [Support](SUPPORT.md) | Supported scope and help channels |
@@ -206,6 +213,15 @@ bash tests/scripts/release-tooling-test.sh
 
 CI runs the same quality gates and an Apple-silicon release build. Unit and
 fixture tests do not require live OpenAI or Meta credentials.
+
+With the exact stock binary installed, run the additional credential-free
+CLI/MSP differential suite:
+
+```sh
+cargo build --workspace --locked
+MUSE_CODEX_MUSE_BIN=/absolute/path/to/muse-bin-1.0.3-R2198.1 \
+  python3 tests/scripts/cli-msp-parity-test.py
+```
 
 Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), use the
 issue forms for scoped proposals and reproducible bugs, and keep security

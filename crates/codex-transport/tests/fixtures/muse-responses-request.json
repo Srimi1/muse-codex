@@ -1,0 +1,76 @@
+{
+  "model": "gpt-fixture",
+  "instructions": "Fixture instructions",
+  "input": [
+    {
+      "type": "message",
+      "role": "developer",
+      "content": "Keep the harness in control."
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        { "type": "input_text", "text": "Inspect this image." },
+        {
+          "type": "input_image",
+          "image_url": "data:image/png;base64,iVBORw0KGgo=",
+          "detail": "high"
+        }
+      ]
+    },
+    {
+      "type": "reasoning",
+      "id": "rs_fixture",
+      "summary": [{ "type": "summary_text", "text": "Fixture summary" }],
+      "encrypted_content": "encrypted-fixture"
+    },
+    {
+      "type": "message",
+      "id": "msg_fixture",
+      "role": "assistant",
+      "content": "I will call the fixture tool."
+    },
+    {
+      "type": "function_call",
+      "id": "fc_fixture",
+      "call_id": "call_fixture",
+      "name": "read_fixture",
+      "arguments": "{\"path\":\"fixture.txt\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "call_fixture",
+      "output": "fixture output"
+    }
+  ],
+  "tools": [
+    {
+      "type": "namespace",
+      "name": "muse",
+      "description": "Fixture namespace",
+      "tools": [
+        {
+          "type": "function",
+          "name": "read_fixture",
+          "description": "Read a fixture",
+          "parameters": {
+            "type": "object",
+            "properties": { "path": { "type": "string" } },
+            "required": ["path"]
+          }
+        }
+      ]
+    }
+  ],
+  "parallel_tool_calls": false,
+  "reasoning": { "effort": "medium", "summary": "auto" },
+  "include": ["reasoning.encrypted_content", "reasoning.encrypted_content"],
+  "max_output_tokens": 4096,
+  "previous_response_id": null,
+  "conversation": null,
+  "store": true,
+  "stream": false,
+  "client_metadata": { "fixture": "legacy-provider-value" },
+  "metadata": { "fixture": "public-api-value" }
+}
