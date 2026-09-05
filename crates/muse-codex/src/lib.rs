@@ -3,6 +3,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use std::collections::HashSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
@@ -18,7 +19,11 @@ pub const SUPPORTED_MUSE_VERSION: &str = "1.0.3-R2198.1";
 pub const STOCK_MUSE_BASENAME: &str = "muse-bin-1.0.3-R2198.1";
 pub const STOCK_MUSE_COMMAND: &str = "muse";
 pub const GATEWAY_BASENAME: &str = "muse-codex-gateway";
-pub const DEFAULT_GATEWAY_READY_TIMEOUT: Duration = Duration::from_secs(15);
+pub const DEFAULT_GATEWAY_READY_TIMEOUT: Duration = Duration::from_secs(100);
+pub const GATEWAY_READY_SCHEMA_VERSION: u32 = 2;
+const MAX_GATEWAY_READY_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_GATEWAY_MODELS: usize = 4096;
+const STOCK_MODEL_CATALOG_FILE: &str = "6d657461__p746268.json";
 
 const SECRET_ENVIRONMENT: &[&str] = &[
     "OPENAI_API_KEY",
@@ -640,14 +645,139 @@ pub fn seed_stock_settings(config_home: &Path, base_url: &str) -> Result<PathBuf
     Ok(path)
 }
 
+/// Writes Muse 1.0.3's normalized provider cache from the authenticated Codex
+/// catalog. The stock raw-catalog decoder cannot preserve multiple rows when a
+/// provider omits optional release dates or output limits, while this cache
+/// schema represents those unknowns as JSON null without inventing values.
+pub fn seed_stock_model_catalog(
+    data_home: &Path,
+    models: &[GatewayModel],
+    default_model: &str,
+) -> Result<PathBuf> {
+    validate_gateway_models(models, default_model)?;
+    let muse_data = data_home.join("muse");
+    let catalog_directory = muse_data.join("model-catalog");
+    ensure_owned_catalog_directory(&muse_data)?;
+    ensure_owned_catalog_directory(&catalog_directory)?;
+    let path = catalog_directory.join(STOCK_MODEL_CATALOG_FILE);
+    if path.exists() {
+        reject_symlink_or_non_file(&path)?;
+    }
+
+    let rows = models
+        .iter()
+        .enumerate()
+        .map(|(index, model)| {
+            json!({
+                "model_id": model.id,
+                "display_label": model.display_name.as_deref().unwrap_or(&model.id),
+                "provider_id": "meta",
+                "profile_id": "tbh",
+                "visibility": if model.is_visible { "visible" } else { "hidden" },
+                "release_date": null,
+                "display_order": index,
+                "is_current": model.is_default,
+                "is_default": model.is_default,
+                "roles": [],
+                "context_limit": model.context_window,
+                "output_limit": model.max_output_tokens,
+                "description": model.description,
+                "cost": null,
+                "reasoning_effort_variants": reasoning_effort_variants(model),
+            })
+        })
+        .collect::<Vec<_>>();
+    let value = json!({
+        "schema_version": 1,
+        "provider_id": "meta",
+        "profile_id": "tbh",
+        "source": "provider_catalog",
+        "rows": rows,
+    });
+    let mut serialized = serde_json::to_vec_pretty(&value)?;
+    serialized.push(b'\n');
+    let mut temporary = NamedTempFile::new_in(&catalog_directory).with_context(|| {
+        format!(
+            "failed to stage model catalog in {}",
+            catalog_directory.display()
+        )
+    })?;
+    protect_file(temporary.as_file())?;
+    temporary.write_all(&serialized)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(&path).map_err(|error| {
+        anyhow!(
+            "failed to install isolated model catalog at {}: {}",
+            path.display(),
+            error.error
+        )
+    })?;
+    set_file_mode_0600(&path)?;
+    Ok(path)
+}
+
+fn reasoning_effort_variants(model: &GatewayModel) -> Option<Vec<Value>> {
+    (!model.supported_reasoning_efforts.is_empty()).then(|| {
+        model
+            .supported_reasoning_efforts
+            .iter()
+            .map(|effort| json!({"tier": effort, "description": null}))
+            .collect()
+    })
+}
+
+fn ensure_owned_catalog_directory(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                bail!("model catalog path {} is not a directory", path.display());
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                // SAFETY: geteuid has no preconditions and does not dereference pointers.
+                let effective_uid = unsafe { libc::geteuid() };
+                if metadata.uid() != effective_uid || metadata.permissions().mode() & 0o022 != 0 {
+                    bail!(
+                        "model catalog directory {} is not privately owned",
+                        path.display()
+                    );
+                }
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                let mut builder = fs::DirBuilder::new();
+                match builder.mode(0o700).create(path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        return ensure_owned_catalog_directory(path);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            #[cfg(not(unix))]
+            match fs::DirBuilder::new().create(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return ensure_owned_catalog_directory(path);
+                }
+                Err(error) => return Err(error.into()),
+            }
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn reject_symlink_or_non_file(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {}", path.display()))?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-        bail!(
-            "refusing to use non-regular settings file {}",
-            path.display()
-        );
+        bail!("refusing to use non-regular file {}", path.display());
     }
     Ok(())
 }
@@ -675,18 +805,38 @@ pub struct GatewayReady {
     pub schema_version: u32,
     pub base_url: String,
     pub token: String,
+    pub default_model: String,
+    pub models: Vec<GatewayModel>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct GatewayModel {
+    pub id: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub context_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub supported_reasoning_efforts: Vec<String>,
+    #[serde(default)]
+    pub default_reasoning_effort: Option<String>,
+    pub is_visible: bool,
+    pub is_default: bool,
 }
 
 impl GatewayReady {
     fn validate(self) -> Result<Self> {
-        if self.schema_version != 1 {
+        if self.schema_version != GATEWAY_READY_SCHEMA_VERSION {
             bail!(
-                "unsupported gateway readiness schema {}; expected 1",
-                self.schema_version
+                "unsupported gateway readiness schema {}; expected {}",
+                self.schema_version,
+                GATEWAY_READY_SCHEMA_VERSION
             );
         }
         validate_loopback_base_url(&self.base_url)?;
         validate_gateway_token(&self.token)?;
+        validate_gateway_model(&self.default_model)?;
+        validate_gateway_models(&self.models, &self.default_model)?;
         Ok(self)
     }
 }
@@ -714,6 +864,96 @@ fn validate_gateway_token(token: &str) -> Result<()> {
         .map_err(|_| anyhow!("gateway returned a malformed bearer token"))?;
     if decoded.len() != 32 {
         bail!("gateway bearer token is not 256 bits");
+    }
+    Ok(())
+}
+
+fn validate_gateway_model(model: &str) -> Result<()> {
+    if model.is_empty()
+        || model.len() > 256
+        || model.starts_with('-')
+        || model
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        bail!("gateway returned an invalid default model id");
+    }
+    Ok(())
+}
+
+fn validate_gateway_models(models: &[GatewayModel], default_model: &str) -> Result<()> {
+    if models.is_empty() || models.len() > MAX_GATEWAY_MODELS {
+        bail!("gateway returned an invalid model count");
+    }
+
+    let mut ids = HashSet::with_capacity(models.len());
+    let mut matching_default = 0_usize;
+    let mut visible = 0_usize;
+    for model in models {
+        validate_gateway_model(&model.id)?;
+        if !ids.insert(model.id.as_str()) {
+            bail!("gateway returned duplicate model ids");
+        }
+        if model.display_name.as_ref().is_some_and(|label| {
+            label.is_empty() || label.len() > 512 || label.chars().any(char::is_control)
+        }) {
+            bail!("gateway returned an invalid model display name");
+        }
+        if model
+            .description
+            .as_ref()
+            .is_some_and(|description| description.len() > 16 * 1024 || description.contains('\0'))
+        {
+            bail!("gateway returned an invalid model description");
+        }
+        if model
+            .context_window
+            .is_some_and(|limit| limit == 0 || limit > i64::MAX as u64)
+            || model
+                .max_output_tokens
+                .is_some_and(|limit| limit == 0 || limit > i64::MAX as u64)
+        {
+            bail!("gateway returned an invalid model limit");
+        }
+        let mut reasoning_efforts = HashSet::with_capacity(model.supported_reasoning_efforts.len());
+        if model.supported_reasoning_efforts.len() > 32 {
+            bail!("gateway returned too many reasoning effort variants");
+        }
+        for effort in &model.supported_reasoning_efforts {
+            if effort.is_empty()
+                || effort.len() > 64
+                || effort
+                    .chars()
+                    .any(|character| character.is_control() || character.is_whitespace())
+                || !reasoning_efforts.insert(effort.as_str())
+            {
+                bail!("gateway returned an invalid reasoning effort variant");
+            }
+        }
+        if model
+            .default_reasoning_effort
+            .as_ref()
+            .is_some_and(|effort| {
+                !model
+                    .supported_reasoning_efforts
+                    .iter()
+                    .any(|supported| supported == effort)
+            })
+        {
+            bail!("gateway returned an unsupported default reasoning effort");
+        }
+        if model.is_visible {
+            visible += 1;
+        }
+        if model.is_default {
+            if !model.is_visible || model.id != default_model {
+                bail!("gateway default model metadata is inconsistent");
+            }
+            matching_default += 1;
+        }
+    }
+    if visible == 0 || matching_default != 1 {
+        bail!("gateway returned no unique visible default model");
     }
     Ok(())
 }
@@ -874,7 +1114,7 @@ fn wait_for_gateway_ready(child: &mut Child, ready_file: &Path) -> Result<Gatewa
     loop {
         if let Some(status) = child.try_wait()? {
             bail!(
-                "gateway exited before becoming ready ({})",
+                "gateway could not initialize authentication or load the Codex model catalog ({}); run `muse-codex auth status`, then `muse-codex login` if needed",
                 display_exit_status(status)
             );
         }
@@ -888,7 +1128,9 @@ fn wait_for_gateway_ready(child: &mut Child, ready_file: &Path) -> Result<Gatewa
             if let Some(error) = last_parse_error {
                 return Err(error.context("gateway readiness file never became valid"));
             }
-            bail!("gateway did not become ready before the startup timeout");
+            bail!(
+                "Codex model catalog did not load before the gateway startup timeout; check your connection and retry"
+            );
         }
         thread::sleep(Duration::from_millis(25));
     }
@@ -911,6 +1153,9 @@ fn read_gateway_ready(path: &Path) -> Result<Option<GatewayReady>> {
     };
     if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
         bail!("gateway readiness path is not a regular file");
+    }
+    if metadata.len() > MAX_GATEWAY_READY_BYTES {
+        bail!("gateway readiness file exceeds the size limit");
     }
     #[cfg(unix)]
     {
@@ -1005,6 +1250,11 @@ fn run_stock_muse(
 
     let directories = StockDirectories::discover()?;
     directories.create_private()?;
+    seed_stock_model_catalog(
+        &directories.data_home,
+        &gateway.ready.models,
+        &gateway.ready.default_model,
+    )?;
     let settings_path = seed_stock_settings(&directories.config_home, &gateway.ready.base_url)?;
     let auth_path = directories.config_home.join("muse").join("auth.json");
     let rewritten = rewrite_muse_args(arguments, &gateway.ready.base_url);
@@ -1155,6 +1405,33 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    fn gateway_models() -> Vec<GatewayModel> {
+        vec![
+            GatewayModel {
+                id: "gpt-visible".into(),
+                display_name: Some("GPT Visible".into()),
+                description: Some("Authenticated default".into()),
+                context_window: Some(272_000),
+                max_output_tokens: None,
+                supported_reasoning_efforts: vec!["low".into(), "medium".into(), "high".into()],
+                default_reasoning_effort: Some("high".into()),
+                is_visible: true,
+                is_default: true,
+            },
+            GatewayModel {
+                id: "codex-hidden".into(),
+                display_name: None,
+                description: None,
+                context_window: None,
+                max_output_tokens: None,
+                supported_reasoning_efforts: Vec::new(),
+                default_reasoning_effort: None,
+                is_visible: false,
+                is_default: false,
+            },
+        ]
     }
 
     fn create_executable(path: &Path) {
@@ -1308,6 +1585,42 @@ mod tests {
                 "--provider",
                 "openai",
                 "--base-url=https://literal.example",
+            ])
+        );
+    }
+
+    #[test]
+    fn rewrite_preserves_an_explicit_model() {
+        let original = args(&["--model=gpt-explicit", "exec", "prompt"]);
+        assert_eq!(
+            rewrite_muse_args(&original, "http://127.0.0.1:4321"),
+            args(&[
+                "--provider",
+                "meta",
+                "--base-url",
+                "http://127.0.0.1:4321",
+                "--model=gpt-explicit",
+                "exec",
+                "prompt",
+            ])
+        );
+    }
+
+    #[test]
+    fn rewrite_keeps_a_literal_model_flag_after_double_dash_opaque() {
+        let original = args(&["exec", "--", "--model", "literal"]);
+        let rewritten = rewrite_muse_args(&original, "http://127.0.0.1:4321");
+        assert_eq!(
+            rewritten,
+            args(&[
+                "--provider",
+                "meta",
+                "--base-url",
+                "http://127.0.0.1:4321",
+                "exec",
+                "--",
+                "--model",
+                "literal",
             ])
         );
     }
@@ -1467,6 +1780,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn model_catalog_seed_preserves_unknowns_and_visibility() {
+        let temporary = tempfile::tempdir().unwrap();
+        let data_home = temporary.path().join("stock-data");
+        fs::create_dir(&data_home).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&data_home, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let path = seed_stock_model_catalog(&data_home, &gateway_models(), "gpt-visible").unwrap();
+        let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["provider_id"], "meta");
+        assert_eq!(value["profile_id"], "tbh");
+        assert_eq!(value["rows"][0]["model_id"], "gpt-visible");
+        assert_eq!(value["rows"][0]["display_label"], "GPT Visible");
+        assert_eq!(value["rows"][0]["visibility"], "visible");
+        assert_eq!(value["rows"][0]["context_limit"], 272_000);
+        assert!(value["rows"][0]["output_limit"].is_null());
+        assert!(value["rows"][0]["release_date"].is_null());
+        assert_eq!(
+            value["rows"][0]["reasoning_effort_variants"],
+            json!([
+                {"tier": "low", "description": null},
+                {"tier": "medium", "description": null},
+                {"tier": "high", "description": null}
+            ])
+        );
+        assert_eq!(value["rows"][1]["display_label"], "codex-hidden");
+        assert_eq!(value["rows"][1]["visibility"], "hidden");
+        assert!(value["rows"][1]["reasoning_effort_variants"].is_null());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn private_directories_are_created_safely_and_never_repermissioned() {
@@ -1533,18 +1890,31 @@ mod tests {
     fn readiness_contract_requires_loopback_and_a_256_bit_token() {
         let token = URL_SAFE_NO_PAD.encode([7_u8; 32]);
         let ready = GatewayReady {
-            schema_version: 1,
+            schema_version: GATEWAY_READY_SCHEMA_VERSION,
             base_url: "http://127.0.0.1:4321".into(),
             token,
+            default_model: "gpt-visible".into(),
+            models: gateway_models(),
         };
         assert!(ready.validate().is_ok());
 
         let remote = GatewayReady {
-            schema_version: 1,
+            schema_version: GATEWAY_READY_SCHEMA_VERSION,
             base_url: "https://example.test".into(),
             token: URL_SAFE_NO_PAD.encode([7_u8; 32]),
+            default_model: "gpt-visible".into(),
+            models: gateway_models(),
         };
         assert!(remote.validate().is_err());
+
+        let invalid_model = GatewayReady {
+            schema_version: GATEWAY_READY_SCHEMA_VERSION,
+            base_url: "http://127.0.0.1:4321".into(),
+            token: URL_SAFE_NO_PAD.encode([7_u8; 32]),
+            default_model: "--help".into(),
+            models: gateway_models(),
+        };
+        assert!(invalid_model.validate().is_err());
     }
 
     #[test]

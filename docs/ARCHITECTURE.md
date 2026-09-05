@@ -44,7 +44,8 @@ The launcher owns only process and provider concerns:
 - load one explicit OpenAI authentication mode;
 - bind the gateway to an ephemeral `127.0.0.1` port;
 - mint a per-run bearer token for the Muse-to-gateway hop;
-- inject the gateway base URL and the internal provider protocol selector;
+- seed Muse's isolated normalized model cache from the authenticated catalog;
+- inject the gateway base URL and internal provider protocol selector;
 - remove provider-routing and credential environment variables that the Muse
   child must not inherit; and
 - forward signals and exit status.
@@ -53,9 +54,10 @@ All non-provider CLI arguments pass through byte-for-byte. User-supplied
 provider or base-URL flags must be rejected or replaced deterministically; they
 cannot be permitted to bypass the gateway.
 
-The launcher does not select, inject, or rewrite a model. An explicit Muse model
-argument passes through unchanged; otherwise stock Muse selects from the model
-catalog returned by the gateway.
+Model arguments pass through unchanged. When no model was specified, stock Muse
+selects the default marked in the authenticated catalog cache. Resume and model
+switch behavior therefore remain under the stock harness rather than being
+overridden by the launcher.
 
 ### Stock Muse child
 
@@ -78,15 +80,25 @@ Muse independently.
 Muse connects to the gateway using its existing endpoint transport. At minimum,
 the gateway exposes:
 
-- `GET /muse-code/models`: fetch the authenticated upstream model catalog and
-  normalize it into Muse's catalog shape; and
+- `GET /muse-code/models`: return `304 Not Modified` after the launcher has
+  installed the authenticated catalog in Muse's isolated normalized cache; and
 - `POST /responses`: forward a Muse Responses request through the pinned Codex
   client and validate the upstream event stream before returning it to Muse.
 
-The gateway does not maintain a local model allowlist. Model availability and
-metadata originate upstream; the normalizer sorts on upstream priority, marks
-the first result as the Muse default, and omits optional limits that upstream
-does not provide instead of inventing them.
+The gateway does not maintain a local model allowlist. Before signaling
+readiness it fetches the authenticated catalog, sorts on upstream priority,
+marks the first picker-visible result as the default, and includes the result in
+its private readiness document. The launcher atomically converts that document
+to Muse 1.0.3's normalized cache format. This cache path is necessary because
+the pinned Muse raw-catalog decoder cannot retain multiple rows whose optional
+release date or output limit is unknown. Unknown values remain JSON `null`;
+they are never replaced with fabricated limits or dates. Authenticated
+reasoning-effort choices are retained in upstream order; Muse's cache has no
+provider-default effort field, so no default effort is invented.
+
+Catalog discovery has a 90-second startup deadline, while the launcher allows
+100 seconds for the complete readiness handshake. This keeps slow credential
+refresh and network startup bounded without racing the catalog request.
 
 For Responses requests, the gateway enforces streaming and sets `store` to
 `false`. Valid, known non-metadata SSE frames are forwarded without rewriting
@@ -148,10 +160,14 @@ receives only the random loopback credential.
 
 1. The launcher validates the stock Muse binary and selected authentication
    mode before starting a session.
-2. It starts the loopback listener and waits until it is ready.
-3. It launches Muse with the loopback endpoint and ephemeral bearer token.
-4. Muse obtains the upstream-derived catalog and sends a Responses request with
-   its selected model.
+2. It starts the loopback listener; the gateway fetches the authenticated model
+   catalog before reporting readiness.
+3. The launcher validates that catalog, atomically seeds Muse's isolated model
+   cache, and launches Muse with the loopback endpoint and ephemeral bearer
+   token.
+4. Muse retains the seeded catalog after the gateway answers its conditional
+   catalog request with `304`, then sends a Responses request with the selected
+   model.
 5. The gateway authenticates upstream, maps the request, and streams typed
    events back with backpressure.
 6. Muse renders output or performs its ordinary tool approval/execution loop.
@@ -214,7 +230,7 @@ does not mean two different models produce identical prose or tool choices.
 | Muse settings, sessions, approvals, rules, and extensions | stock Muse |
 | OpenAI credentials and selected auth mode | `muse-codex` keyring namespace |
 | Ephemeral listener address and bearer token | launcher process |
-| Model selection | stock Muse and user-supplied Muse arguments |
+| Model selection | stock Muse and user-supplied arguments, using authenticated upstream defaults |
 | Upstream model discovery and protocol compatibility | gateway |
 | Private release URL and curl credentials | release operator/user |
 

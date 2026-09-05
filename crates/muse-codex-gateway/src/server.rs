@@ -20,13 +20,15 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use codex_transport::{ModelInfo, Transport};
 use serde::Serialize;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 
 use crate::sse;
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+const READY_SCHEMA_VERSION: u8 = 2;
+const MODEL_CATALOG_STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Clone)]
 struct AppState {
@@ -39,6 +41,8 @@ struct ReadyFile<'a> {
     schema_version: u8,
     base_url: String,
     token: &'a str,
+    default_model: &'a str,
+    models: &'a [ModelInfo],
 }
 
 pub async fn run(
@@ -48,6 +52,15 @@ pub async fn run(
     transport: Transport,
 ) -> Result<()> {
     let token = generate_token()?;
+    let catalog_models =
+        tokio::time::timeout(MODEL_CATALOG_STARTUP_TIMEOUT, transport.list_models())
+            .await
+            .context("Codex model catalog timed out before gateway readiness")??;
+    let default_model = catalog_models
+        .iter()
+        .find(|model| model.is_default)
+        .map(|model| model.id.as_str())
+        .context("Codex model catalog has no default model")?;
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind private gateway to {bind}"))?;
@@ -59,9 +72,11 @@ pub async fn run(
     write_ready_file(
         &ready_file,
         &ReadyFile {
-            schema_version: 1,
+            schema_version: READY_SCHEMA_VERSION,
             base_url: format!("http://{address}"),
             token: &token,
+            default_model,
+            models: &catalog_models,
         },
     )?;
 
@@ -98,18 +113,16 @@ pub fn generate_token() -> Result<String> {
 }
 
 async fn health() -> Response {
-    Json(json!({"status":"ok","schema_version":1})).into_response()
+    Json(json!({"status":"ok","schema_version":READY_SCHEMA_VERSION})).into_response()
 }
 
-async fn models(State(state): State<AppState>) -> Response {
-    match state.transport.list_models().await {
-        Ok(models) => Json(catalog(models)).into_response(),
-        Err(_) => gateway_error(
-            StatusCode::BAD_GATEWAY,
-            "Unable to load the Codex model catalog. Run `muse-codex login` and retry.",
-            "codex_catalog_error",
-        ),
-    }
+async fn models() -> StatusCode {
+    // The launcher atomically seeds Muse's isolated normalized catalog from
+    // the authenticated models embedded in the private readiness file. Muse
+    // 1.0.3 cannot represent multiple provider rows when optional limits are
+    // unknown, so a 304 keeps that lossless cache rather than coercing unknown
+    // values to fabricated numbers.
+    StatusCode::NOT_MODIFIED
 }
 
 async fn responses(
@@ -270,51 +283,6 @@ fn proxy_sse_response(
     proxy_response(status, headers, sse::validated_stream(body))
 }
 
-fn catalog(models: Vec<ModelInfo>) -> Value {
-    let data = models.into_iter().map(model_entry).collect::<Vec<_>>();
-    json!({"object":"list","data":data})
-}
-
-fn model_entry(model: ModelInfo) -> Value {
-    let mut metadata = Map::new();
-    metadata.insert("is_hidden".to_string(), Value::Bool(false));
-    if let Some(description) = model.description {
-        metadata.insert("description".to_string(), Value::String(description));
-    }
-
-    let mut limit = Map::new();
-    if let Some(context) = model.context_window {
-        limit.insert("context".to_string(), Value::from(context));
-    }
-    if let Some(output) = model.max_output_tokens {
-        limit.insert("output".to_string(), Value::from(output));
-    }
-    if !limit.is_empty() {
-        metadata.insert("limit".to_string(), Value::Object(limit));
-    }
-    if !model.supported_reasoning_efforts.is_empty() {
-        metadata.insert(
-            "reasoning".to_string(),
-            json!({
-                "efforts": model.supported_reasoning_efforts,
-                "default": model.default_reasoning_effort,
-            }),
-        );
-    }
-
-    let mut entry = Map::new();
-    entry.insert("id".to_string(), Value::String(model.id));
-    entry.insert("object".to_string(), Value::String("model".to_string()));
-    if let Some(label) = model.display_name {
-        entry.insert("display_name".to_string(), Value::String(label));
-    }
-    entry.insert(
-        "metadata".to_string(),
-        json!({"muse-code": Value::Object(metadata)}),
-    );
-    Value::Object(entry)
-}
-
 fn gateway_error(status: StatusCode, message: &str, kind: &str) -> Response {
     (
         status,
@@ -401,12 +369,25 @@ mod tests {
     fn ready_file_is_private_and_valid() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("ready.json");
+        let models = vec![ModelInfo {
+            id: "gpt-test".to_string(),
+            display_name: Some("GPT Test".to_string()),
+            description: None,
+            context_window: Some(100_000),
+            max_output_tokens: None,
+            supported_reasoning_efforts: vec!["medium".to_string()],
+            default_reasoning_effort: Some("medium".to_string()),
+            is_visible: true,
+            is_default: true,
+        }];
         write_ready_file(
             &path,
             &ReadyFile {
-                schema_version: 1,
+                schema_version: READY_SCHEMA_VERSION,
                 base_url: "http://127.0.0.1:1234".to_string(),
                 token: "secret",
+                default_model: "gpt-test",
+                models: &models,
             },
         )
         .unwrap();
@@ -415,21 +396,14 @@ mod tests {
             0o600
         );
         let parsed: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(parsed["schema_version"], READY_SCHEMA_VERSION);
+        assert_eq!(parsed["default_model"], "gpt-test");
+        assert_eq!(parsed["models"][0]["id"], "gpt-test");
+        assert!(parsed["models"][0]["max_output_tokens"].is_null());
     }
 
-    #[test]
-    fn custom_catalog_never_fabricates_limits() {
-        let value = model_entry(ModelInfo {
-            id: "gpt-test".to_string(),
-            display_name: None,
-            description: None,
-            context_window: None,
-            max_output_tokens: None,
-            supported_reasoning_efforts: Vec::new(),
-            default_reasoning_effort: None,
-            is_default: false,
-        });
-        assert!(value["metadata"]["muse-code"].get("limit").is_none());
+    #[tokio::test]
+    async fn model_endpoint_preserves_the_launcher_seeded_cache() {
+        assert_eq!(models().await, StatusCode::NOT_MODIFIED);
     }
 }

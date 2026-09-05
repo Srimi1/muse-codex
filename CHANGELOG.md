@@ -14,6 +14,15 @@ All notable project changes will be documented here. The format follows
 - Signed private-release manifest and installer tooling.
 - Project branding, community standards, support policy, and GitHub templates.
 
+### Fixed
+
+- Preserve authenticated multi-model catalogs in Muse 1.0.3's normalized
+  cache, including picker visibility, context limits, and reasoning efforts.
+- Keep unknown release dates and output limits unknown instead of allowing the
+  stock raw-catalog decoder to discard otherwise valid models.
+- Allow slow authenticated catalog discovery to finish within a bounded
+  startup handshake and provide actionable authentication guidance on failure.
+
 ### Security
 
 - Per-invocation loopback bearer tokens and provider credential scrubbing.

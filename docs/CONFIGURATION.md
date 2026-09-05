@@ -45,9 +45,12 @@ and data directories. It is not stock Muse's normal profile.
   the private loopback URL.
 - Other arguments pass through to the stock Muse parser.
 
-Model selection remains a Muse argument. The gateway publishes the model catalog
-returned by the authenticated upstream and translates the selected model's
-Responses stream.
+An explicit Muse `--model` argument remains unchanged. Without one, stock Muse
+uses the first picker-visible default in the authenticated upstream catalog.
+The launcher atomically seeds Muse's isolated normalized catalog cache so
+unknown release dates and output limits remain unknown instead of being
+fabricated, while authenticated reasoning-effort choices retain upstream order.
+The gateway then translates the selected model's Responses stream.
 
 ## Environment isolation
 

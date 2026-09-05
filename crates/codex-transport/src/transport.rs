@@ -93,6 +93,7 @@ pub struct ModelInfo {
     pub max_output_tokens: Option<u64>,
     pub supported_reasoning_efforts: Vec<String>,
     pub default_reasoning_effort: Option<String>,
+    pub is_visible: bool,
     pub is_default: bool,
 }
 
@@ -751,6 +752,8 @@ struct UpstreamModel {
     default_reasoning_level: Option<String>,
     #[serde(default)]
     priority: i32,
+    #[serde(default)]
+    visibility: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -770,29 +773,50 @@ fn normalize_models(bytes: &[u8]) -> Result<Vec<ModelInfo>> {
     }
     upstream.models.sort_by_key(|model| model.priority);
 
-    Ok(upstream
+    let mut models = upstream
         .models
         .into_iter()
-        .enumerate()
-        .map(|(index, model)| ModelInfo {
-            id: model.slug,
-            display_name: model.display_name.filter(|value| !value.is_empty()),
-            description: model.description,
-            context_window: model
-                .context_window
-                .and_then(|value| u64::try_from(value).ok()),
-            max_output_tokens: model
-                .max_output_tokens
-                .and_then(|value| u64::try_from(value).ok()),
-            supported_reasoning_efforts: model
-                .supported_reasoning_levels
-                .into_iter()
-                .map(|preset| preset.effort)
-                .collect(),
-            default_reasoning_effort: model.default_reasoning_level,
-            is_default: index == 0,
+        .map(|model| -> Result<ModelInfo> {
+            let is_visible = match model.visibility.as_deref() {
+                None | Some("list") => true,
+                Some("hide" | "none") => false,
+                Some(value) => {
+                    return Err(Error::InvalidUpstreamResponse(format!(
+                        "model catalog returned unknown visibility {value:?}"
+                    )));
+                }
+            };
+            let mut supported_reasoning_efforts = Vec::new();
+            for preset in model.supported_reasoning_levels {
+                if !supported_reasoning_efforts.contains(&preset.effort) {
+                    supported_reasoning_efforts.push(preset.effort);
+                }
+            }
+            Ok(ModelInfo {
+                id: model.slug,
+                display_name: model.display_name.filter(|value| !value.is_empty()),
+                description: model.description,
+                context_window: model
+                    .context_window
+                    .and_then(|value| u64::try_from(value).ok()),
+                max_output_tokens: model
+                    .max_output_tokens
+                    .and_then(|value| u64::try_from(value).ok()),
+                supported_reasoning_efforts,
+                default_reasoning_effort: model.default_reasoning_level,
+                is_visible,
+                is_default: false,
+            })
         })
-        .collect())
+        .collect::<Result<Vec<_>>>()?;
+    let default_index = models
+        .iter()
+        .position(|model| model.is_visible)
+        .ok_or_else(|| {
+            Error::InvalidUpstreamResponse("model catalog has no visible models".to_string())
+        })?;
+    models[default_index].is_default = true;
+    Ok(models)
 }
 
 #[cfg(test)]
@@ -842,6 +866,7 @@ mod tests {
         assert_eq!(models[0].context_window, Some(200_000));
         assert_eq!(models[0].max_output_tokens, None);
         assert_eq!(models[0].supported_reasoning_efforts, ["low", "high"]);
+        assert!(models[0].is_visible);
         assert!(!models[1].is_default);
     }
 
@@ -856,10 +881,52 @@ mod tests {
     }
 
     #[test]
+    fn selects_the_first_picker_visible_model_as_default() {
+        let models = normalize_models(
+            br#"{
+                "models": [
+                    {"slug":"hidden-first","priority":1,"visibility":"hide"},
+                    {
+                        "slug":"visible-second",
+                        "priority":2,
+                        "visibility":"list",
+                        "supported_reasoning_levels":[
+                            {"effort":"low"},{"effort":"high"},{"effort":"low"}
+                        ]
+                    },
+                    {"slug":"not-listed","priority":3,"visibility":"none"}
+                ]
+            }"#,
+        )
+        .expect("mixed-visibility catalog");
+
+        assert!(!models[0].is_visible);
+        assert!(!models[0].is_default);
+        assert!(models[1].is_visible);
+        assert!(models[1].is_default);
+        assert_eq!(models[1].supported_reasoning_efforts, ["low", "high"]);
+        assert!(!models[2].is_visible);
+    }
+
+    #[test]
     fn rejects_an_empty_model_catalog() {
         assert!(matches!(
             normalize_models(br#"{"models":[]}"#),
             Err(Error::InvalidUpstreamResponse(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_or_entirely_hidden_visibility() {
+        assert!(matches!(
+            normalize_models(br#"{"models":[{"slug":"future","visibility":"future"}]}"#),
+            Err(Error::InvalidUpstreamResponse(message)) if message.contains("unknown visibility")
+        ));
+        assert!(matches!(
+            normalize_models(
+                br#"{"models":[{"slug":"hidden","visibility":"hide"},{"slug":"none","visibility":"none"}]}"#
+            ),
+            Err(Error::InvalidUpstreamResponse(message)) if message.contains("no visible models")
         ));
     }
 

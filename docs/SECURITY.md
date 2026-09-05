@@ -145,9 +145,10 @@ protected release infrastructure and is never an installer input.
   A user-selected API-key endpoint may target any URL that passes the strict
   HTTPS base-URL validation; there is no local upstream-host or model allowlist.
 - The upstream HTTP client uses certificate verification and disables redirects.
-- Inbound request bodies are limited to 64 MiB. Model catalogs are limited to
-  8 MiB, captured error bodies to 64 KiB, individual SSE events to 8 MiB, and
-  SSE idle periods to 120 seconds.
+- Inbound request bodies are limited to 64 MiB. Upstream model catalogs are
+  limited to 8 MiB, private gateway readiness documents to 10 MiB, captured
+  error bodies to 64 KiB, individual SSE events to 8 MiB, and SSE idle periods
+  to 120 seconds.
 - Only `accept-language` and `x-request-id` are copied from Muse to upstream
   transport input. Authorization, cookie, proxy, host, connection, originator,
   account, and user-agent headers are not forwarded.
@@ -260,6 +261,12 @@ The isolated Muse profile has telemetry disabled, and this project does not
 currently implement a second prompt transcript or an observability pipeline. If
 either is introduced, it must be opt-in and exclude prompt bodies, authorization
 headers, signed URL query strings, and credentials by default.
+
+The authenticated model catalog crosses the private readiness file only long
+enough for the launcher to validate it and atomically seed the isolated Muse
+cache. Both files reject symlinks and unsafe ownership or permissions. Missing
+release dates and output limits are stored as `null`; the compatibility layer
+does not invent provider metadata.
 
 ## Verification status
 
