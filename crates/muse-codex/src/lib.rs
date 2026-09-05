@@ -22,7 +22,7 @@ pub const STOCK_MUSE_BASENAME: &str = "muse-bin-1.0.3-R2198.1";
 pub const STOCK_MUSE_COMMAND: &str = "muse";
 pub const GATEWAY_BASENAME: &str = "muse-codex-gateway";
 pub const DEFAULT_GATEWAY_READY_TIMEOUT: Duration = Duration::from_secs(100);
-pub const GATEWAY_READY_SCHEMA_VERSION: u32 = 3;
+pub const GATEWAY_READY_SCHEMA_VERSION: u32 = 4;
 pub const SUPPORTED_CODEX_WIRE_VERSION: &str = "0.153.4";
 const MAX_GATEWAY_READY_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_GATEWAY_MODELS: usize = 4096;
@@ -43,6 +43,13 @@ const SECRET_ENVIRONMENT: &[&str] = &[
     "TBH_MINT_BASE_URL",
     "MUSE_CUSTOM_HEADERS",
     "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "ZAI_API_KEY",
+    "Z_AI_API_KEY",
+    "ZHIPUAI_API_KEY",
+    "ZAI_BASE_URL",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,7 +63,8 @@ pub enum Invocation {
 /// Authentication always belongs to the wrapper, including help and invalid
 /// arguments. It must never reach the stock provider's credential handlers.
 pub fn classify_invocation(args: &[OsString]) -> Result<Invocation> {
-    let (_, without_provider) = validate_and_remove_provider(args)?;
+    let (provider, without_provider) = validate_and_remove_provider(args)?;
+    let provider = provider.unwrap_or_default();
     if without_provider == [OsString::from("self-test")] {
         return Ok(Invocation::SelfTest);
     }
@@ -68,16 +76,16 @@ pub fn classify_invocation(args: &[OsString]) -> Result<Invocation> {
     {
         if index != 0 {
             return Ok(Invocation::Output {
-                text: "muse-codex: authentication commands accept --provider codex but no other startup options\n".into(),
+                text: "muse-codex: authentication commands accept --provider codex or --provider zai but no other startup options\n".into(),
                 code: 2,
             });
         }
-        return Ok(classify_auth_invocation(&without_provider));
+        return Ok(classify_auth_invocation(&without_provider, provider));
     }
     Ok(Invocation::Muse(args.to_vec()))
 }
 
-fn classify_auth_invocation(args: &[OsString]) -> Invocation {
+fn classify_auth_invocation(args: &[OsString], provider: PublicProvider) -> Invocation {
     use clap::{Arg, ArgAction, Command};
 
     let login = || {
@@ -97,7 +105,7 @@ fn classify_auth_invocation(args: &[OsString]) -> Invocation {
         .subcommand(logout())
         .subcommand(
             Command::new("auth")
-                .about("Manage isolated OpenAI credentials")
+                .about("Manage isolated provider credentials")
                 .subcommand_required(true)
                 .arg_required_else_help(true)
                 .subcommand(login())
@@ -105,8 +113,8 @@ fn classify_auth_invocation(args: &[OsString]) -> Invocation {
                 .subcommand(Command::new("status").about("Show the saved authentication mode"))
                 .subcommand(
                     Command::new("set")
-                        .about("Store an OpenAI API key in macOS Keychain")
-                        .after_help("The optional --provider codex flag is accepted. API keys are read only from stdin.")
+                        .about("Store a provider API key in macOS Keychain")
+                        .after_help("The optional --provider codex or --provider zai flag selects the credential record. API keys are read only from stdin.")
                         .arg(
                             Arg::new("api-key-stdin")
                                 .long("api-key-stdin")
@@ -136,6 +144,8 @@ fn classify_auth_invocation(args: &[OsString]) -> Invocation {
     if name == "login" && matches.get_flag("device-auth") {
         arguments.push("--device-auth".into());
     }
+    arguments.push("--provider".into());
+    arguments.push(provider.as_str().into());
     Invocation::GatewayAuth(arguments)
 }
 
@@ -143,18 +153,51 @@ fn os_args(values: &[&str]) -> Vec<OsString> {
     values.iter().map(OsString::from).collect()
 }
 
-/// Validates the public provider name. `meta` is an internal implementation
-/// detail used only for the stock Muse child and is never accepted from users.
+/// Public provider selectors accepted at the wrapper boundary.
+///
+/// `meta` is an internal implementation detail used only for the stock Muse
+/// child and is never accepted from users. Each launch selects exactly one
+/// upstream; the wrapper never falls back between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PublicProvider {
+    #[default]
+    Codex,
+    Zai,
+}
+
+impl PublicProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Zai => "zai",
+        }
+    }
+}
+
+impl std::fmt::Display for PublicProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Validates the public provider name without consuming the arguments.
 pub fn validate_provider_selection(args: &[OsString]) -> Result<()> {
     validate_and_remove_provider(args).map(|_| ())
+}
+
+/// Returns the provider this invocation selected, defaulting to `codex`.
+pub fn selected_provider(args: &[OsString]) -> Result<PublicProvider> {
+    validate_and_remove_provider(args).map(|(provider, _)| provider.unwrap_or_default())
 }
 
 pub fn strip_public_provider_args(args: &[OsString]) -> Result<Vec<OsString>> {
     validate_and_remove_provider(args).map(|(_, remaining)| remaining)
 }
 
-fn validate_and_remove_provider(args: &[OsString]) -> Result<(bool, Vec<OsString>)> {
-    let mut provider_selected = false;
+fn validate_and_remove_provider(
+    args: &[OsString],
+) -> Result<(Option<PublicProvider>, Vec<OsString>)> {
+    let mut selected: Option<PublicProvider> = None;
     let mut remaining = Vec::with_capacity(args.len());
     let mut index = 0;
     while index < args.len() {
@@ -165,13 +208,12 @@ fn validate_and_remove_provider(args: &[OsString]) -> Result<(bool, Vec<OsString
         }
         if arg == "--provider" {
             let Some(value) = args.get(index + 1) else {
-                bail!("--provider requires the value 'codex'");
+                bail!("--provider requires the value 'codex' or 'zai'");
             };
             if is_option_like(value) {
-                bail!("--provider requires the value 'codex'");
+                bail!("--provider requires the value 'codex' or 'zai'");
             }
-            require_codex_provider(value)?;
-            provider_selected = true;
+            merge_provider_selection(&mut selected, parse_public_provider(value)?)?;
             index += 2;
             continue;
         }
@@ -179,8 +221,7 @@ fn validate_and_remove_provider(args: &[OsString]) -> Result<(bool, Vec<OsString
             .to_str()
             .and_then(|argument| argument.strip_prefix("--provider="))
         {
-            require_codex_provider(OsStr::new(value))?;
-            provider_selected = true;
+            merge_provider_selection(&mut selected, parse_public_provider(OsStr::new(value))?)?;
             index += 1;
             continue;
         }
@@ -193,15 +234,35 @@ fn validate_and_remove_provider(args: &[OsString]) -> Result<(bool, Vec<OsString
         index += 1;
     }
 
-    Ok((provider_selected, remaining))
+    Ok((selected, remaining))
 }
 
-fn require_codex_provider(value: &OsStr) -> Result<()> {
+/// Repeating the same provider is harmless, but two different providers in one
+/// invocation is ambiguous. Reject it rather than letting the last flag win.
+fn merge_provider_selection(
+    slot: &mut Option<PublicProvider>,
+    provider: PublicProvider,
+) -> Result<()> {
+    if let Some(existing) = slot
+        && *existing != provider
+    {
+        bail!("conflicting providers: --provider {existing} and --provider {provider}");
+    }
+    *slot = Some(provider);
+    Ok(())
+}
+
+fn parse_public_provider(value: &OsStr) -> Result<PublicProvider> {
     if value == "codex" {
-        return Ok(());
+        return Ok(PublicProvider::Codex);
+    }
+    if value == "zai" {
+        return Ok(PublicProvider::Zai);
     }
     let value = value.to_string_lossy();
-    bail!("unsupported provider '{value}'; muse-codex only accepts '--provider codex'")
+    bail!(
+        "unsupported provider '{value}'; muse-codex accepts '--provider codex' or '--provider zai'"
+    )
 }
 
 /// Replaces provider-routing flags while preserving every other argument and
@@ -458,11 +519,30 @@ fn validate_msp_options(arguments: &[OsString]) -> Result<()> {
     Ok(())
 }
 
-/// Returns the custom OpenAI-compatible upstream requested by the user. Muse
-/// never receives this URL; only the loopback gateway does.
+/// Returns the custom upstream requested by the user. Muse never receives this
+/// URL; only the loopback gateway does. `environment_variable` names the
+/// provider-specific override so conflicts report the variable the user set.
+/// Rejects a launch-scoped option the selected provider cannot honor.
+///
+/// Fast is an OpenAI service tier that changes billing; accepting the flag and
+/// quietly dropping it would leave the user believing they bought priority
+/// processing.
+pub fn reject_unsupported_provider_options(
+    provider: PublicProvider,
+    fast_mode: bool,
+) -> Result<()> {
+    if fast_mode && provider == PublicProvider::Zai {
+        bail!(
+            "--fast requests OpenAI Fast mode, which the Z.ai GLM Coding Plan has no equivalent for; re-run without --fast"
+        );
+    }
+    Ok(())
+}
+
 pub fn resolve_upstream_base_url(
     args: &[OsString],
     environment_value: Option<&OsStr>,
+    environment_variable: &str,
 ) -> Result<Option<OsString>> {
     let mut cli_value: Option<OsString> = None;
     let mut index = 0;
@@ -494,7 +574,7 @@ pub fn resolve_upstream_base_url(
     let environment_value = environment_value.filter(|value| !value.is_empty());
     match (cli_value, environment_value) {
         (Some(cli), Some(environment)) if cli != environment => {
-            bail!("conflicting upstream base URLs: --base-url and OPENAI_BASE_URL differ")
+            bail!("conflicting upstream base URLs: --base-url and {environment_variable} differ")
         }
         (Some(cli), _) => Ok(Some(cli)),
         (None, Some(environment)) => Ok(Some(environment.to_os_string())),
@@ -706,14 +786,22 @@ pub struct StockDirectories {
 
 impl StockDirectories {
     pub fn discover() -> Result<Self> {
+        Self::discover_for(PublicProvider::Codex)
+    }
+
+    pub fn discover_for(provider: PublicProvider) -> Result<Self> {
         let app_home = if let Some(path) = env::var_os("MUSE_CODEX_HOME") {
             PathBuf::from(path)
         } else {
             default_app_home()?
         };
+        let (config, data) = match provider {
+            PublicProvider::Codex => ("stock-config", "stock-data"),
+            PublicProvider::Zai => ("stock-config-zai", "stock-data-zai"),
+        };
         Ok(Self {
-            config_home: app_home.join("stock-config"),
-            data_home: app_home.join("stock-data"),
+            config_home: app_home.join(config),
+            data_home: app_home.join(data),
             app_home,
         })
     }
@@ -1096,6 +1184,7 @@ fn set_file_mode_0600(path: &Path) -> Result<()> {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct GatewayReady {
     pub schema_version: u32,
+    pub provider: String,
     pub base_url: String,
     pub token: String,
     pub default_model: String,
@@ -1118,12 +1207,20 @@ pub struct GatewayModel {
 }
 
 impl GatewayReady {
-    fn validate(self) -> Result<Self> {
+    fn validate(self, provider: PublicProvider) -> Result<Self> {
         if self.schema_version != GATEWAY_READY_SCHEMA_VERSION {
             bail!(
                 "unsupported gateway readiness schema {}; expected {}",
                 self.schema_version,
                 GATEWAY_READY_SCHEMA_VERSION
+            );
+        }
+        // A gateway that served a different upstream than the launcher asked
+        // for would silently bill the wrong account.
+        if self.provider != provider.as_str() {
+            bail!(
+                "gateway served provider '{}' but '{provider}' was selected",
+                self.provider
             );
         }
         validate_loopback_base_url(&self.base_url)?;
@@ -1335,6 +1432,7 @@ fn create_gateway_temporary_directory() -> Result<TempDir> {
 impl GatewayProcess {
     fn start(
         executable: &Path,
+        provider: PublicProvider,
         upstream_base_url: Option<&OsStr>,
         api_key: Option<&SecretInput>,
         fast_mode: bool,
@@ -1351,6 +1449,8 @@ impl GatewayProcess {
             .arg(&ready_file)
             .arg("--parent-pid")
             .arg(std::process::id().to_string())
+            .arg("--provider")
+            .arg(provider.as_str())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         if let Some(upstream_base_url) = upstream_base_url {
@@ -1391,7 +1491,7 @@ impl GatewayProcess {
             }
         }
 
-        let ready = match wait_for_gateway_ready(&mut child, &ready_file) {
+        let ready = match wait_for_gateway_ready(&mut child, &ready_file, provider) {
             Ok(ready) => ready,
             Err(error) => {
                 let _ = child.kill();
@@ -1432,26 +1532,30 @@ impl Drop for GatewayProcess {
     }
 }
 
-fn wait_for_gateway_ready(child: &mut Child, ready_file: &Path) -> Result<GatewayReady> {
+fn wait_for_gateway_ready(
+    child: &mut Child,
+    ready_file: &Path,
+    provider: PublicProvider,
+) -> Result<GatewayReady> {
     let deadline = Instant::now() + gateway_ready_timeout();
     let mut last_parse_error = None;
     loop {
         if let Some(status) = child.try_wait()? {
-            if let Some(message) = read_gateway_startup_failure(ready_file)? {
+            if let Some(message) = read_gateway_startup_failure(ready_file, provider)? {
                 bail!("{message}");
             }
             bail!(
-                "gateway could not initialize authentication or load the Codex model catalog ({}); run `muse-codex auth status`, then `muse-codex login` if needed",
+                "gateway could not initialize authentication or load the upstream model catalog ({}); run `muse-codex auth status`",
                 display_exit_status(status)
             );
         }
 
-        if let Some(message) = read_gateway_startup_failure(ready_file)? {
+        if let Some(message) = read_gateway_startup_failure(ready_file, provider)? {
             bail!("{message}");
         }
 
         match read_gateway_ready(ready_file) {
-            Ok(Some(ready)) => return ready.validate(),
+            Ok(Some(ready)) => return ready.validate(provider),
             Ok(None) => {}
             Err(error) => last_parse_error = Some(error),
         }
@@ -1460,14 +1564,17 @@ fn wait_for_gateway_ready(child: &mut Child, ready_file: &Path) -> Result<Gatewa
                 return Err(error.context("gateway readiness file never became valid"));
             }
             bail!(
-                "Codex model catalog did not load before the gateway startup timeout; check your connection and retry"
+                "the upstream model catalog did not load before the gateway startup timeout; check your connection and retry"
             );
         }
         thread::sleep(Duration::from_millis(25));
     }
 }
 
-fn read_gateway_startup_failure(ready_file: &Path) -> Result<Option<&'static str>> {
+fn read_gateway_startup_failure(
+    ready_file: &Path,
+    provider: PublicProvider,
+) -> Result<Option<&'static str>> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct StartupFailure {
@@ -1489,12 +1596,22 @@ fn read_gateway_startup_failure(ready_file: &Path) -> Result<Option<&'static str
     if failure.schema_version != 1 {
         bail!("unsupported gateway startup error schema");
     }
+    let zai = provider == PublicProvider::Zai;
     let message = match failure.error.code.as_str() {
+        "authentication_required" if zai => {
+            "No Z.ai credentials are saved. Run `muse-codex auth set --provider zai --api-key-stdin`."
+        }
         "authentication_required" => {
             "No Codex credentials are saved. Run `muse-codex login` or `muse-codex auth set --provider codex --api-key-stdin`."
         }
+        "authentication_failed" if zai => {
+            "Z.ai rejected the stored key. Store a current key with `muse-codex auth set --provider zai --api-key-stdin`."
+        }
         "authentication_failed" => {
             "Codex authentication was rejected. Run `muse-codex login` to sign in again."
+        }
+        "provider_option_unsupported" => {
+            "An option was selected that the chosen provider does not support. Restart without it."
         }
         "custom_base_url_requires_api_key" => {
             "A custom base URL is allowed only with API-key authentication. Remove --base-url/OPENAI_BASE_URL to use your ChatGPT subscription."
@@ -1649,8 +1766,9 @@ pub fn run() -> Result<i32> {
             verify_stock_muse_version(&stock_muse)?;
             if is_informational_invocation(&muse_arguments) || is_local_invocation(&muse_arguments)
             {
+                let provider = selected_provider(&muse_arguments)?;
                 let stock_arguments = strip_public_provider_args(&muse_arguments)?;
-                run_stock_information(&stock_muse, &stock_arguments)
+                run_stock_information(&stock_muse, &stock_arguments, provider)
             } else {
                 let gateway = discover_gateway(&discovery)?;
                 run_stock_muse(&gateway, &stock_muse, &muse_arguments)
@@ -1666,6 +1784,7 @@ fn verify_gateway_self_test(executable: &Path) -> Result<()> {
         status: String,
         ready_schema_version: u32,
         wire_compatibility_version: String,
+        supported_providers: Vec<String>,
     }
 
     let mut command = Command::new(executable);
@@ -1689,9 +1808,16 @@ fn verify_gateway_self_test(executable: &Path) -> Result<()> {
     }
     let result: GatewaySelfTest = serde_json::from_slice(&output.stdout)
         .context("gateway self-test returned invalid JSON")?;
+    let providers: Vec<&str> = result
+        .supported_providers
+        .iter()
+        .map(String::as_str)
+        .collect();
     if result.status != "ok"
         || result.ready_schema_version != GATEWAY_READY_SCHEMA_VERSION
         || result.wire_compatibility_version != SUPPORTED_CODEX_WIRE_VERSION
+        || !providers.contains(&"codex")
+        || !providers.contains(&"zai")
     {
         bail!("gateway self-test reported an incompatible launcher/gateway protocol");
     }
@@ -1718,24 +1844,38 @@ fn run_stock_muse(
     arguments: &[OsString],
 ) -> Result<i32> {
     validate_msp_options(arguments)?;
+    let provider = selected_provider(arguments)?;
     let (api_key_stdin, arguments) = take_exec_api_key_stdin(arguments);
     let (fast_mode, arguments) = take_fast_mode(&arguments);
-    let upstream_base_url =
-        resolve_upstream_base_url(&arguments, env::var_os("OPENAI_BASE_URL").as_deref())?;
+    reject_unsupported_provider_options(provider, fast_mode)?;
+    let base_url_variable = match provider {
+        PublicProvider::Codex => "OPENAI_BASE_URL",
+        PublicProvider::Zai => "ZAI_BASE_URL",
+    };
+    let api_key_variable = match provider {
+        PublicProvider::Codex => "OPENAI_API_KEY",
+        PublicProvider::Zai => "ZAI_API_KEY",
+    };
+    let upstream_base_url = resolve_upstream_base_url(
+        &arguments,
+        env::var_os(base_url_variable).as_deref(),
+        base_url_variable,
+    )?;
     let api_key = if api_key_stdin {
         Some(SecretInput::from_reader(std::io::stdin().lock())?)
     } else {
-        SecretInput::from_environment("OPENAI_API_KEY")?
+        SecretInput::from_environment(api_key_variable)?
     };
     let gateway = GatewayProcess::start(
         gateway_executable,
+        provider,
         upstream_base_url.as_deref(),
         api_key.as_ref(),
         fast_mode,
     )?;
     drop(api_key);
 
-    let directories = StockDirectories::discover()?;
+    let directories = StockDirectories::discover_for(provider)?;
     directories.create_private()?;
     seed_stock_model_catalog(
         &directories.data_home,
@@ -1783,7 +1923,7 @@ fn run_stock_muse(
         )
     })?;
     let relay = if is_msp {
-        match msp::MspRelay::start(&mut child) {
+        match msp::MspRelay::start(&mut child, provider) {
             Ok(relay) => Some(relay),
             Err(error) => {
                 let _ = child.kill();
@@ -1801,13 +1941,17 @@ fn run_stock_muse(
     result
 }
 
-fn run_stock_information(stock_muse: &Path, arguments: &[OsString]) -> Result<i32> {
+fn run_stock_information(
+    stock_muse: &Path,
+    arguments: &[OsString],
+    provider: PublicProvider,
+) -> Result<i32> {
     let (_, mut arguments) = take_fast_mode(arguments);
     if let Some(index) = stock_subcommand_index(&arguments) {
         let command = arguments.remove(index);
         arguments.insert(0, command);
     }
-    let directories = StockDirectories::discover()?;
+    let directories = StockDirectories::discover_for(provider)?;
     directories.create_private()?;
     // The endpoint is deliberately unroutable and remains inside the isolated
     // profile. Information-only calls do not make provider requests.
@@ -1834,8 +1978,8 @@ fn run_stock_information(stock_muse: &Path, arguments: &[OsString]) -> Result<i3
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let output = command.output().context("failed to read stock Muse help")?;
-        std::io::stdout().write_all(&rewrite_provider_help(&output.stdout))?;
-        std::io::stderr().write_all(&rewrite_provider_help(&output.stderr))?;
+        std::io::stdout().write_all(&rewrite_provider_help_for(&output.stdout, provider))?;
+        std::io::stderr().write_all(&rewrite_provider_help_for(&output.stderr, provider))?;
         return Ok(exit_status_code(output.status));
     }
     let mut child = command
@@ -1844,21 +1988,19 @@ fn run_stock_information(stock_muse: &Path, arguments: &[OsString]) -> Result<i3
     wait_with_signal_forwarding(&mut child)
 }
 
-fn rewrite_provider_help(bytes: &[u8]) -> Vec<u8> {
+/// Fast is an OpenAI service tier, so its injected help lines are omitted when
+/// the launch selected a provider that cannot offer it.
+fn rewrite_provider_help_for(bytes: &[u8], provider: PublicProvider) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return bytes.to_vec();
     };
-    text.replace("muse ", "muse-codex ")
-        .replace(
-            "Startup provider: echo or meta (default: meta)",
-            "Startup provider: codex (default: codex)",
-        )
-        .replace(
-            "Model id for non-echo providers",
-            "Model id from the authenticated Codex catalog",
-        )
-        .replace("Meta reasoning effort:", "Model reasoning effort:")
-        .replace(
+    let fast = provider == PublicProvider::Codex;
+    let text = text.replace("muse ", "muse-codex ").replace(
+        "Startup provider: echo or meta (default: meta)",
+        "Startup provider: codex or zai (default: codex)",
+    );
+    let text = if fast {
+        text.replace(
             "          (default: high)\n",
             "          (default: high)\n      --fast\n          Use OpenAI Fast mode (priority processing; increased usage)\n",
         )
@@ -1870,24 +2012,32 @@ fn rewrite_provider_help(bytes: &[u8]) -> Vec<u8> {
             "Options:\n      --last\n          Resume the most recent session in this workspace",
             "Options:\n      --fast\n          Resume this session with OpenAI Fast mode\n      --last\n          Resume the most recent session in this workspace",
         )
-        .replace(
-            "Override the Meta provider base URL",
-            "Override the OpenAI API base URL (API-key auth only)",
-        )
-        .replace(
-            "Override the provider base URL",
-            "Override the OpenAI API base URL (API-key auth only)",
-        )
-        .replace("Meta API parallel tool calls", "parallel tool calls")
-        .replace(
-            "Deterministic echo reply delay (echo provider only)",
-            "Inactive compatibility option; the test provider is unavailable",
-        )
-        .replace(
-            "Use memory-only sessions",
-            "Unavailable for MSP turns with the pinned Muse 1.0.3 host",
-        )
-        .into_bytes()
+    } else {
+        text
+    };
+    text.replace(
+        "Model id for non-echo providers",
+        "Model id from the active provider catalog",
+    )
+    .replace("Meta reasoning effort:", "Model reasoning effort:")
+    .replace(
+        "Override the Meta provider base URL",
+        "Override the upstream API base URL",
+    )
+    .replace(
+        "Override the provider base URL",
+        "Override the upstream API base URL",
+    )
+    .replace("Meta API parallel tool calls", "parallel tool calls")
+    .replace(
+        "Deterministic echo reply delay (echo provider only)",
+        "Inactive compatibility option; the test provider is unavailable",
+    )
+    .replace(
+        "Use memory-only sessions",
+        "Unavailable for MSP turns with the pinned Muse 1.0.3 host",
+    )
+    .into_bytes()
 }
 
 fn wait_with_signal_forwarding(child: &mut Child) -> Result<i32> {
@@ -1979,6 +2129,80 @@ impl Drop for SignalForwarder {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fast_mode_is_rejected_for_the_zai_provider() {
+        reject_unsupported_provider_options(PublicProvider::Codex, true).unwrap();
+        reject_unsupported_provider_options(PublicProvider::Zai, false).unwrap();
+        let error = reject_unsupported_provider_options(PublicProvider::Zai, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--fast"));
+        assert!(error.contains("Z.ai"));
+    }
+
+    #[test]
+    fn third_party_provider_credentials_are_scrubbed_from_the_muse_child() {
+        // A developer wiring the GLM Coding Plan into another agent commonly
+        // holds a live Z.ai token in ANTHROPIC_AUTH_TOKEN, so it must not
+        // survive into the tool-executing child.
+        for variable in [
+            "ZAI_API_KEY",
+            "Z_AI_API_KEY",
+            "ZHIPUAI_API_KEY",
+            "ZAI_BASE_URL",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+        ] {
+            assert!(
+                SECRET_ENVIRONMENT.contains(&variable),
+                "{variable} is not scrubbed"
+            );
+        }
+    }
+
+    #[test]
+    fn help_output_names_both_providers_and_hides_fast_for_zai() {
+        let help = b"Startup provider: echo or meta (default: meta)\n          (default: high)\n";
+        let codex = String::from_utf8(rewrite_provider_help_for(help, PublicProvider::Codex))
+            .expect("utf-8");
+        assert!(codex.contains("Startup provider: codex or zai (default: codex)"));
+        assert!(codex.contains("--fast"));
+
+        let zai =
+            String::from_utf8(rewrite_provider_help_for(help, PublicProvider::Zai)).expect("utf-8");
+        assert!(zai.contains("Startup provider: codex or zai (default: codex)"));
+        assert!(!zai.contains("--fast"), "Fast is an OpenAI-only selector");
+    }
+
+    #[test]
+    fn readiness_must_name_the_provider_the_launcher_selected() {
+        let ready = GatewayReady {
+            provider: "zai".to_string(),
+            schema_version: GATEWAY_READY_SCHEMA_VERSION,
+            base_url: "http://127.0.0.1:1234".to_string(),
+            token: URL_SAFE_NO_PAD.encode([7_u8; 32]),
+            default_model: "glm-5.3".to_string(),
+            models: vec![GatewayModel {
+                id: "glm-5.3".to_string(),
+                display_name: None,
+                description: None,
+                context_window: None,
+                max_output_tokens: None,
+                supported_reasoning_efforts: Vec::new(),
+                default_reasoning_effort: None,
+                is_visible: true,
+                is_default: true,
+            }],
+        };
+        ready.clone().validate(PublicProvider::Zai).unwrap();
+        let error = ready
+            .validate(PublicProvider::Codex)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("gateway served provider 'zai'"));
+    }
+
     use super::*;
 
     fn args(values: &[&str]) -> Vec<OsString> {
@@ -2048,15 +2272,21 @@ mod tests {
         );
         assert_eq!(
             classify_invocation(&args(&["login"])).unwrap(),
-            Invocation::GatewayAuth(args(&["auth", "login"]))
+            Invocation::GatewayAuth(args(&["auth", "login", "--provider", "codex"]))
         );
         assert_eq!(
             classify_invocation(&args(&["login", "--device-auth"])).unwrap(),
-            Invocation::GatewayAuth(args(&["auth", "login", "--device-auth"]))
+            Invocation::GatewayAuth(args(&[
+                "auth",
+                "login",
+                "--device-auth",
+                "--provider",
+                "codex"
+            ]))
         );
         assert_eq!(
             classify_invocation(&args(&["logout"])).unwrap(),
-            Invocation::GatewayAuth(args(&["auth", "logout"]))
+            Invocation::GatewayAuth(args(&["auth", "logout", "--provider", "codex"]))
         );
         assert_eq!(
             classify_invocation(&args(&[
@@ -2067,7 +2297,7 @@ mod tests {
                 "--api-key-stdin",
             ]))
             .unwrap(),
-            Invocation::GatewayAuth(args(&["auth", "set-api-key"]))
+            Invocation::GatewayAuth(args(&["auth", "set-api-key", "--provider", "codex"]))
         );
         assert_eq!(
             classify_invocation(&args(&[
@@ -2077,12 +2307,18 @@ mod tests {
                 "--provider=codex",
             ]))
             .unwrap(),
-            Invocation::GatewayAuth(args(&["auth", "set-api-key"]))
+            Invocation::GatewayAuth(args(&["auth", "set-api-key", "--provider", "codex"]))
         );
         assert_eq!(
             classify_invocation(&args(&["--provider", "codex", "login", "--device-auth",]))
                 .unwrap(),
-            Invocation::GatewayAuth(args(&["auth", "login", "--device-auth"]))
+            Invocation::GatewayAuth(args(&[
+                "auth",
+                "login",
+                "--device-auth",
+                "--provider",
+                "codex"
+            ]))
         );
     }
 
@@ -2095,11 +2331,11 @@ mod tests {
         ));
         assert_eq!(
             classify_invocation(&args(&["auth", "set", "--api-key-stdin"])).unwrap(),
-            Invocation::GatewayAuth(args(&["auth", "set-api-key"]))
+            Invocation::GatewayAuth(args(&["auth", "set-api-key", "--provider", "codex"]))
         );
         assert_eq!(
             classify_invocation(&args(&["auth", "status"])).unwrap(),
-            Invocation::GatewayAuth(args(&["auth", "status"]))
+            Invocation::GatewayAuth(args(&["auth", "status", "--provider", "codex"]))
         );
         for command in [
             args(&["auth", "set"]),
@@ -2115,18 +2351,71 @@ mod tests {
     }
 
     #[test]
-    fn provider_validation_accepts_codex_and_rejects_internal_or_unknown_names() {
+    fn provider_validation_accepts_public_names_and_rejects_internal_or_unknown_ones() {
         validate_provider_selection(&args(&["--provider", "codex", "exec"])).unwrap();
         validate_provider_selection(&args(&["exec", "--provider=codex"])).unwrap();
+        validate_provider_selection(&args(&["--provider", "zai", "exec"])).unwrap();
+        validate_provider_selection(&args(&["exec", "--provider=zai"])).unwrap();
         validate_provider_selection(&args(&["exec", "--", "--provider", "meta"])).unwrap();
 
-        for provider in ["meta", "echo", "openai", "unknown"] {
+        for provider in ["meta", "echo", "openai", "zhipu", "unknown"] {
             let error = validate_provider_selection(&args(&["--provider", provider, "exec"]))
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("only accepts '--provider codex'"));
+            assert!(error.contains("muse-codex accepts '--provider codex' or '--provider zai'"));
         }
         assert!(validate_provider_selection(&args(&["--provider"])).is_err());
+    }
+
+    #[test]
+    fn selected_provider_defaults_to_codex_and_rejects_conflicting_values() {
+        assert_eq!(
+            selected_provider(&args(&["exec"])).unwrap(),
+            PublicProvider::Codex
+        );
+        assert_eq!(
+            selected_provider(&args(&["--provider", "zai", "exec"])).unwrap(),
+            PublicProvider::Zai
+        );
+        // Repeating one provider is harmless; naming two is ambiguous.
+        selected_provider(&args(&["--provider", "zai", "exec", "--provider=zai"])).unwrap();
+        let error = selected_provider(&args(&["--provider", "zai", "exec", "--provider=codex"]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("conflicting providers"));
+    }
+
+    #[test]
+    fn auth_commands_carry_the_selected_credential_record() {
+        assert_eq!(
+            classify_invocation(&args(&[
+                "auth",
+                "set",
+                "--provider",
+                "zai",
+                "--api-key-stdin"
+            ]))
+            .unwrap(),
+            Invocation::GatewayAuth(args(&["auth", "set-api-key", "--provider", "zai"]))
+        );
+        assert_eq!(
+            classify_invocation(&args(&["--provider", "zai", "auth", "status"])).unwrap(),
+            Invocation::GatewayAuth(args(&["auth", "status", "--provider", "zai"]))
+        );
+    }
+
+    #[test]
+    fn each_provider_gets_its_own_stock_profile() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join("muse-codex");
+        // SAFETY: the test process sets this for its own child-free lookup.
+        unsafe { env::set_var("MUSE_CODEX_HOME", &home) };
+        let codex = StockDirectories::discover_for(PublicProvider::Codex).unwrap();
+        let zai = StockDirectories::discover_for(PublicProvider::Zai).unwrap();
+        unsafe { env::remove_var("MUSE_CODEX_HOME") };
+        assert_ne!(codex.config_home, zai.config_home);
+        assert_ne!(codex.data_home, zai.data_home);
+        assert_eq!(codex.app_home, zai.app_home);
     }
 
     #[test]
@@ -2279,7 +2568,10 @@ mod tests {
             "--prompt-file",
             "--base-url=https://literal.invalid",
         ]);
-        assert_eq!(resolve_upstream_base_url(&original, None).unwrap(), None);
+        assert_eq!(
+            resolve_upstream_base_url(&original, None, "OPENAI_BASE_URL").unwrap(),
+            None
+        );
         let rewritten = rewrite_muse_args(&original, "http://127.0.0.1:1234");
         assert_eq!(&rewritten[5..], &original[1..]);
         let literal_provider = args(&["exec", "--prompt-file", "--provider=meta"]);
@@ -2339,19 +2631,26 @@ mod tests {
     #[test]
     fn rewritten_help_documents_fast_without_changing_stock_usage() {
         let help = b"      --reasoning-effort <EFFORT>\n          Meta reasoning effort: low|high\n          (default: high)\n      --base-url <URL>\n";
-        let rewritten = String::from_utf8(rewrite_provider_help(help)).unwrap();
+        let rewritten =
+            String::from_utf8(rewrite_provider_help_for(help, PublicProvider::Codex)).unwrap();
         assert!(rewritten.contains("      --fast\n"));
         assert!(rewritten.contains("priority processing; increased usage"));
         assert!(rewritten.contains("Model reasoning effort:"));
 
         let serve_help =
             b"Options:\n  -h, --help\n          Print this help\n      --no-session-log\n";
-        let rewritten = String::from_utf8(rewrite_provider_help(serve_help)).unwrap();
+        let rewritten =
+            String::from_utf8(rewrite_provider_help_for(serve_help, PublicProvider::Codex))
+                .unwrap();
         assert!(rewritten.contains("every MSP session in this host"));
 
         let resume_help =
             b"Options:\n      --last\n          Resume the most recent session in this workspace\n";
-        let rewritten = String::from_utf8(rewrite_provider_help(resume_help)).unwrap();
+        let rewritten = String::from_utf8(rewrite_provider_help_for(
+            resume_help,
+            PublicProvider::Codex,
+        ))
+        .unwrap();
         assert!(rewritten.contains("Resume this session with OpenAI Fast mode"));
     }
 
@@ -2387,7 +2686,7 @@ mod tests {
         .unwrap();
         set_file_mode_0600(&error_path).unwrap();
         assert!(
-            read_gateway_startup_failure(&ready)
+            read_gateway_startup_failure(&ready, PublicProvider::Codex)
                 .unwrap()
                 .unwrap()
                 .contains("API-key authentication")
@@ -2398,30 +2697,38 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !read_gateway_startup_failure(&ready)
+            !read_gateway_startup_failure(&ready, PublicProvider::Codex)
                 .unwrap()
                 .unwrap()
                 .contains("untrusted-secret-value")
         );
         fs::write(&error_path, br#"{"schema_version":1,"error":{"code":"authentication_failed","body":"untrusted-secret-value"}}"#).unwrap();
-        assert!(read_gateway_startup_failure(&ready).is_err());
+        assert!(read_gateway_startup_failure(&ready, PublicProvider::Codex).is_err());
     }
 
     #[test]
     fn resolves_custom_upstream_and_rejects_conflicts() {
         let command = args(&["exec", "--base-url=https://example.test/v1"]);
         assert_eq!(
-            resolve_upstream_base_url(&command, None).unwrap(),
+            resolve_upstream_base_url(&command, None, "OPENAI_BASE_URL").unwrap(),
             Some("https://example.test/v1".into())
         );
         assert_eq!(
-            resolve_upstream_base_url(&command, Some(OsStr::new("https://example.test/v1")))
-                .unwrap(),
+            resolve_upstream_base_url(
+                &command,
+                Some(OsStr::new("https://example.test/v1")),
+                "OPENAI_BASE_URL"
+            )
+            .unwrap(),
             Some("https://example.test/v1".into())
         );
         assert!(
-            resolve_upstream_base_url(&command, Some(OsStr::new("https://different.test/v1")))
-                .is_err()
+            resolve_upstream_base_url(
+                &command,
+                Some(OsStr::new("https://different.test/v1")),
+                "OPENAI_BASE_URL"
+            )
+            .is_err()
         );
     }
 
@@ -2490,7 +2797,7 @@ mod tests {
         fs::write(
             &exact,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' '{{\"status\":\"ok\",\"ready_schema_version\":{},\"wire_compatibility_version\":\"{}\"}}'\n",
+                "#!/bin/sh\nprintf '%s\\n' '{{\"status\":\"ok\",\"ready_schema_version\":{},\"wire_compatibility_version\":\"{}\",\"supported_providers\":[\"codex\",\"zai\"]}}'\n",
                 GATEWAY_READY_SCHEMA_VERSION, SUPPORTED_CODEX_WIRE_VERSION
             ),
         )
@@ -2498,7 +2805,7 @@ mod tests {
         fs::write(
             &wrong,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' '{{\"status\":\"ok\",\"ready_schema_version\":2,\"wire_compatibility_version\":\"{}\"}}'\n",
+                "#!/bin/sh\nprintf '%s\\n' '{{\"status\":\"ok\",\"ready_schema_version\":2,\"wire_compatibility_version\":\"{}\",\"supported_providers\":[\"codex\",\"zai\"]}}'\n",
                 SUPPORTED_CODEX_WIRE_VERSION
             ),
         )
@@ -2697,31 +3004,34 @@ mod tests {
     fn readiness_contract_requires_loopback_and_a_256_bit_token() {
         let token = URL_SAFE_NO_PAD.encode([7_u8; 32]);
         let ready = GatewayReady {
+            provider: "codex".to_string(),
             schema_version: GATEWAY_READY_SCHEMA_VERSION,
             base_url: "http://127.0.0.1:4321".into(),
             token,
             default_model: "gpt-visible".into(),
             models: gateway_models(),
         };
-        assert!(ready.validate().is_ok());
+        assert!(ready.validate(PublicProvider::Codex).is_ok());
 
         let remote = GatewayReady {
+            provider: "codex".to_string(),
             schema_version: GATEWAY_READY_SCHEMA_VERSION,
             base_url: "https://example.test".into(),
             token: URL_SAFE_NO_PAD.encode([7_u8; 32]),
             default_model: "gpt-visible".into(),
             models: gateway_models(),
         };
-        assert!(remote.validate().is_err());
+        assert!(remote.validate(PublicProvider::Codex).is_err());
 
         let invalid_model = GatewayReady {
+            provider: "codex".to_string(),
             schema_version: GATEWAY_READY_SCHEMA_VERSION,
             base_url: "http://127.0.0.1:4321".into(),
             token: URL_SAFE_NO_PAD.encode([7_u8; 32]),
             default_model: "--help".into(),
             models: gateway_models(),
         };
-        assert!(invalid_model.validate().is_err());
+        assert!(invalid_model.validate(PublicProvider::Codex).is_err());
     }
 
     #[test]

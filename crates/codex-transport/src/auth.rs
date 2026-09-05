@@ -286,6 +286,9 @@ pub enum AuthStatus {
         email: Option<String>,
         plan: Option<String>,
     },
+    /// A stored Z.ai GLM Coding Plan key. Z.ai issues static keys, so there is
+    /// no account profile to report.
+    Zai,
 }
 
 /// Runs upstream Codex login with its default UI behavior.

@@ -1,0 +1,16 @@
+data: {"id":"20260905fixture01","created":1757030400,"model":"glm-5.3","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Weighing "}}]}
+
+data: {"id":"20260905fixture01","created":1757030400,"model":"glm-5.3","choices":[{"index":0,"delta":{"reasoning_content":"the options."}}]}
+
+data: {"id":"20260905fixture01","created":1757030400,"model":"glm-5.3","choices":[{"index":0,"delta":{"content":"Reading "}}]}
+
+data: {"id":"20260905fixture01","created":1757030400,"model":"glm-5.3","choices":[{"index":0,"delta":{"content":"the file."}}]}
+
+data: {"id":"20260905fixture01","created":1757030400,"model":"glm-5.3","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_fixture","type":"function","function":{"name":"muse__read_file","arguments":"{\"path\":"}}]}}]}
+
+data: {"id":"20260905fixture01","created":1757030400,"model":"glm-5.3","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"fixture.txt\"}"}}]}}]}
+
+data: {"id":"20260905fixture01","created":1757030400,"model":"glm-5.3","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":31,"completion_tokens":12,"total_tokens":43}}
+
+data: [DONE]
+

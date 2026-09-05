@@ -4,8 +4,10 @@
 //! events, execute tools, or implement an agent loop.
 
 mod auth;
+mod backend;
 mod error;
 mod transport;
+mod zai;
 
 pub use auth::AuthConfig;
 pub use auth::AuthStatus;
@@ -17,6 +19,7 @@ pub use auth::logout;
 pub use auth::set_api_key;
 pub use auth::set_api_key_from_reader;
 pub use auth::status;
+pub use backend::Backend;
 pub use error::Error;
 pub use error::Result;
 pub use secrecy::SecretString;
@@ -26,6 +29,9 @@ pub use transport::RawResponse;
 pub use transport::SearchRequest;
 pub use transport::Transport;
 pub use url::Url;
+pub use zai::DEFAULT_BASE_URL as ZAI_DEFAULT_BASE_URL;
+pub use zai::ZaiCredentials;
+pub use zai::ZaiTransport;
 
 /// The immutable OpenAI Codex source revision used by this adapter.
 pub const CODEX_GIT_REVISION: &str = "3d2ee51ca2d5db578f328aa75e20aa22c0197c9a";

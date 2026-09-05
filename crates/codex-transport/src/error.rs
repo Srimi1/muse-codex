@@ -18,6 +18,17 @@ pub enum Error {
     )]
     NotAuthenticated,
 
+    #[error(
+        "no Z.ai credentials are stored; run `muse-codex auth set --provider zai --api-key-stdin`"
+    )]
+    ZaiNotAuthenticated,
+
+    #[error("the isolated credential store is unavailable: {0}")]
+    Keyring(String),
+
+    #[error("{0} is not available with the selected provider")]
+    ProviderUnsupported(&'static str),
+
     #[error("the active credential type is not supported by this adapter")]
     UnsupportedAuthMode,
 

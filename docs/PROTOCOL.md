@@ -27,10 +27,13 @@ Headless `exec --no-session-log` is still supported.
 
 ## MSP provider fields
 
-MSP clients select `codex` in `session/start.params.providerId` or
+MSP clients select the provider this host process launched with — `codex` or
+`zai` — in `session/start.params.providerId` or
 `session/setModel.params.model.providerId`. The launcher translates those
-fields to the internal provider selector understood by Muse. Other explicit
-providers are rejected with a correlated protocol error.
+fields to the internal provider selector understood by Muse. Any other explicit
+provider, including the one this process did *not* launch with, is rejected with
+a correlated protocol error rather than silently retargeted: the provider is
+fixed for the lifetime of the host process.
 
 The response adapter translates the corresponding provider fields in session
 results, catalog results, model-change notifications, and effective-model
@@ -42,6 +45,54 @@ The stable schema defines provider identifiers as strings, so these label
 changes do not require changing its bytes or fingerprint. Session event files
 and `exec --json` remain the stock harness's records and can contain internal
 provider labels.
+
+## Z.ai request and stream translation
+
+Z.ai implements OpenAI chat-completions, not the Responses API, so the `zai`
+backend translates in both directions. This section is the reference to diff
+against when Z.ai's API changes.
+
+Request mapping (`POST <base>/chat/completions`):
+
+| Responses field | Z.ai chat field |
+| --- | --- |
+| `instructions` | leading `{"role":"system"}` message |
+| `input[]` `message`, role `developer` | `{"role":"system"}` |
+| `input[]` `message`, roles `user`/`assistant` | same role; part arrays flattened to text |
+| `input_image` part | `{"type":"image_url"}` part, only for a catalog row that lists `image`; otherwise rejected |
+| `input[]` `reasoning` | dropped; it carries provider-opaque OpenAI state |
+| `input[]` `function_call` | assistant message `tool_calls[]`; consecutive calls merge into one message |
+| `input[]` `function_call_output` | `{"role":"tool","tool_call_id":…}`; the replayed `name` is dropped |
+| `input[]` `custom_tool_call` | a function call whose arguments wrap the freeform input in one string property |
+| `tools[]` namespaces | flattened to `namespace.tool`, then encoded for the wire |
+| `reasoning.effort` | `reasoning_effort`; `ultra` and `max` become `xhigh`, `none` becomes `thinking:{"type":"disabled"}` |
+| `max_output_tokens` | `max_tokens`, clamped to the catalog limit |
+| `include`, `store`, `metadata`, `client_metadata`, `parallel_tool_calls`, `service_tier` | dropped |
+| `previous_response_id`, `conversation` | rejected when non-null |
+
+Z.ai restricts function names to `^[a-zA-Z0-9_-]+$`, at most 64 bytes, so the
+dot in a flattened namespaced name is encoded as `__` and decoded again when the
+call is replayed to Muse. Two tool names that would encode to the same wire name
+are rejected rather than made ambiguous.
+
+Response synthesis reads `choices[].delta.{reasoning_content,content,tool_calls}`
+and `choices[].finish_reason` and emits Responses events: reasoning as the
+`reasoning_summary_*` family, text as a `message` item, and each tool call as a
+`function_call` item. `finish_reason: "length"` becomes `response.incomplete`;
+`stop` and `tool_calls` become `response.completed`. The `[DONE]` sentinel is
+consumed and never forwarded, because the validator treats it as a protocol
+failure. A stream that ends without a terminal signal becomes a terminal error
+rather than a fabricated completion.
+
+Identifiers are derived from Z.ai's own response id (sanitized to the validator's
+safe alphabet) plus the output index, so they are stable for a given upstream
+response. Tool `call_id` values are Z.ai's own, because Muse replays them and the
+translator sends them back as `tool_call_id`.
+
+Non-2xx chat responses are replaced with a canonical
+`{"error":{"code":…,"param":null}}` document before the gateway sees them. Z.ai
+reports numeric codes the gateway's allowlist does not recognize, and its error
+bodies can name the account.
 
 ## Responses requests and streams
 

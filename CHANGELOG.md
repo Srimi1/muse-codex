@@ -21,9 +21,26 @@ All notable project changes will be documented here. The format follows
   older gateway that lacks the private selector.
 - Signed private-release manifest and installer tooling.
 - Project branding, community standards, support policy, and GitHub templates.
+- First-class Z.ai GLM Coding Plan provider: `--provider zai`,
+  `muse-codex auth set --provider zai --api-key-stdin`, and an isolated Z.ai
+  keyring record that cannot satisfy a Codex launch or be removed by a Codex
+  logout.
+- Responses-to-chat-completions request translation and Responses event-stream
+  synthesis for Z.ai, including namespaced tool-name encoding, parallel tool
+  calls, reasoning summaries, and length truncation.
+- A pinned GLM model catalog validated at startup against Z.ai's plan-usage
+  endpoint, which consumes no coding prompt; skip it with
+  `MUSE_CODEX_ZAI_SKIP_PROBE=1`.
 
 ### Changed
 
+- Select the upstream with a `Backend` enum shared by the launcher, gateway, and
+  readiness contract; the gateway self-test now advertises the providers it
+  supports so a launcher cannot pair with a gateway that would ignore
+  `--provider`.
+- Give each provider its own isolated stock-Muse profile, because Muse's
+  normalized catalog cache is keyed only by its internal provider name.
+- Make sanitized failure messages and provider help text provider-neutral.
 - Repin the vendored OpenAI Codex client from `rust-v0.133.0` to
   `rust-v0.153.4` (`3d2ee51ca2d5db578f328aa75e20aa22c0197c9a`) and move source builds to
   Rust `1.95.0`.

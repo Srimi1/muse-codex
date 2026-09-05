@@ -87,10 +87,19 @@ framing; it does not approve or execute model-requested tools.
   home. It defaults to the platform data directory under
   `muse-codex/codex-home`; `MUSE_CODEX_HOME` may override it subject to path,
   ownership, and permission checks.
+- Z.ai credentials use a separate keyring record (service `Muse Codex Z.ai`,
+  account `zai|<digest>`) derived from the same isolated home. Both the service
+  and the account prefix differ from the Codex record, so no collision can let
+  one provider's credential satisfy a launch that selected the other. `logout`
+  removes only the record for the provider named on the command line.
 - The launcher removes `CODEX_ACCESS_TOKEN`, `CODEX_API_KEY`, `CODEX_HOME`,
   `CODEX_INTERNAL_ORIGINATOR_OVERRIDE`, `META_API_KEY`, `OPENAI_API_KEY`,
-  `OPENAI_BASE_URL`, `OPENAI_ORGANIZATION`, `OPENAI_PROJECT`, custom Muse
-  headers, and the configured OTLP endpoint from child environments.
+  `OPENAI_BASE_URL`, `OPENAI_ORGANIZATION`, `OPENAI_PROJECT`, `ZAI_API_KEY`,
+  `Z_AI_API_KEY`, `ZHIPUAI_API_KEY`, `ZAI_BASE_URL`, `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, custom Muse headers, and the
+  configured OTLP endpoint from child environments. The `ANTHROPIC_*` names are
+  included because the Z.ai GLM Coding Plan is commonly wired into other agents
+  through them, so a developer's shell often holds a live Z.ai credential there.
 - An invocation-only `OPENAI_API_KEY` is copied into a bounded, zeroed-on-drop
   buffer, delivered to the gateway through stdin, and omitted from child argv.
   This does not claim that the operating system's original process-environment
@@ -98,8 +107,26 @@ framing; it does not approve or execute model-requested tools.
 - Stored API keys are read from bounded stdin, stripped of trailing CR/LF,
   checked for emptiness and other whitespace, and never accepted as a
   command-line value.
-- Custom upstream base URLs require API-key mode, HTTPS, and no embedded user
-  information, query, or fragment. The HTTP client does not follow redirects.
+- Custom upstream base URLs require HTTPS and no embedded user information,
+  query, or fragment; under the `codex` provider they additionally require
+  API-key mode. The HTTP client does not follow redirects.
+- The Z.ai `Authorization` header is marked sensitive on both the chat request
+  (`Bearer <key>`) and the plan-usage probe, which Z.ai specifies as a bare
+  token with no `Bearer` prefix.
+
+### Third-party data minimization
+
+The Z.ai GLM Coding Plan is operated by a different party, in a different
+jurisdiction, from OpenAI. Under `--provider zai`:
+
+- `metadata`, `client_metadata`, `user_id`, and `request_id` are never
+  forwarded. Muse's telemetry fields have no functional role upstream and would
+  be a new egress path.
+- The startup plan check reads Z.ai's usage endpoint only to confirm the
+  credential and an active plan. Its usage figures are not parsed, logged, or
+  written to the readiness file.
+- Upstream error bodies are replaced with a canonical code before the gateway
+  sees them, so an account-identifying message cannot reach Muse or a log.
 - Logout targets only the keyring record associated with the Muse Codex auth
   home.
 
@@ -314,6 +341,11 @@ The following remain planned release gates:
 - A malicious local process running as the same user can inspect memory or
   interfere with loopback traffic.
 - Proxy or custom-CA configuration can observe provider traffic.
+- Prompts, code, and tool output sent under `--provider zai` reach Z.ai and are
+  governed by that operator's terms and jurisdiction, not OpenAI's. Choosing the
+  provider is choosing where the session's content goes.
+- The Z.ai model catalog is pinned rather than discovered, so it can drift from
+  what the account can actually use until it is updated.
 - The absence of completed black-box and live release gates leaves integration
   properties unverified.
 - Compromised release infrastructure can sign a malicious wrapper.

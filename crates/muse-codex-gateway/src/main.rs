@@ -6,10 +6,11 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use codex_transport::{
-    AuthConfig, AuthStatus, CODEX_WIRE_COMPATIBILITY_VERSION, LoginMode, LoginPrompt, login,
-    login_with_prompt_handler, logout, set_api_key_from_reader, status,
+    AuthConfig, AuthStatus, Backend, CODEX_WIRE_COMPATIBILITY_VERSION, LoginMode, LoginPrompt,
+    ZaiCredentials, ZaiTransport, login, login_with_prompt_handler, logout,
+    set_api_key_from_reader, status,
 };
 use secrecy::SecretString;
 use url::Url;
@@ -32,6 +33,16 @@ enum Command {
     SelfTest,
 }
 
+/// Providers this gateway build can serve. The launcher selects exactly one
+/// per process; there is no runtime switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum GatewayProvider {
+    Codex,
+    Zai,
+}
+
+pub(crate) const SUPPORTED_PROVIDERS: &[&str] = &["codex", "zai"];
+
 #[derive(Debug, Args)]
 struct ServeArgs {
     #[arg(long, default_value = "127.0.0.1:0")]
@@ -49,12 +60,18 @@ struct ServeArgs {
     /// Request OpenAI Fast mode for every Responses turn in this Muse session.
     #[arg(long)]
     fast: bool,
+    /// Upstream provider for this gateway process.
+    #[arg(long, value_enum, default_value_t = GatewayProvider::Codex)]
+    provider: GatewayProvider,
 }
 
 #[derive(Debug, Args)]
 struct AuthArgs {
     #[command(subcommand)]
     command: AuthCommand,
+    /// Credential record to operate on.
+    #[arg(long, value_enum, default_value_t = GatewayProvider::Codex)]
+    provider: GatewayProvider,
 }
 
 #[derive(Debug, Subcommand)]
@@ -142,6 +159,9 @@ fn classify_startup_error(error: &anyhow::Error) -> server::StartupErrorCode {
                 StartupErrorCode::NetworkUnavailable
             }
             TransportError::InvalidUpstreamResponse(_) => StartupErrorCode::CatalogInvalid,
+            TransportError::ZaiNotAuthenticated => StartupErrorCode::AuthenticationRequired,
+            TransportError::Keyring(_) => StartupErrorCode::CredentialStoreUnavailable,
+            TransportError::ProviderUnsupported(_) => StartupErrorCode::ProviderOptionUnsupported,
             TransportError::InvalidRequest(_)
             | TransportError::FastModeUnavailable
             | TransportError::InvalidHeader(_)
@@ -172,15 +192,39 @@ async fn serve(args: ServeArgs) -> Result<()> {
         None
     };
     let auth = AuthConfig::for_muse_codex()?;
-    let transport =
-        codex_transport::Transport::new(auth, invocation_key, args.upstream_base_url, args.fast)
+    let backend = match args.provider {
+        GatewayProvider::Codex => Backend::Codex(
+            codex_transport::Transport::new(
+                auth,
+                invocation_key,
+                args.upstream_base_url,
+                args.fast,
+            )
             .await
-            .context("initialize Codex transport")?;
-    server::run(args.bind, args.ready_file, args.parent_pid, transport).await
+            .context("initialize Codex transport")?,
+        ),
+        GatewayProvider::Zai => {
+            // The launcher already refuses this pairing. Re-check here so the
+            // gateway never trusts its own argv to be well formed.
+            if args.fast {
+                return Err(anyhow::Error::new(
+                    codex_transport::Error::ProviderUnsupported("OpenAI Fast mode"),
+                ));
+            }
+            Backend::Zai(
+                ZaiTransport::new(&auth, invocation_key, args.upstream_base_url)
+                    .context("initialize Z.ai transport")?,
+            )
+        }
+    };
+    server::run(args.bind, args.ready_file, args.parent_pid, backend).await
 }
 
 async fn auth(args: AuthArgs) -> Result<()> {
     let config = AuthConfig::for_muse_codex()?;
+    if args.provider == GatewayProvider::Zai {
+        return zai_auth(&config, args.command);
+    }
     match args.command {
         AuthCommand::Login { device_auth } => {
             let result = if device_auth {
@@ -217,10 +261,45 @@ async fn auth(args: AuthArgs) -> Result<()> {
     Ok(())
 }
 
+/// Z.ai issues static API keys and has no interactive sign-in, so `login` is
+/// rejected rather than quietly treated as `auth set`.
+fn zai_auth(config: &AuthConfig, command: AuthCommand) -> Result<()> {
+    let credentials = ZaiCredentials::new(config);
+    match command {
+        AuthCommand::Login { .. } => {
+            bail!(
+                "Z.ai has no interactive sign-in; run `muse-codex auth set --provider zai --api-key-stdin`"
+            )
+        }
+        AuthCommand::Logout => {
+            if credentials.delete()? {
+                println!("Logged out and removed muse-codex Z.ai credentials.");
+            } else {
+                println!("No saved muse-codex Z.ai credentials were found.");
+            }
+        }
+        AuthCommand::SetApiKey => {
+            let key = read_secret_line(&mut io::stdin().lock())?;
+            credentials.save(&key)?;
+            println!("Z.ai API key saved in macOS Keychain.");
+        }
+        AuthCommand::Status => {
+            let status = if credentials.load()?.is_some() {
+                AuthStatus::Zai
+            } else {
+                AuthStatus::SignedOut
+            };
+            print_auth_status(&status);
+        }
+    }
+    Ok(())
+}
+
 fn print_auth_status(status: &AuthStatus) {
     match status {
         AuthStatus::SignedOut => println!("Not signed in."),
         AuthStatus::ApiKey => println!("Signed in with an OpenAI API key."),
+        AuthStatus::Zai => println!("Signed in with a Z.ai GLM Coding Plan API key."),
         AuthStatus::ChatGpt { email, plan } => {
             print!("Signed in with ChatGPT");
             if let Some(email) = email {
@@ -273,6 +352,7 @@ fn self_test() -> Result<()> {
             "status": "ok",
             "ready_schema_version": server::READY_SCHEMA_VERSION,
             "wire_compatibility_version": CODEX_WIRE_COMPATIBILITY_VERSION,
+            "supported_providers": SUPPORTED_PROVIDERS,
         })
     );
     Ok(())

@@ -7,7 +7,7 @@
 <p align="center"><strong>Keep the harness. Change the model.</strong></p>
 
 <p align="center">
-  An independent compatibility gateway for using OpenAI models through the stock Muse Code CLI.
+  An independent compatibility gateway for using OpenAI or Z.ai models through the stock Muse Code CLI.
 </p>
 
 <p align="center">
@@ -49,7 +49,7 @@ the pinned OpenAI Codex client.
 | Stock Muse owns | Muse Codex owns | Not included here |
 | --- | --- | --- |
 | TUI and exec mode | CLI routing and version gate | The proprietary Muse binary |
-| Sessions and context | Isolated OpenAI authentication | OpenAI service access |
+| Sessions and context | Isolated per-provider authentication | Upstream service access |
 | Tools and approvals | Loopback gateway lifecycle | A public binary release |
 | Sandbox and extensions | Model catalog and stream translation | Modified Muse host source |
 
@@ -59,7 +59,7 @@ flowchart LR
     L -->|spawns| M[Stock Muse Code]
     L -->|starts| G[Loopback gateway]
     M -->|ephemeral bearer token| G
-    G -->|authenticated HTTPS| O[OpenAI]
+    G -->|authenticated HTTPS| O[OpenAI or Z.ai]
     M --> T[Tools, approvals, sandbox]
 ```
 
@@ -74,7 +74,8 @@ See [Architecture](docs/ARCHITECTURE.md) and the
 | Muse Code | Exactly `1.0.3-R2198.1` |
 | Rust | `1.95.0` for source builds |
 | OpenAI Codex source | `rust-v0.153.4` at `3d2ee51ca2d5db578f328aa75e20aa22c0197c9a` |
-| Authentication | ChatGPT browser/device login or an OpenAI API key |
+| Authentication | ChatGPT browser/device login, an OpenAI API key, or a Z.ai API key |
+| Providers | `--provider codex` (default) and `--provider zai` |
 
 The current Meta installer may provide a newer Muse build. Muse Codex does not
 bypass its version gate; verify the installed binary before building:
@@ -85,6 +86,20 @@ Muse Code 1.0.3 (1.0.3-R2198.1)
 ```
 
 If the output differs, this version of Muse Codex will not start a session.
+
+### Providers
+
+Each launch selects exactly one upstream and never falls back to the other.
+Omitting `--provider` selects `codex`.
+
+| Provider | Upstream | Authentication |
+| --- | --- | --- |
+| `codex` (default) | OpenAI Responses API | ChatGPT subscription or an OpenAI API key |
+| `zai` | Z.ai GLM Coding Plan (`https://api.z.ai/api/coding/paas/v4`) | Z.ai API key |
+
+Credentials live in two separate keyring records, so signing out of one leaves
+the other untouched, and a launch that selects one provider can never be served
+by the other's credential.
 
 ### Models
 
@@ -152,6 +167,16 @@ printf '%s' "$OPENAI_API_KEY" | \
   muse-codex auth set --provider codex --api-key-stdin
 ```
 
+For the Z.ai GLM Coding Plan, store its key in its own keyring record:
+
+```sh
+printf '%s' "$ZAI_API_KEY" | \
+  muse-codex auth set --provider zai --api-key-stdin
+```
+
+Z.ai issues static keys and has no interactive sign-in, so `muse-codex login`
+is rejected for that provider.
+
 ChatGPT subscription authentication and API-key billing are separate modes.
 Muse Codex never silently falls back between them. Credentials are stored in an
 isolated operating-system keyring namespace rather than a plaintext
@@ -198,9 +223,22 @@ determines whether it supports it. Without `--fast`, the gateway strips and
 omits any service tier. The startup banner says Fast was *requested* because
 the service can report a downgraded tier.
 
+To run the same harness against your Z.ai subscription:
+
+```sh
+muse-codex --provider zai
+muse-codex --provider zai exec --model glm-5.3 "Review this repository"
+```
+
+Z.ai publishes no model-listing endpoint, so the GLM catalog is pinned in the
+source and validated at startup against Z.ai's plan-usage endpoint, which
+confirms the key and an active plan without spending a coding prompt. Set
+`MUSE_CODEX_ZAI_SKIP_PROBE=1` to skip that check and defer credential
+validation to the first turn.
+
 Arguments unrelated to provider routing pass through to Muse. The public
-provider is either omitted or explicitly `--provider codex`; other provider
-values are rejected.
+provider is either omitted or explicitly `--provider codex` or
+`--provider zai`; other provider values are rejected.
 
 For complete setup, private signed-feed installation, environment variables,
 and endpoint rules, see [Installation](docs/INSTALLATION.md) and
@@ -238,6 +276,12 @@ not a public issue.
 - New response event types, auxiliary routes, and Muse releases require explicit
   compatibility work before support is claimed.
 - Hooks, MCP servers, skills, and plugins retain Muse's existing trust model.
+- With `--provider zai`: `--fast` is rejected (GLM has no service tier), the
+  web-search and browser-open routes return `501`, and freeform (`custom`)
+  tools are approximated as a single-string function because Z.ai has no
+  freeform tool type.
+- The Z.ai GLM catalog is pinned rather than discovered, and prompts sent under
+  `--provider zai` are governed by Z.ai's terms rather than OpenAI's.
 
 Track planned qualification work in the [Roadmap](ROADMAP.md).
 

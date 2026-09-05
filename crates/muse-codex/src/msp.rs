@@ -14,7 +14,8 @@ use std::thread::{self, JoinHandle};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
-const PUBLIC_PROVIDER: &str = "codex";
+use crate::PublicProvider;
+
 const INTERNAL_PROVIDER: &str = "meta";
 const MAX_FRAME_BYTES: usize = 10 * 1024 * 1024;
 const MAX_PENDING_REQUESTS: usize = 4096;
@@ -38,7 +39,11 @@ pub struct MspRelay {
 }
 
 impl MspRelay {
-    pub fn start(child: &mut Child) -> Result<Self> {
+    /// `provider` is the public label this launch accepts and re-exposes. Only
+    /// one provider is active per process, so a frame naming any other public
+    /// provider is rejected rather than silently retargeted.
+    pub fn start(child: &mut Child, provider: PublicProvider) -> Result<Self> {
+        let public = provider.as_str();
         let child_stdin = child
             .stdin
             .take()
@@ -54,7 +59,7 @@ impl MspRelay {
         let input_pending = pending.clone();
         let input_stdout = stdout.clone();
         let input = thread::spawn(move || {
-            let result = relay_client_input(child_stdin, input_pending, input_stdout);
+            let result = relay_client_input(child_stdin, input_pending, input_stdout, public);
             if result.is_err() {
                 terminate_child(child_pid);
             }
@@ -62,7 +67,7 @@ impl MspRelay {
         });
 
         let output = thread::spawn(move || {
-            let result = relay_server_output(child_stdout, pending, stdout);
+            let result = relay_server_output(child_stdout, pending, stdout, public);
             if result.is_err() {
                 terminate_child(child_pid);
             }
@@ -101,6 +106,7 @@ fn relay_client_input(
     child_stdin: ChildStdin,
     pending: PendingRequests,
     stdout: SharedStdout,
+    public: &'static str,
 ) -> Result<()> {
     let stdin = io::stdin();
     let mut source = stdin.lock();
@@ -108,7 +114,7 @@ fn relay_client_input(
     let mut frame = Vec::new();
 
     while read_frame(&mut source, &mut frame)? {
-        match adapt_client_frame(&frame, &pending)? {
+        match adapt_client_frame(&frame, &pending, public)? {
             ClientFrame::Forward(bytes) => {
                 destination.write_all(&bytes)?;
                 destination.flush()?;
@@ -125,11 +131,12 @@ fn relay_server_output(
     child_stdout: ChildStdout,
     pending: PendingRequests,
     stdout: SharedStdout,
+    public: &'static str,
 ) -> Result<()> {
     let mut source = BufReader::new(child_stdout);
     let mut frame = Vec::new();
     while read_frame(&mut source, &mut frame)? {
-        let bytes = adapt_server_frame(&frame, &pending)?;
+        let bytes = adapt_server_frame(&frame, &pending, public)?;
         write_stdout(&stdout, &bytes)?;
     }
     Ok(())
@@ -180,7 +187,11 @@ enum ClientFrame {
     Drop,
 }
 
-fn adapt_client_frame(frame: &[u8], pending: &PendingRequests) -> Result<ClientFrame> {
+fn adapt_client_frame(
+    frame: &[u8],
+    pending: &PendingRequests,
+    public: &str,
+) -> Result<ClientFrame> {
     let Some(mut value) = parse_frame(frame) else {
         // Invalid JSON cannot carry an executable MSP command. Preserve it so
         // the stock host remains authoritative for parse-error behavior.
@@ -213,7 +224,7 @@ fn adapt_client_frame(frame: &[u8], pending: &PendingRequests) -> Result<ClientF
 
     let mut changed = false;
     if let Some(Value::String(provider)) = provider {
-        if provider == PUBLIC_PROVIDER {
+        if provider == public {
             *provider = INTERNAL_PROVIDER.to_string();
             changed = true;
         } else if !provider.is_empty() {
@@ -225,7 +236,7 @@ fn adapt_client_frame(frame: &[u8], pending: &PendingRequests) -> Result<ClientF
                 .and_then(Value::as_str);
             if let Some(id) = id.filter(|id| rpc_id_key(id).is_some()) {
                 let error = if let Some(command_id) = command_id {
-                    command_rejected(id, command_id)
+                    command_rejected(id, command_id, public)
                 } else {
                     invalid_params(id, "provider requires a valid commandId")
                 };
@@ -268,13 +279,13 @@ fn adapt_client_frame(frame: &[u8], pending: &PendingRequests) -> Result<ClientF
     }
 }
 
-fn command_rejected(id: Value, command_id: &str) -> Value {
+fn command_rejected(id: Value, command_id: &str, public: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": id,
         "error": {
             "code": -32030,
-            "message": "muse-codex only accepts provider 'codex'",
+            "message": format!("muse-codex only accepts provider '{public}' in this session"),
             "data": {
                 "kind": "commandRejected",
                 "commandId": command_id,
@@ -325,7 +336,7 @@ fn overloaded(id: Value) -> Value {
     })
 }
 
-fn adapt_server_frame(frame: &[u8], pending: &PendingRequests) -> Result<Vec<u8>> {
+fn adapt_server_frame(frame: &[u8], pending: &PendingRequests, public: &str) -> Result<Vec<u8>> {
     let Some(mut value) = parse_frame(frame) else {
         bail!("stock Muse emitted malformed MSP JSON");
     };
@@ -339,7 +350,7 @@ fn adapt_server_frame(frame: &[u8], pending: &PendingRequests) -> Result<Vec<u8>
         .and_then(Value::as_str)
         .map(str::to_owned)
     {
-        changed |= adapt_server_notification(&method, object)?;
+        changed |= adapt_server_notification(&method, object, public)?;
     } else if let Some(key) = object.get("id").and_then(rpc_id_key) {
         let has_result = object.contains_key("result");
         let has_error = object.contains_key("error");
@@ -353,7 +364,7 @@ fn adapt_server_frame(frame: &[u8], pending: &PendingRequests) -> Result<Vec<u8>
             .remove(&key);
         if let Some(request) = request {
             if let Some(result) = object.get_mut("result") {
-                changed |= adapt_server_result(&request.method, result)?;
+                changed |= adapt_server_result(&request.method, result, public)?;
             }
         } else if has_result {
             // Stock may legitimately emit an uncorrelated error after the
@@ -376,33 +387,34 @@ fn adapt_server_frame(frame: &[u8], pending: &PendingRequests) -> Result<Vec<u8>
     }
 }
 
-fn adapt_server_result(method: &str, result: &mut Value) -> Result<bool> {
+fn adapt_server_result(method: &str, result: &mut Value, public: &str) -> Result<bool> {
     let Some(result) = result.as_object_mut() else {
         return Ok(false);
     };
     match method {
         "session/start" | "session/resume" | "session/fork" | "session/read" => {
-            let mut changed = adapt_session(result.get_mut("session"))?;
-            changed |= adapt_history(result.get_mut("history"))?;
+            let mut changed = adapt_session(result.get_mut("session"), public)?;
+            changed |= adapt_history(result.get_mut("history"), public)?;
             Ok(changed)
         }
         "session/list" => {
             let mut changed = false;
             if let Some(Value::Array(sessions)) = result.get_mut("sessions") {
                 for session in sessions {
-                    changed |= adapt_session(Some(session))?;
+                    changed |= adapt_session(Some(session), public)?;
                 }
             }
             Ok(changed)
         }
         "model/list" => {
-            let mut changed = adapt_provider(result.get_mut("providerId"))?;
+            let mut changed = adapt_provider(result.get_mut("providerId"), public)?;
             if let Some(Value::Array(models)) = result.get_mut("models") {
                 for model in models {
                     changed |= adapt_provider(
                         model
                             .as_object_mut()
                             .and_then(|model| model.get_mut("providerId")),
+                        public,
                     )?;
                 }
             }
@@ -418,7 +430,7 @@ fn adapt_server_result(method: &str, result: &mut Value) -> Result<bool> {
                             .and_then(Value::as_str)
                             .map(str::to_owned)
                     {
-                        changed |= adapt_server_notification(&method, event)?;
+                        changed |= adapt_server_notification(&method, event, public)?;
                     }
                 }
             }
@@ -431,27 +443,28 @@ fn adapt_server_result(method: &str, result: &mut Value) -> Result<bool> {
 fn adapt_server_notification(
     method: &str,
     object: &mut serde_json::Map<String, Value>,
+    public: &str,
 ) -> Result<bool> {
     let Some(params) = object.get_mut("params").and_then(Value::as_object_mut) else {
         return Ok(false);
     };
     match method {
         "session/started" | "session/resumed" | "session/forked" => {
-            adapt_session(params.get_mut("session"))
+            adapt_session(params.get_mut("session"), public)
         }
-        "session/modelChanged" => adapt_provider(params.get_mut("providerId")),
+        "session/modelChanged" => adapt_provider(params.get_mut("providerId"), public),
         _ => Ok(false),
     }
 }
 
-fn adapt_session(session: Option<&mut Value>) -> Result<bool> {
+fn adapt_session(session: Option<&mut Value>, public: &str) -> Result<bool> {
     let Some(session) = session.and_then(Value::as_object_mut) else {
         return Ok(false);
     };
-    adapt_provider(session.get_mut("providerId"))
+    adapt_provider(session.get_mut("providerId"), public)
 }
 
-fn adapt_history(history: Option<&mut Value>) -> Result<bool> {
+fn adapt_history(history: Option<&mut Value>, public: &str) -> Result<bool> {
     let Some(history) = history.and_then(Value::as_object_mut) else {
         return Ok(false);
     };
@@ -469,20 +482,20 @@ fn adapt_history(history: Option<&mut Value>) -> Result<bool> {
     else {
         return Ok(false);
     };
-    adapt_provider(effective_model.get_mut("providerId"))
+    adapt_provider(effective_model.get_mut("providerId"), public)
 }
 
-fn adapt_provider(provider: Option<&mut Value>) -> Result<bool> {
+fn adapt_provider(provider: Option<&mut Value>, public: &str) -> Result<bool> {
     let Some(provider) = provider else {
         return Ok(false);
     };
     match provider {
         Value::Null => Ok(false),
         Value::String(value) if value == INTERNAL_PROVIDER => {
-            *value = PUBLIC_PROVIDER.to_string();
+            *value = public.to_string();
             Ok(true)
         }
-        Value::String(value) if value == PUBLIC_PROVIDER => Ok(false),
+        Value::String(value) if value == public => Ok(false),
         Value::String(_) => bail!("stock Muse exposed an unsupported MSP provider"),
         _ => bail!("stock Muse exposed a malformed MSP provider field"),
     }
@@ -545,7 +558,7 @@ mod tests {
         let frame = wire(
             r#"{"jsonrpc":"2.0","id":1,"method":"session/start","params":{"commandId":"cmd","providerId":"codex","config":{"providerId":"codex"},"modelId":"meta-in-model"}}"#,
         );
-        let value = decode(adapt_client_frame(&frame, &requests).unwrap());
+        let value = decode(adapt_client_frame(&frame, &requests, "codex").unwrap());
         assert_eq!(value["params"]["providerId"], "meta");
         assert_eq!(value["params"]["config"]["providerId"], "codex");
         assert_eq!(value["params"]["modelId"], "meta-in-model");
@@ -557,10 +570,49 @@ mod tests {
         let frame = wire(
             r#"{"jsonrpc":"2.0","id":"r","method":"session/setModel","params":{"commandId":"cmd","sessionId":"s","model":{"providerId":"codex","modelId":"meta-model","displayLabel":"meta text"}}}"#,
         );
-        let value = decode(adapt_client_frame(&frame, &requests).unwrap());
+        let value = decode(adapt_client_frame(&frame, &requests, "codex").unwrap());
         assert_eq!(value["params"]["model"]["providerId"], "meta");
         assert_eq!(value["params"]["model"]["modelId"], "meta-model");
         assert_eq!(value["params"]["model"]["displayLabel"], "meta text");
+    }
+
+    #[test]
+    fn maps_the_active_provider_label_in_both_directions() {
+        let requests = pending();
+        let frame = wire(
+            r#"{"jsonrpc":"2.0","id":1,"method":"session/start","params":{"commandId":"cmd","providerId":"zai"}}"#,
+        );
+        let value = decode(adapt_client_frame(&frame, &requests, "zai").unwrap());
+        assert_eq!(value["params"]["providerId"], "meta");
+
+        let response = wire(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"session":{"providerId":"meta","sessionId":"s"}}}"#,
+        );
+        let mapped = adapt_server_frame(&response, &requests, "zai").unwrap();
+        let value = parse_frame(&mapped).unwrap();
+        assert_eq!(value["result"]["session"]["providerId"], "zai");
+    }
+
+    #[test]
+    fn rejects_the_provider_this_process_did_not_launch_with() {
+        // The provider is fixed for the host process, so naming the other one
+        // is a client error rather than something to silently retarget.
+        let requests = pending();
+        let frame = wire(
+            r#"{"jsonrpc":"2.0","id":9,"method":"session/start","params":{"commandId":"cmd-9","providerId":"codex"}}"#,
+        );
+        let ClientFrame::Reject(frame) = adapt_client_frame(&frame, &requests, "zai").unwrap()
+        else {
+            panic!("expected rejection");
+        };
+        let value = parse_frame(&frame).unwrap();
+        assert_eq!(value["error"]["data"]["reason"], "unsupported_provider");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("provider 'zai'")
+        );
     }
 
     #[test]
@@ -571,7 +623,7 @@ mod tests {
                 "{{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"session/start\",\"params\":{{\"commandId\":\"cmd-7\",\"providerId\":\"{provider}\"}}}}\n"
             );
             let ClientFrame::Reject(frame) =
-                adapt_client_frame(frame.as_bytes(), &requests).unwrap()
+                adapt_client_frame(frame.as_bytes(), &requests, "codex").unwrap()
             else {
                 panic!("expected rejection");
             };
@@ -590,7 +642,8 @@ mod tests {
         let frame = wire(
             r#"{"jsonrpc":"2.0","id":"missing-command","method":"session/start","params":{"providerId":"echo"}}"#,
         );
-        let ClientFrame::Reject(frame) = adapt_client_frame(&frame, &requests).unwrap() else {
+        let ClientFrame::Reject(frame) = adapt_client_frame(&frame, &requests, "codex").unwrap()
+        else {
             panic!("expected rejection");
         };
         let value = parse_frame(&frame).unwrap();
@@ -605,7 +658,8 @@ mod tests {
         let frame = wire(
             r#"{"jsonrpc":"2.0","id":{"nested":true},"method":"session/start","params":{"commandId":"cmd","providerId":"echo"}}"#,
         );
-        let ClientFrame::Reject(frame) = adapt_client_frame(&frame, &requests).unwrap() else {
+        let ClientFrame::Reject(frame) = adapt_client_frame(&frame, &requests, "codex").unwrap()
+        else {
             panic!("expected rejection");
         };
         let value = parse_frame(&frame).unwrap();
@@ -621,11 +675,13 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":9,"method":"session/start","params":{"commandId":"cmd","providerId":"codex"}}"#,
         );
         assert!(matches!(
-            adapt_client_frame(&first, &requests).unwrap(),
+            adapt_client_frame(&first, &requests, "codex").unwrap(),
             ClientFrame::Forward(_)
         ));
         let duplicate = wire(r#"{"jsonrpc":"2.0","id":9,"method":"model/list","params":{}}"#);
-        let ClientFrame::Reject(frame) = adapt_client_frame(&duplicate, &requests).unwrap() else {
+        let ClientFrame::Reject(frame) =
+            adapt_client_frame(&duplicate, &requests, "codex").unwrap()
+        else {
             panic!("expected duplicate rejection");
         };
         let value = parse_frame(&frame).unwrap();
@@ -639,10 +695,12 @@ mod tests {
         let first = wire(
             r#"{"jsonrpc":"2.0","id":"same","method":"session/start","params":{"commandId":"cmd","providerId":"codex"}}"#,
         );
-        let _ = adapt_client_frame(&first, &requests).unwrap();
+        let _ = adapt_client_frame(&first, &requests, "codex").unwrap();
         let duplicate =
             wire(r#"{"jsonrpc":"2.0","id":"same","method":"unknown/extension","params":{}}"#);
-        let ClientFrame::Reject(frame) = adapt_client_frame(&duplicate, &requests).unwrap() else {
+        let ClientFrame::Reject(frame) =
+            adapt_client_frame(&duplicate, &requests, "codex").unwrap()
+        else {
             panic!("expected duplicate rejection");
         };
         let value = parse_frame(&frame).unwrap();
@@ -664,7 +722,8 @@ mod tests {
             }
         }
         let frame = wire(r#"{"jsonrpc":"2.0","id":"overflow","method":"model/list","params":{}}"#);
-        let ClientFrame::Reject(frame) = adapt_client_frame(&frame, &requests).unwrap() else {
+        let ClientFrame::Reject(frame) = adapt_client_frame(&frame, &requests, "codex").unwrap()
+        else {
             panic!("expected capacity rejection");
         };
         let value = parse_frame(&frame).unwrap();
@@ -689,7 +748,9 @@ mod tests {
         let frame = wire(
             r#"{"jsonrpc":"2.0","id":4,"method":"turn/start","params":{"input":[{"type":"text","text":"providerId meta codex echo"}],"providerId":"meta"}}"#,
         );
-        let ClientFrame::Forward(forwarded) = adapt_client_frame(&frame, &requests).unwrap() else {
+        let ClientFrame::Forward(forwarded) =
+            adapt_client_frame(&frame, &requests, "codex").unwrap()
+        else {
             panic!("expected forwarding");
         };
         assert_eq!(forwarded, frame);
@@ -701,21 +762,21 @@ mod tests {
         let request = wire(
             r#"{"jsonrpc":"2.0","id":1,"method":"session/start","params":{"commandId":"cmd","providerId":"codex"}}"#,
         );
-        let _ = adapt_client_frame(&request, &requests).unwrap();
+        let _ = adapt_client_frame(&request, &requests, "codex").unwrap();
         let response = wire(
             r#"{"jsonrpc":"2.0","id":1,"result":{"session":{"providerId":"meta","modelId":"meta-model"}}}"#,
         );
-        let response = adapt_server_frame(&response, &requests).unwrap();
+        let response = adapt_server_frame(&response, &requests, "codex").unwrap();
         let value = parse_frame(&response).unwrap();
         assert_eq!(value["result"]["session"]["providerId"], "codex");
         assert_eq!(value["result"]["session"]["modelId"], "meta-model");
 
         let request = wire(r#"{"jsonrpc":"2.0","id":2,"method":"model/list","params":{}}"#);
-        let _ = adapt_client_frame(&request, &requests).unwrap();
+        let _ = adapt_client_frame(&request, &requests, "codex").unwrap();
         let response = wire(
             r#"{"jsonrpc":"2.0","id":2,"result":{"providerId":"meta","models":[{"providerId":"meta","modelId":"fixture"}]}}"#,
         );
-        let response = adapt_server_frame(&response, &requests).unwrap();
+        let response = adapt_server_frame(&response, &requests, "codex").unwrap();
         let value = parse_frame(&response).unwrap();
         assert_eq!(value["result"]["providerId"], "codex");
         assert_eq!(value["result"]["models"][0]["providerId"], "codex");
@@ -727,7 +788,7 @@ mod tests {
         let frame = wire(
             r#"{"jsonrpc":"2.0","method":"session/modelChanged","params":{"providerId":"meta","modelId":"meta-model","source":"user","note":"meta"}}"#,
         );
-        let frame = adapt_server_frame(&frame, &requests).unwrap();
+        let frame = adapt_server_frame(&frame, &requests, "codex").unwrap();
         let value = parse_frame(&frame).unwrap();
         assert_eq!(value["params"]["providerId"], "codex");
         assert_eq!(value["params"]["modelId"], "meta-model");
@@ -738,15 +799,15 @@ mod tests {
     fn malformed_response_does_not_consume_pending_correlation() {
         let requests = pending();
         let request = wire(r#"{"jsonrpc":"2.0","id":1,"method":"model/list","params":{}}"#);
-        let _ = adapt_client_frame(&request, &requests).unwrap();
+        let _ = adapt_client_frame(&request, &requests, "codex").unwrap();
 
         let missing = wire(r#"{"jsonrpc":"2.0","id":1}"#);
-        assert!(adapt_server_frame(&missing, &requests).is_err());
+        assert!(adapt_server_frame(&missing, &requests, "codex").is_err());
         assert!(requests.lock().unwrap().contains_key("1"));
 
         let doubled =
             wire(r#"{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-32603,"message":"bad"}}"#);
-        assert!(adapt_server_frame(&doubled, &requests).is_err());
+        assert!(adapt_server_frame(&doubled, &requests, "codex").is_err());
         assert!(requests.lock().unwrap().contains_key("1"));
     }
 
@@ -756,17 +817,20 @@ mod tests {
         let request = wire(
             r#"{"jsonrpc":"2.0","id":1,"method":"session/start","params":{"commandId":"cmd","providerId":"codex"}}"#,
         );
-        let _ = adapt_client_frame(&request, &requests).unwrap();
+        let _ = adapt_client_frame(&request, &requests, "codex").unwrap();
         let response =
             wire(r#"{"jsonrpc":"2.0","id":1,"result":{"session":{"providerId":"echo"}}}"#);
-        assert!(adapt_server_frame(&response, &requests).is_err());
+        assert!(adapt_server_frame(&response, &requests, "codex").is_err());
     }
 
     #[test]
     fn passes_uncorrelated_stock_error_for_invalid_client_input() {
         let response =
             wire(r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}"#);
-        assert_eq!(adapt_server_frame(&response, &pending()).unwrap(), response);
+        assert_eq!(
+            adapt_server_frame(&response, &pending(), "codex").unwrap(),
+            response
+        );
     }
 
     #[test]
@@ -781,7 +845,9 @@ mod tests {
     fn malformed_client_json_remains_stock_muse_input() {
         let requests = pending();
         let frame = b"{not json}\n";
-        let ClientFrame::Forward(forwarded) = adapt_client_frame(frame, &requests).unwrap() else {
+        let ClientFrame::Forward(forwarded) =
+            adapt_client_frame(frame, &requests, "codex").unwrap()
+        else {
             panic!("expected forwarding");
         };
         assert_eq!(forwarded, frame);
@@ -789,6 +855,6 @@ mod tests {
 
     #[test]
     fn malformed_stock_output_fails_closed() {
-        assert!(adapt_server_frame(b"{not json}\n", &pending()).is_err());
+        assert!(adapt_server_frame(b"{not json}\n", &pending(), "codex").is_err());
     }
 }

@@ -22,7 +22,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use codex_transport::{ModelInfo, Transport};
+use codex_transport::{Backend, ModelInfo};
 use futures_util::StreamExt;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -33,7 +33,7 @@ use crate::sse;
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_UPSTREAM_ERROR_BYTES: usize = 64 * 1024;
-pub(crate) const READY_SCHEMA_VERSION: u8 = 3;
+pub(crate) const READY_SCHEMA_VERSION: u8 = 4;
 const MODEL_CATALOG_STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
 const UPSTREAM_ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const PARENT_WATCH_INTERVAL: Duration = Duration::from_millis(250);
@@ -41,12 +41,15 @@ const PARENT_WATCH_INTERVAL: Duration = Duration::from_millis(250);
 #[derive(Clone)]
 struct AppState {
     token: Arc<[u8]>,
-    transport: Arc<Transport>,
+    backend: Arc<Backend>,
 }
 
 #[derive(Debug, Serialize)]
 struct ReadyFile<'a> {
     schema_version: u8,
+    /// The public provider this gateway serves. The launcher refuses a
+    /// readiness file that does not name the provider it asked for.
+    provider: &'a str,
     base_url: String,
     token: &'a str,
     default_model: &'a str,
@@ -66,6 +69,7 @@ pub enum StartupErrorCode {
     CatalogInvalid,
     CatalogTimeout,
     NetworkUnavailable,
+    ProviderOptionUnsupported,
     GatewayStartFailed,
 }
 
@@ -84,18 +88,17 @@ pub async fn run(
     bind: SocketAddr,
     ready_file: PathBuf,
     parent_pid: u32,
-    transport: Transport,
+    backend: Backend,
 ) -> Result<()> {
     let token = generate_token()?;
-    let catalog_models =
-        tokio::time::timeout(MODEL_CATALOG_STARTUP_TIMEOUT, transport.list_models())
-            .await
-            .context("Codex model catalog timed out before gateway readiness")??;
+    let catalog_models = tokio::time::timeout(MODEL_CATALOG_STARTUP_TIMEOUT, backend.list_models())
+        .await
+        .context("the upstream model catalog timed out before gateway readiness")??;
     let default_model = catalog_models
         .iter()
         .find(|model| model.is_default)
         .map(|model| model.id.as_str())
-        .context("Codex model catalog has no default model")?;
+        .context("the upstream model catalog has no default model")?;
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind private gateway to {bind}"))?;
@@ -108,6 +111,7 @@ pub async fn run(
         &ready_file,
         &ReadyFile {
             schema_version: READY_SCHEMA_VERSION,
+            provider: backend.provider(),
             base_url: format!("http://{address}"),
             token: &token,
             default_model,
@@ -117,7 +121,7 @@ pub async fn run(
 
     let state = AppState {
         token: Arc::from(token.as_bytes()),
-        transport: Arc::new(transport),
+        backend: Arc::new(backend),
     };
     let app = Router::new()
         .route("/healthz", get(health))
@@ -179,7 +183,7 @@ async fn responses(
 
     let upstream_headers = upstream_request_headers(&headers);
     match state
-        .transport
+        .backend
         .stream_responses(request, upstream_headers)
         .await
     {
@@ -220,7 +224,7 @@ async fn search(
         Err(response) => return *response,
     };
     match state
-        .transport
+        .backend
         .search_muse_request(request, upstream_request_headers(&headers))
         .await
     {
@@ -235,6 +239,11 @@ async fn search(
             StatusCode::BAD_REQUEST,
             "The search request was invalid.",
             "invalid_request",
+        ),
+        Err(codex_transport::Error::ProviderUnsupported(_)) => gateway_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "Web search is not available with the selected provider.",
+            "provider_unsupported",
         ),
         Err(_) => gateway_error(
             StatusCode::BAD_GATEWAY,
@@ -254,7 +263,7 @@ async fn browser_open(
         Err(response) => return *response,
     };
     match state
-        .transport
+        .backend
         .browser_open_muse_request(request, upstream_request_headers(&headers))
         .await
     {
@@ -269,6 +278,11 @@ async fn browser_open(
             StatusCode::BAD_REQUEST,
             "The browser-open request was invalid.",
             "invalid_request",
+        ),
+        Err(codex_transport::Error::ProviderUnsupported(_)) => gateway_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "Browser open is not available with the selected provider.",
+            "provider_unsupported",
         ),
         Err(_) => gateway_error(
             StatusCode::BAD_GATEWAY,
@@ -760,6 +774,48 @@ fn process_exists(pid: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Z.ai has no search or browser service. 501 is permanent, so stock Muse
+    /// does not retry it the way it would a 5xx, and it is never answered with
+    /// an empty success that the model would read as "the web found nothing".
+    #[tokio::test]
+    async fn auxiliary_routes_are_not_implemented_for_the_zai_backend() {
+        let temporary = tempfile::tempdir().unwrap();
+        let auth =
+            codex_transport::AuthConfig::with_home(temporary.path().join("muse-codex")).unwrap();
+        let backend = Backend::Zai(
+            codex_transport::ZaiTransport::new(
+                &auth,
+                Some(codex_transport::SecretString::from(
+                    "zai-fixture-key".to_string(),
+                )),
+                None,
+            )
+            .unwrap(),
+        );
+        assert_eq!(backend.provider(), "zai");
+        let state = AppState {
+            token: Arc::from(b"token".as_slice()),
+            backend: Arc::new(backend),
+        };
+
+        for response in [
+            search(
+                State(state.clone()),
+                HeaderMap::new(),
+                Ok(Json(json!({"query": "rust", "request_id": "r1"}))),
+            )
+            .await,
+            browser_open(
+                State(state.clone()),
+                HeaderMap::new(),
+                Ok(Json(json!({"url": "https://example.test"}))),
+            )
+            .await,
+        ] {
+            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -801,6 +857,7 @@ mod tests {
         write_ready_file(
             &path,
             &ReadyFile {
+                provider: "codex",
                 schema_version: READY_SCHEMA_VERSION,
                 base_url: "http://127.0.0.1:1234".to_string(),
                 token: "secret",
