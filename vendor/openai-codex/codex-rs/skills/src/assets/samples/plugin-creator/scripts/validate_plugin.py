@@ -6,11 +6,16 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlparse
 
 import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from identifier_validation import validate_plugin_identifier
 
 
 TODO_MARKER = "[TODO:"
@@ -111,7 +116,12 @@ def validate_manifest_shape(
         errors.append(f"plugin.json field `{key}` is not accepted by plugin validation")
 
     validate_optional_non_empty_string(manifest, "id", errors)
-    require_non_empty_string(manifest, "name", errors)
+    plugin_name = require_non_empty_string(manifest, "name", errors)
+    if plugin_name is not None:
+        try:
+            validate_plugin_identifier(plugin_name)
+        except ValueError as error:
+            errors.append(f"plugin.json field `name` is invalid: {error}")
     version = require_non_empty_string(manifest, "version", errors)
     if version is not None and SEMVER_RE.fullmatch(version) is None:
         errors.append("plugin.json field `version` must be strict semver")
@@ -126,16 +136,11 @@ def validate_manifest_shape(
 
     validate_optional_contract_path(manifest, "skills", "skills", errors)
     validate_optional_contract_path(manifest, "apps", ".app.json", errors)
-    validate_optional_contract_path(manifest, "mcpServers", ".mcp.json", errors)
+    validate_manifest_mcp_servers(plugin_root, manifest, errors)
 
     if manifest.get("apps") is not None:
         validate_app_manifest(
             plugin_root / ".app.json",
-            errors,
-        )
-    if manifest.get("mcpServers") is not None:
-        validate_mcp_manifest(
-            plugin_root / ".mcp.json",
             errors,
         )
     validate_skill_manifests(plugin_root, errors)
@@ -158,6 +163,7 @@ def validate_manifest_shape(
             "brandColor",
             "composerIcon",
             "logo",
+            "logoDark",
             "screenshots",
             "defaultPrompt",
             "default_prompt",
@@ -181,7 +187,9 @@ def validate_manifest_shape(
     if not isinstance(capabilities, list) or not all(
         isinstance(value, str) and value.strip() for value in capabilities
     ):
-        errors.append("plugin.json field `interface.capabilities` must be an array of strings")
+        errors.append(
+            "plugin.json field `interface.capabilities` must be an array of strings"
+        )
     for field in ("websiteURL", "privacyPolicyURL", "termsOfServiceURL"):
         validate_optional_https_url(interface, field, errors, prefix="interface")
     brand_color = interface.get("brandColor")
@@ -189,7 +197,7 @@ def validate_manifest_shape(
         not isinstance(brand_color, str) or HEX_COLOR_RE.fullmatch(brand_color) is None
     ):
         errors.append("plugin.json field `interface.brandColor` must use `#RRGGBB`")
-    for field in ("composerIcon", "logo"):
+    for field in ("composerIcon", "logo", "logoDark"):
         validate_optional_asset_path(plugin_root, plugin_root, interface, field, errors)
     screenshots = interface.get("screenshots", [])
     if not isinstance(screenshots, list):
@@ -254,7 +262,9 @@ def reject_unknown_fields(
     errors: list[str],
 ) -> None:
     for key in sorted(set(payload) - allowed_keys):
-        errors.append(f"plugin.json field `{prefix}.{key}` is not accepted by plugin validation")
+        errors.append(
+            f"plugin.json field `{prefix}.{key}` is not accepted by plugin validation"
+        )
 
 
 def validate_optional_https_url(
@@ -269,7 +279,9 @@ def validate_optional_https_url(
         return
     parsed = urlparse(value) if isinstance(value, str) else None
     if parsed is None or parsed.scheme != "https" or not parsed.netloc:
-        errors.append(f"plugin.json field `{prefix}.{key}` must be an absolute `https://` URL")
+        errors.append(
+            f"plugin.json field `{prefix}.{key}` must be an absolute `https://` URL"
+        )
 
 
 def validate_optional_contract_path(
@@ -284,6 +296,32 @@ def validate_optional_contract_path(
     normalized = normalize_contract_path(value) if isinstance(value, str) else None
     if normalized != expected:
         errors.append(f"plugin.json field `{key}` must resolve to `{expected}`")
+
+
+def validate_manifest_mcp_servers(
+    plugin_root: Path,
+    manifest: dict[str, Any],
+    errors: list[str],
+) -> None:
+    value = manifest.get("mcpServers")
+    if value is None:
+        return
+    if isinstance(value, str):
+        validate_optional_contract_path(manifest, "mcpServers", ".mcp.json", errors)
+        validate_mcp_manifest(
+            plugin_root / ".mcp.json",
+            errors,
+        )
+        return
+    if isinstance(value, dict):
+        validate_mcp_server_entries(
+            value,
+            "plugin.json field `mcpServers`",
+            "plugin.json field `mcpServers`",
+            errors,
+        )
+        return
+    errors.append("plugin.json field `mcpServers` must be a string path or object")
 
 
 def normalize_contract_path(raw_path: str) -> str | None:
@@ -307,10 +345,21 @@ def validate_app_manifest(path: Path, errors: list[str]) -> None:
         if not isinstance(value, dict):
             errors.append(f"`.app.json` app `{key}` must be an object")
             continue
-        reject_companion_unknown_fields(value, {"id"}, f"`.app.json` app `{key}`", errors)
+        reject_companion_unknown_fields(
+            value, {"id", "category"}, f"`.app.json` app `{key}`", errors
+        )
         app_id = value.get("id")
         if not isinstance(app_id, str) or not app_id.strip():
-            errors.append(f"`.app.json` app `{key}` field `id` must be a non-empty string")
+            errors.append(
+                f"`.app.json` app `{key}` field `id` must be a non-empty string"
+            )
+        category = value.get("category")
+        if category is not None and (
+            not isinstance(category, str) or not category.strip()
+        ):
+            errors.append(
+                f"`.app.json` app `{key}` field `category` must be a non-empty string"
+            )
 
 
 def validate_mcp_manifest(path: Path, errors: list[str]) -> None:
@@ -319,14 +368,28 @@ def validate_mcp_manifest(path: Path, errors: list[str]) -> None:
         return
     reject_companion_unknown_fields(payload, {"mcpServers"}, "`.mcp.json`", errors)
     servers = payload.get("mcpServers")
+    validate_mcp_server_entries(
+        servers,
+        "`.mcp.json`",
+        "`.mcp.json` field `mcpServers`",
+        errors,
+    )
+
+
+def validate_mcp_server_entries(
+    servers: Any,
+    source_label: str,
+    field_label: str,
+    errors: list[str],
+) -> None:
     if not isinstance(servers, dict):
-        errors.append("`.mcp.json` field `mcpServers` must be an object")
+        errors.append(f"{field_label} must be an object")
         return
     for key, value in servers.items():
         if not isinstance(key, str) or not key.strip():
-            errors.append("`.mcp.json` server names must be non-empty strings")
+            errors.append(f"{source_label} server names must be non-empty strings")
         if not isinstance(value, dict):
-            errors.append(f"`.mcp.json` server `{key}` must be an object")
+            errors.append(f"{source_label} server `{key}` must be an object")
 
 
 def load_companion_json_object(
@@ -395,7 +458,9 @@ def validate_skill_manifest(skill_root: Path, errors: list[str]) -> None:
         return
     skill_name = frontmatter.get("name")
     if not isinstance(skill_name, str) or not skill_name.strip():
-        errors.append(f"skill `{skill_root.name}` frontmatter field `name` must be non-empty")
+        errors.append(
+            f"skill `{skill_root.name}` frontmatter field `name` must be non-empty"
+        )
     description = frontmatter.get("description")
     if not isinstance(description, str) or not description.strip():
         errors.append(
@@ -445,7 +510,9 @@ def validate_skill_agent_manifest(
     )
     interface = payload.get("interface")
     if not isinstance(interface, dict):
-        errors.append(f"skill `{skill_root.name}` agent field `interface` must be an object")
+        errors.append(
+            f"skill `{skill_root.name}` agent field `interface` must be an object"
+        )
         return
     reject_skill_agent_unknown_fields(
         interface,
@@ -494,7 +561,9 @@ def validate_skill_agent_manifest(
     policy = payload.get("policy")
     if policy is not None:
         if not isinstance(policy, dict):
-            errors.append(f"skill `{skill_root.name}` agent field `policy` must be an object")
+            errors.append(
+                f"skill `{skill_root.name}` agent field `policy` must be an object"
+            )
         else:
             reject_skill_agent_unknown_fields(
                 policy,
@@ -571,7 +640,9 @@ def validate_asset_path(
         errors.append(f"{label} must be a non-empty relative path")
         return
     candidate = PurePosixPath(raw_path.replace("\\", "/"))
-    if candidate.is_absolute() or any(part in {"", ".", ".."} for part in candidate.parts):
+    if candidate.is_absolute() or any(
+        part in {"", ".", ".."} for part in candidate.parts
+    ):
         errors.append(f"{label} must stay inside the plugin archive")
         return
     resolved_path = (base_dir / candidate.as_posix()).resolve()

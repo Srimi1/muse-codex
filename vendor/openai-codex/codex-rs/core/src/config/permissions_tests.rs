@@ -82,7 +82,7 @@ async fn restricted_read_implicitly_allows_helper_executables() -> std::io::Resu
         },
         ConfigOverrides {
             cwd: Some(cwd.clone()),
-            zsh_path: Some(zsh_path.clone()),
+            default_zsh_path: Some(AbsolutePathBuf::try_from(zsh_path.clone())?),
             main_execve_wrapper_exe: Some(execve_wrapper),
             ..Default::default()
         },
@@ -149,7 +149,7 @@ fn network_permission_containers_project_allowed_and_denied_entries() {
             ),
             (
                 "/tmp/ignored.sock".to_string(),
-                NetworkUnixSocketPermissionToml::None,
+                NetworkUnixSocketPermissionToml::Deny,
             ),
         ]),
     };
@@ -211,7 +211,7 @@ fn network_toml_overlays_unix_socket_permissions_by_path() {
                 ),
                 (
                     "/tmp/override.sock".to_string(),
-                    NetworkUnixSocketPermissionToml::None,
+                    NetworkUnixSocketPermissionToml::Deny,
                 ),
             ]),
         }),
@@ -220,7 +220,7 @@ fn network_toml_overlays_unix_socket_permissions_by_path() {
     .apply_to_network_proxy_config(&mut config);
 
     assert_eq!(
-        config.network.unix_sockets,
+        config.unix_sockets,
         Some(codex_network_proxy::NetworkUnixSocketPermissions {
             entries: BTreeMap::from([
                 (
@@ -233,7 +233,7 @@ fn network_toml_overlays_unix_socket_permissions_by_path() {
                 ),
                 (
                     "/tmp/override.sock".to_string(),
-                    ProxyNetworkUnixSocketPermission::None,
+                    ProxyNetworkUnixSocketPermission::Deny,
                 ),
             ]),
         })
@@ -265,6 +265,7 @@ enabled = true
 
 [base.network.unix_sockets]
 "/tmp/base.sock" = "allow"
+"/tmp/blocked.sock" = "deny"
 
 [child]
 extends = "base"
@@ -319,13 +320,13 @@ allow_local_binding = true
 
 [network.unix_sockets]
 "/tmp/base.sock" = "allow"
+"/tmp/blocked.sock" = "deny"
 "/tmp/child.sock" = "allow"
 "#,
     )
     .expect("expected profile should deserialize");
 
-    assert_eq!(resolved.profile, expected_profile);
-    assert_eq!(resolved.inherited_profile_names, vec!["base".to_string()]);
+    assert_eq!(resolved, expected_profile);
 }
 
 #[test]
@@ -398,7 +399,7 @@ fn profile_network_proxy_config_keeps_proxy_disabled_for_bare_network_access() {
         ..Default::default()
     }));
 
-    assert!(!config.network.enabled);
+    assert!(!config.enabled);
 }
 
 #[test]
@@ -416,11 +417,11 @@ fn profile_network_proxy_config_keeps_proxy_disabled_for_proxy_policy() {
         ..Default::default()
     }));
 
-    assert!(!config.network.enabled);
-    assert_eq!(config.network.proxy_url, "http://127.0.0.1:43128");
-    assert!(!config.network.enable_socks5);
+    assert!(!config.enabled);
+    assert_eq!(config.proxy_url, "http://127.0.0.1:43128");
+    assert!(!config.enable_socks5);
     assert_eq!(
-        config.network.domains,
+        config.domains,
         Some(codex_network_proxy::NetworkDomainPermissions {
             entries: vec![codex_network_proxy::NetworkDomainPermissionEntry {
                 pattern: "openai.com".to_string(),
@@ -462,6 +463,56 @@ fn compile_permission_profile_workspace_roots_resolves_enabled_entries() -> std:
             cwd.path()
         )]
     );
+    Ok(())
+}
+
+#[test]
+fn legacy_project_roots_restrictions_do_not_fail_open() -> std::io::Result<()> {
+    let permissions = toml::from_str::<PermissionsToml>(
+        r#"
+[read_deny.filesystem]
+":root" = "read"
+":project_roots" = "none"
+
+[write_deny.filesystem]
+":root" = "write"
+":project_roots" = "none"
+
+[write_read.filesystem]
+":root" = "write"
+
+[write_read.filesystem.":project_roots"]
+docs = "read"
+"#,
+    )
+    .expect("legacy project roots profiles should deserialize");
+    let cwd = TempDir::new()?;
+    let docs = cwd.path().join("docs");
+    let mut startup_warnings = Vec::new();
+
+    let (read_deny_policy, _) =
+        compile_permission_profile(&permissions, "read_deny", &mut startup_warnings)?;
+    assert_eq!(
+        read_deny_policy.resolve_access_with_cwd(cwd.path(), cwd.path()),
+        FileSystemAccessMode::Deny
+    );
+
+    let (write_deny_policy, _) =
+        compile_permission_profile(&permissions, "write_deny", &mut startup_warnings)?;
+    assert!(!write_deny_policy.has_full_disk_write_access());
+    assert_eq!(
+        write_deny_policy.resolve_access_with_cwd(cwd.path(), cwd.path()),
+        FileSystemAccessMode::Deny
+    );
+
+    let (write_read_policy, _) =
+        compile_permission_profile(&permissions, "write_read", &mut startup_warnings)?;
+    assert!(!write_read_policy.has_full_disk_write_access());
+    assert_eq!(
+        write_read_policy.resolve_access_with_cwd(&docs, cwd.path()),
+        FileSystemAccessMode::Read
+    );
+
     Ok(())
 }
 
@@ -542,7 +593,6 @@ fn glob_scan_max_depth_must_be_positive() {
 
 #[test]
 fn read_write_trailing_glob_suffix_compiles_as_subpath() -> std::io::Result<()> {
-    let cwd = TempDir::new()?;
     let mut startup_warnings = Vec::new();
     let (file_system_policy, _) = compile_permission_profile(
         &PermissionsToml {
@@ -567,7 +617,6 @@ fn read_write_trailing_glob_suffix_compiles_as_subpath() -> std::io::Result<()> 
             )]),
         },
         "workspace",
-        cwd.path(),
         &mut startup_warnings,
     )?;
 
@@ -578,6 +627,7 @@ fn read_write_trailing_glob_suffix_compiles_as_subpath() -> std::io::Result<()> 
                 value: FileSystemSpecialPath::project_roots(Some("docs".into())),
             },
             access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         }]),
         "trailing /** should compile as a subtree path instead of a glob pattern"
     );

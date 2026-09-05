@@ -1,6 +1,7 @@
 use super::ContextualUserFragment;
 use codex_protocol::approvals::NetworkPolicyAmendment;
 use codex_protocol::approvals::NetworkPolicyRuleAction;
+use codex_protocol::models::ContentItemKind;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct NetworkRuleSaved {
@@ -18,7 +19,11 @@ impl NetworkRuleSaved {
 }
 
 impl ContextualUserFragment for NetworkRuleSaved {
-    fn role() -> &'static str {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("network_proxy.rule_saved".to_string())
+    }
+
+    fn role(&self) -> &'static str {
         "developer"
     }
 

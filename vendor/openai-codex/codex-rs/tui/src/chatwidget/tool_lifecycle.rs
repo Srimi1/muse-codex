@@ -4,13 +4,14 @@
 //! events as transcript cells.
 
 use super::*;
+use codex_utils_path_uri::LegacyAppPathString;
 
 impl ChatWidget {
     pub(super) fn on_patch_apply_begin(&mut self, changes: HashMap<PathBuf, FileChange>) {
         self.add_to_history(history_cell::new_patch_event(changes, &self.config.cwd));
     }
 
-    pub(super) fn on_view_image_tool_call(&mut self, path: AbsolutePathBuf) {
+    pub(super) fn on_view_image_tool_call(&mut self, path: LegacyAppPathString) {
         self.flush_answer_stream_with_separator();
         self.add_to_history(history_cell::new_view_image_tool_call(
             path,
@@ -21,17 +22,22 @@ impl ChatWidget {
 
     pub(super) fn on_image_generation_begin(&mut self) {
         self.flush_answer_stream_with_separator();
+        if self.bottom_pane.is_task_running() {
+            self.bottom_pane.ensure_status_indicator();
+        }
     }
 
     pub(super) fn on_image_generation_end(
         &mut self,
         call_id: String,
+        status: String,
         revised_prompt: Option<String>,
         saved_path: Option<AbsolutePathBuf>,
     ) {
         self.flush_answer_stream_with_separator();
         self.add_to_history(history_cell::new_image_generation_call(
             call_id,
+            &status,
             revised_prompt,
             saved_path,
         ));
@@ -39,26 +45,26 @@ impl ChatWidget {
     }
 
     pub(super) fn on_file_change_completed(&mut self, item: ThreadItem) {
-        let item2 = item.clone();
         self.defer_or_handle(
-            |q| q.push_item_completed(item),
-            |s| s.handle_file_change_completed_now(item2),
+            item,
+            InterruptManager::push_item_completed,
+            Self::handle_file_change_completed_now,
         );
     }
 
     pub(super) fn on_mcp_tool_call_started(&mut self, item: ThreadItem) {
-        let item2 = item.clone();
         self.defer_or_handle(
-            |q| q.push_item_started(item),
-            |s| s.handle_mcp_tool_call_started_now(item2),
+            item,
+            InterruptManager::push_item_started,
+            Self::handle_mcp_tool_call_started_now,
         );
     }
 
     pub(super) fn on_mcp_tool_call_completed(&mut self, item: ThreadItem) {
-        let item2 = item.clone();
         self.defer_or_handle(
-            |q| q.push_item_completed(item),
-            |s| s.handle_mcp_tool_call_completed_now(item2),
+            item,
+            InterruptManager::push_item_completed,
+            Self::handle_mcp_tool_call_completed_now,
         );
     }
 
@@ -139,6 +145,12 @@ impl ChatWidget {
         }
     }
 
+    pub(super) fn on_sub_agent_activity(&mut self, item: ThreadItem) {
+        if let Some(cell) = multi_agents::sub_agent_activity_history_cell(&item) {
+            self.on_collab_event(cell);
+        }
+    }
+
     pub(crate) fn handle_file_change_completed_now(&mut self, item: ThreadItem) {
         let ThreadItem::FileChange { status, .. } = item else {
             return;
@@ -185,6 +197,7 @@ impl ChatWidget {
             id,
             server,
             tool,
+            status,
             arguments,
             result,
             error,
@@ -207,7 +220,7 @@ impl ChatWidget {
                 Ok(codex_protocol::mcp::CallToolResult {
                     content: result.content,
                     structured_content: result.structured_content,
-                    is_error: Some(false),
+                    is_error: Some(status == codex_app_server_protocol::McpToolCallStatus::Failed),
                     meta: None,
                 })
             }

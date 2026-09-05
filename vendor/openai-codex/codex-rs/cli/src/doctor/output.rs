@@ -25,11 +25,18 @@ const SEPARATOR_WIDTH: usize = 61;
 const GROUPS: &[OutputGroup] = &[
     OutputGroup {
         title: "Environment",
-        keys: &["runtime", "install", "search", "terminal", "state"],
+        keys: &[
+            "system", "disk", "security", "runtime", "install", "search", "git", "terminal",
+            "title", "state", "threads",
+        ],
     },
     OutputGroup {
         title: "Configuration",
         keys: &["config", "auth", "mcp", "sandbox"],
+    },
+    OutputGroup {
+        title: "Desktop App",
+        keys: &["desktop"],
     },
     OutputGroup {
         title: "Updates",
@@ -492,6 +499,9 @@ fn notes_for_report(report: &DoctorReport) -> Vec<DoctorNote> {
         update_note(check, report)
             .into_iter()
             .for_each(|note| notes.push(note));
+        desktop_update_note(check)
+            .into_iter()
+            .for_each(|note| notes.push(note));
     }
     if let Some(check) = find_check(report, "state") {
         rollout_note(check)
@@ -538,6 +548,21 @@ fn update_note(check: &DoctorCheck, report: &DoctorReport) -> Option<DoctorNote>
         status: DisplayStatus::Update,
         name: "updates".to_string(),
         summary: format!("{latest} available ({parenthetical})"),
+    })
+}
+
+fn desktop_update_note(check: &DoctorCheck) -> Option<DoctorNote> {
+    let status = detail::detail_value(check, "desktop update status")?;
+    let build = detail::detail_value(check, "desktop latest build")?;
+    let summary = match status.as_str() {
+        "ready to install" => format!("build {build} available (ready to install)"),
+        "available" => format!("build {build} available"),
+        _ => return None,
+    };
+    Some(DoctorNote {
+        status: DisplayStatus::Update,
+        name: "desktop".to_string(),
+        summary,
     })
 }
 
@@ -611,12 +636,15 @@ fn auth_reachability_note(report: &DoctorReport) -> Option<DoctorNote> {
     None
 }
 
-fn display_summary(check: &DoctorCheck, _options: HumanOutputOptions) -> String {
+fn display_summary(check: &DoctorCheck, options: HumanOutputOptions) -> String {
     match check.category.as_str() {
+        "system" => system_summary(check),
         "runtime" => runtime_summary(check),
         "install" if check.status == CheckStatus::Ok => "consistent".to_string(),
         "search" => search_summary(check),
+        "git" => git_summary(check),
         "terminal" => terminal_summary(check),
+        "title" => title_summary(check, options),
         "state" => state_summary(check),
         "config" if check.status == CheckStatus::Ok => "loaded".to_string(),
         "mcp" => mcp_summary(check),
@@ -626,6 +654,10 @@ fn display_summary(check: &DoctorCheck, _options: HumanOutputOptions) -> String 
         "app-server" => app_server_summary(check),
         _ => check.summary.clone(),
     }
+}
+
+fn system_summary(check: &DoctorCheck) -> String {
+    detail::detail_value(check, "os language").unwrap_or_else(|| check.summary.clone())
 }
 
 fn runtime_summary(check: &DoctorCheck) -> String {
@@ -649,6 +681,12 @@ fn search_summary(check: &DoctorCheck) -> String {
     }
 }
 
+fn git_summary(check: &DoctorCheck) -> String {
+    detail::detail_value(check, "git version")
+        .or_else(|| detail::detail_value(check, "selected git"))
+        .unwrap_or_else(|| check.summary.clone())
+}
+
 fn terminal_summary(check: &DoctorCheck) -> String {
     let mut parts = Vec::new();
     if let Some(terminal) = detail::detail_value(check, "terminal") {
@@ -668,11 +706,25 @@ fn terminal_summary(check: &DoctorCheck) -> String {
     }
 }
 
+fn title_summary(check: &DoctorCheck, options: HumanOutputOptions) -> String {
+    let source = detail::detail_value(check, "terminal title source");
+    let project = detail::detail_value(check, "terminal title project value");
+    match (source, project) {
+        (Some(source), Some(project)) => {
+            let separator = if options.ascii { " | " } else { " · " };
+            format!("{source}{separator}project {project}")
+        }
+        (Some(source), None) => source,
+        _ => check.summary.clone(),
+    }
+}
+
 fn state_summary(check: &DoctorCheck) -> String {
     let databases_ok = [
         "state DB integrity",
         "log DB integrity",
         "goals DB integrity",
+        "memories DB integrity",
     ]
     .into_iter()
     .all(|label| detail::detail_value(check, label).is_some_and(|value| value == "ok"));
@@ -1097,6 +1149,20 @@ mod tests {
     fn sample_report() -> DoctorReport {
         let checks = vec![
             DoctorCheck::new(
+                "system.environment",
+                "system",
+                CheckStatus::Ok,
+                "OS language en-US",
+            )
+            .detail("os: macOS 15.0")
+            .detail("os language: en-US")
+            .detail("VISUAL: code --wait")
+            .detail("EDITOR: vim")
+            .detail("PAGER: less -R")
+            .detail("GIT_PAGER: delta")
+            .detail("GH_PAGER: less")
+            .detail("LESS: -FRX"),
+            DoctorCheck::new(
                 "runtime.provenance",
                 "runtime",
                 CheckStatus::Ok,
@@ -1115,11 +1181,29 @@ mod tests {
                 "search is OK (bundled)",
             ),
             DoctorCheck::new(
+                "git.environment",
+                "git",
+                CheckStatus::Ok,
+                "git version 2.54.0",
+            )
+            .detail("selected git: /usr/bin/git")
+            .detail("git version: git version 2.54.0")
+            .detail("repo detected: true"),
+            DoctorCheck::new(
                 "terminal.env",
                 "terminal",
                 CheckStatus::Warning,
                 "narrow terminal",
             ),
+            DoctorCheck::new(
+                "terminal.title",
+                "title",
+                CheckStatus::Ok,
+                "terminal title default",
+            )
+            .detail("terminal title source: default")
+            .detail("terminal title items: activity, project-name")
+            .detail("terminal title project value: codex"),
             DoctorCheck::new(
                 "state.paths",
                 "state",
@@ -1187,11 +1271,28 @@ Notes
 ─────────────────────────────────────────────────────────────
 
 Environment
+  ✓ system       en-US
+      os                       macOS 15.0
+      OS language              en-US
+      VISUAL                   code --wait
+      EDITOR                   vim
+      PAGER                    less -R
+      GIT_PAGER                delta
+      GH_PAGER                 less
+      LESS                     -FRX
   ✓ runtime      running local build on darwin-arm64
   ✓ install      consistent
-      managed by               npm: no · bun: no · package root —
+      managed by               npm: no · bun: no · pnpm: no · Vite+: no · package root —
   ✓ search       search is OK (bundled)
+  ✓ git          git version 2.54.0
+      selected git             /usr/bin/git
+      version                  git version 2.54.0
+      repo detected            true
   ⚠ terminal     narrow terminal
+  ✓ title        default · project codex
+      title source             default
+      title items              activity, project-name
+      project value            codex
   ✓ state        state paths inspectable
 
 Configuration
@@ -1210,7 +1311,7 @@ Background Server
   ✓ app-server   background server is not running
 
 {}
-9 ok · 2 notes · 1 warn · 1 fail failed
+12 ok · 2 notes · 1 warn · 1 fail failed
 
 --summary compact output           --all expand truncated lists
 --json redacted report
@@ -1218,6 +1319,74 @@ Background Server
             "─".repeat(SEPARATOR_WIDTH)
         );
         assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn render_human_report_snapshot_covers_environment_rows() {
+        let mut report = sample_report();
+        report.checks.push(DoctorCheck::new(
+            "system.disk",
+            "disk",
+            CheckStatus::Ok,
+            "sufficient free disk space (42.0 GiB)",
+        ));
+        report.checks.push(
+            DoctorCheck::new(
+                "git.worktree.dev_drive",
+                "git",
+                CheckStatus::Warning,
+                "this worktree is not on a Windows Dev Drive",
+            )
+            .remediation(
+                "create a trusted Windows Dev Drive: https://learn.microsoft.com/en-us/windows/dev-drive/",
+            ),
+        );
+        let mut security = super::super::security::endpoint_check(
+            super::super::security::EndpointInspection::Complete(vec!["Microsoft Defender"]),
+        );
+        let targets = security
+            .details
+            .iter_mut()
+            .find(|detail| detail.starts_with("exclusion targets: "))
+            .expect("endpoint security check should include exclusion targets");
+        *targets = "exclusion targets: verified Codex app and required helpers".into();
+        report.checks.push(security);
+        report.checks.extend([
+            DoctorCheck::new(
+                "desktop.app.version",
+                "desktop",
+                CheckStatus::Ok,
+                "the desktop application is installed",
+            )
+            .detail("version: 1.2.3")
+            .detail("running: true")
+            .detail("log directory: $HOME/Library/Logs/com.openai.codex"),
+            DoctorCheck::new(
+                "desktop.app_server.handshake",
+                "desktop",
+                CheckStatus::Ok,
+                "the desktop app-server initialized successfully",
+            ),
+        ]);
+        let update = report
+            .checks
+            .iter_mut()
+            .find(|check| check.category == "updates")
+            .unwrap();
+        for (status, expected) in [
+            ("available", "build 123 available"),
+            ("ready to install", "build 123 available (ready to install)"),
+        ] {
+            update.details = vec![
+                format!("desktop update status: {status}"),
+                "desktop latest build: 123".to_string(),
+            ];
+            assert_eq!(desktop_update_note(update).unwrap().summary, expected);
+        }
+        insta::assert_snapshot!(
+            "doctor_human_report_environment_rows",
+            render_human_report(&report, detailed_no_color_unicode_options())
+        );
     }
 
     #[test]
@@ -1233,10 +1402,13 @@ Notes
 ─────────────────────────────────────────────────────────────
 
 Environment
+  ✓ system       en-US
   ✓ runtime      running local build on darwin-arm64
   ✓ install      consistent
   ✓ search       search is OK (bundled)
+  ✓ git          git version 2.54.0
   ⚠ terminal     narrow terminal
+  ✓ title        default · project codex
   ✓ state        state paths inspectable
 
 Configuration
@@ -1254,7 +1426,7 @@ Background Server
   ✓ app-server   background server is not running
 
 {}
-9 ok · 2 notes · 1 warn · 1 fail failed
+12 ok · 2 notes · 1 warn · 1 fail failed
 
 Run codex doctor without --summary for detailed diagnostics.
 --all expand truncated lists       --json redacted report
@@ -1262,6 +1434,59 @@ Run codex doctor without --summary for detailed diagnostics.
             "─".repeat(SEPARATOR_WIDTH)
         );
         assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn render_human_report_includes_threads_row_in_environment() {
+        let mut report = sample_report();
+        report.checks.push(DoctorCheck::new(
+            "state.rollout_db_parity",
+            "threads",
+            CheckStatus::Warning,
+            "rollout files and state DB thread inventory differ",
+        ));
+
+        let rendered = render_human_report(&report, summary_no_color_unicode_options());
+
+        let threads_line = rendered
+            .lines()
+            .find(|line| line.contains("threads"))
+            .expect("threads row should be rendered");
+        assert!(
+            threads_line.contains("rollout files and state DB thread inventory differ"),
+            "{threads_line}"
+        );
+    }
+
+    #[test]
+    fn render_human_report_includes_memories_db_in_state_health_summary() {
+        let report = DoctorReport {
+            schema_version: 1,
+            generated_at: "0s since unix epoch".to_string(),
+            overall_status: CheckStatus::Ok,
+            codex_version: "0.0.0".to_string(),
+            checks: vec![
+                DoctorCheck::new(
+                    "state.paths",
+                    "state",
+                    CheckStatus::Ok,
+                    "state paths inspectable",
+                )
+                .detail("state DB: /tmp/state.sqlite")
+                .detail("state DB integrity: ok")
+                .detail("log DB: /tmp/logs.sqlite")
+                .detail("log DB integrity: ok")
+                .detail("goals DB: /tmp/goals.sqlite")
+                .detail("goals DB integrity: ok")
+                .detail("memories DB: /tmp/memories.sqlite")
+                .detail("memories DB integrity: ok"),
+            ],
+        };
+
+        let rendered = render_human_report(&report, detailed_no_color_unicode_options());
+
+        assert!(rendered.contains("✓ state        databases healthy"));
+        assert!(rendered.contains("memories DB              /tmp/memories.sqlite · integrity ok"));
     }
 
     #[test]
@@ -1285,10 +1510,13 @@ Notes
 -------------------------------------------------------------
 
 Environment
+  [ok] system       en-US
   [ok] runtime      running local build on darwin-arm64
   [ok] install      consistent
   [ok] search       search is OK (bundled)
+  [ok] git          git version 2.54.0
   [!!] terminal     narrow terminal
+  [ok] title        default | project codex
   [ok] state        state paths inspectable
 
 Configuration
@@ -1306,7 +1534,7 @@ Background Server
   [ok] app-server   background server is not running
 
 {}
-9 ok | 2 notes | 1 warn | 1 fail failed
+12 ok | 2 notes | 1 warn | 1 fail failed
 
 Run codex doctor without --summary for detailed diagnostics.
 --all expand truncated lists       --json redacted report

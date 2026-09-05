@@ -52,13 +52,32 @@ handles are rejected because they would introduce a second history source.
 API-key requests retain supported public API parameters; subscription requests
 omit parameters unsupported by the pinned ChatGPT backend.
 
+The authenticated subscription catalog determines both model visibility and
+the request dialect. Catalog entries marked `use_responses_lite` receive the
+Responses Lite header and wire shape used by current Codex clients: tools and
+base instructions become stable developer input items, direct
+function/custom tools are grouped under the `functions` namespace,
+`reasoning.context` is `all_turns`, and parallel tool calls are disabled.
+This is a transport mapping only; Muse still assembles history, executes tools,
+and decides when the next model turn starts.
+
+The `rust-v0.153.4` wire parser understands authenticated catalog entries for
+`gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`. It does not
+hard-code those entries into a user's picker. Subscription requests are
+accepted only for a picker-visible model returned by that account's catalog,
+with an effort advertised for that model. Rows requiring a newer client wire
+version or an unknown transport capability are hidden instead of being
+presented as usable.
+
 Stock Muse records namespaced calls as dotted names such as `muse.read_file`.
 The adapter restores the separate namespace/name fields only for exact matches
 in the advertised tool catalog. It preserves call IDs, arguments, results, and
 ordering, and rejects ambiguous aliases instead of guessing.
 
-The gateway validates fragmented SSE before exposing it to Muse. Malformed,
-unknown non-metadata, interrupted, or idle streams end with a terminal provider
+The gateway validates fragmented SSE before exposing it to Muse. It recognizes
+`response.cancelled` as a terminal event and drops
+`codex.response.metadata` as known transport metadata. Malformed, unknown
+non-metadata, interrupted, or idle streams end with a terminal provider
 failure. A final upstream HTTP failure is also translated into a terminal
 failure: stock Muse otherwise retries even rejected HTTP 400 requests. The
 gateway never replays an observable stream or executes a tool itself.
@@ -71,10 +90,13 @@ copied into protocol output.
 
 ## Local verification (2026-09-05)
 
-- All 117 first-party Rust tests and all-target Clippy with warnings denied pass.
+- The first-party Rust suites and all-target Clippy with warnings denied pass.
 - The exact Muse help/version baseline and stable MSP schema hashes match.
 - Deterministic stock/wrapped tests pass for headless text, tools, terminal
   failures without replay, MSP turns, process-restart resume, and fork history.
+- Current-catalog fixtures cover GPT-6 Astra and GPT-5.6 Sol, Terra, and Luna,
+  including minimum-client, visibility, effort, modality, tool-mode, and
+  Responses Lite mapping rules.
 - Live ChatGPT subscription `exec --json` completes a real file-read tool loop.
 - Live MSP completes one file-read tool loop, restarts the host, resumes the
   saved session, and recalls the result without another tool call.
@@ -105,8 +127,7 @@ qualification work. Use separate `MUSE_CODEX_HOME` profiles for concurrent
 invocations with different accounts or upstream endpoints. Private release
 publication also requires a release-feed URL and signing material.
 
-The pinned dependency graph has five outstanding GitHub dependency alerts.
-Their affected operations are not reachable in the current helper configuration
-according to the [pinned dependency review](DEPENDENCY_REVIEW.md); the alerts
-remain open and must be re-reviewed when the dependency graph or enabled paths
-change. CLI/protocol fixes do not remove the affected versions.
+The Codex repin changed the dependency graph. Known version-flagged dependencies
+and their current helper reachability are recorded in the
+[pinned dependency review](DEPENDENCY_REVIEW.md), but that document is not a
+substitute for a fresh advisory scan before release.

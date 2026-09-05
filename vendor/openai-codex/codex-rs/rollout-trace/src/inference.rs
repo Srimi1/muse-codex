@@ -166,7 +166,11 @@ impl InferenceTraceAttempt {
         headers.insert(INFERENCE_CALL_ID_HEADER, inference_call_id);
     }
 
-    /// Records the exact request object about to be sent to the model provider.
+    /// Records the request payload replay should treat as the model-visible inference input.
+    ///
+    /// This is usually the exact provider request. Callers may instead pass a
+    /// logical request when the transport omits already-sent input, such as
+    /// websocket reuse after an untraced warmup response.
     pub fn record_started(&self, request: &impl Serialize) {
         let InferenceTraceAttemptState::Enabled(attempt) = &self.state else {
             return;
@@ -387,6 +391,7 @@ fn append_with_context_best_effort(
 mod tests {
     use std::sync::Arc;
 
+    use codex_protocol::ResponseItemId;
     use codex_protocol::models::ReasoningItemContent;
     use codex_protocol::models::ReasoningItemReasoningSummary;
     use pretty_assertions::assert_eq;
@@ -492,7 +497,7 @@ mod tests {
     #[test]
     fn traced_response_item_preserves_reasoning_content_omitted_by_normal_serializer() {
         let item = ResponseItem::Reasoning {
-            id: "rs-1".to_string(),
+            id: Some(ResponseItemId::with_suffix("rs", "1")),
             summary: vec![ReasoningItemReasoningSummary::SummaryText {
                 text: "summary".to_string(),
             }],
@@ -500,6 +505,7 @@ mod tests {
                 text: "raw reasoning".to_string(),
             }]),
             encrypted_content: Some("encoded".to_string()),
+            internal_chat_message_metadata_passthrough: None,
         };
 
         let normal = serde_json::to_value(&item).expect("response item serializes");
@@ -510,6 +516,7 @@ mod tests {
             traced,
             json!({
                 "type": "reasoning",
+                "id": "rs_1",
                 "summary": [{"type": "summary_text", "text": "summary"}],
                 "content": [{"type": "text", "text": "raw reasoning"}],
                 "encrypted_content": "encoded",

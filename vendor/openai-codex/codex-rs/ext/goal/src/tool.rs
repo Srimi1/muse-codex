@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use codex_extension_api::FunctionCallError;
 use codex_extension_api::JsonToolOutput;
 use codex_extension_api::ToolCall;
@@ -17,7 +16,10 @@ use serde::Serialize;
 
 use crate::accounting::BudgetLimitedGoalDisposition;
 use crate::accounting::GoalAccountingState;
+use crate::analytics::GoalAnalytics;
+use crate::analytics::GoalEventAttribution;
 use crate::events::GoalEventEmitter;
+use crate::metrics::GoalMetrics;
 use crate::spec::CREATE_GOAL_TOOL_NAME;
 use crate::spec::GET_GOAL_TOOL_NAME;
 use crate::spec::UPDATE_GOAL_TOOL_NAME;
@@ -31,7 +33,10 @@ pub(crate) struct GoalToolExecutor {
     thread_id: ThreadId,
     state_db: Arc<codex_state::StateRuntime>,
     accounting_state: Arc<GoalAccountingState>,
+    analytics: GoalAnalytics,
     event_emitter: GoalEventEmitter,
+    metrics: GoalMetrics,
+    max_goal_token_budget: Option<i64>,
 }
 
 #[derive(Clone, Copy)]
@@ -73,14 +78,19 @@ impl GoalToolExecutor {
         thread_id: ThreadId,
         state_db: Arc<codex_state::StateRuntime>,
         accounting_state: Arc<GoalAccountingState>,
+        analytics: GoalAnalytics,
         event_emitter: GoalEventEmitter,
+        metrics: GoalMetrics,
     ) -> Self {
         Self {
             kind: GoalToolKind::Get,
             thread_id,
             state_db,
             accounting_state,
+            analytics,
             event_emitter,
+            metrics,
+            max_goal_token_budget: None,
         }
     }
 
@@ -88,14 +98,20 @@ impl GoalToolExecutor {
         thread_id: ThreadId,
         state_db: Arc<codex_state::StateRuntime>,
         accounting_state: Arc<GoalAccountingState>,
+        analytics: GoalAnalytics,
         event_emitter: GoalEventEmitter,
+        metrics: GoalMetrics,
+        max_goal_token_budget: Option<i64>,
     ) -> Self {
         Self {
             kind: GoalToolKind::Create,
             thread_id,
             state_db,
             accounting_state,
+            analytics,
             event_emitter,
+            metrics,
+            max_goal_token_budget,
         }
     }
 
@@ -103,20 +119,24 @@ impl GoalToolExecutor {
         thread_id: ThreadId,
         state_db: Arc<codex_state::StateRuntime>,
         accounting_state: Arc<GoalAccountingState>,
+        analytics: GoalAnalytics,
         event_emitter: GoalEventEmitter,
+        metrics: GoalMetrics,
     ) -> Self {
         Self {
             kind: GoalToolKind::Update,
             thread_id,
             state_db,
             accounting_state,
+            analytics,
             event_emitter,
+            metrics,
+            max_goal_token_budget: None,
         }
     }
 }
 
-#[async_trait]
-impl ToolExecutor<ToolCall> for GoalToolExecutor {
+impl<'call> ToolExecutor<ToolCall<'call>> for GoalToolExecutor {
     fn tool_name(&self) -> ToolName {
         ToolName::plain(match self.kind {
             GoalToolKind::Get => GET_GOAL_TOOL_NAME,
@@ -125,27 +145,35 @@ impl ToolExecutor<ToolCall> for GoalToolExecutor {
         })
     }
 
-    fn spec(&self) -> Option<ToolSpec> {
-        Some(match self.kind {
+    fn spec(&self) -> ToolSpec {
+        match self.kind {
             GoalToolKind::Get => create_get_goal_tool(),
             GoalToolKind::Create => create_create_goal_tool(),
             GoalToolKind::Update => create_update_goal_tool(),
-        })
+        }
     }
 
-    async fn handle(&self, invocation: ToolCall) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
-        match self.kind {
-            GoalToolKind::Get => self.handle_get(invocation).await,
-            GoalToolKind::Create => self.handle_create(invocation).await,
-            GoalToolKind::Update => self.handle_update(invocation).await,
-        }
+    fn handle<'a>(
+        &'a self,
+        invocation: ToolCall<'call>,
+    ) -> codex_extension_api::ToolExecutorFuture<'a>
+    where
+        'call: 'a,
+    {
+        Box::pin(async move {
+            match self.kind {
+                GoalToolKind::Get => self.handle_get(invocation).await,
+                GoalToolKind::Create => self.handle_create(invocation).await,
+                GoalToolKind::Update => self.handle_update(invocation).await,
+            }
+        })
     }
 }
 
 impl GoalToolExecutor {
     async fn handle_get(
         &self,
-        invocation: ToolCall,
+        invocation: ToolCall<'_>,
     ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
         let _ = invocation.function_arguments()?;
         let goal = self
@@ -162,13 +190,15 @@ impl GoalToolExecutor {
 
     async fn handle_create(
         &self,
-        invocation: ToolCall,
+        invocation: ToolCall<'_>,
     ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
         let mut request: CreateGoalRequest = parse_arguments(invocation.function_arguments()?)?;
         request.objective = request.objective.trim().to_string();
         validate_thread_goal_objective(&request.objective)
             .map_err(FunctionCallError::RespondToModel)?;
-        validate_goal_budget(request.token_budget).map_err(FunctionCallError::RespondToModel)?;
+        request.token_budget = request.token_budget.or(self.max_goal_token_budget);
+        validate_goal_budget(request.token_budget, self.max_goal_token_budget)
+            .map_err(FunctionCallError::RespondToModel)?;
 
         let goal = self
             .state_db
@@ -183,7 +213,7 @@ impl GoalToolExecutor {
             .map_err(|err| FunctionCallError::RespondToModel(format!("failed to create goal: {err}")))?
             .ok_or_else(|| {
                 FunctionCallError::RespondToModel(
-                    "cannot create a new goal because this thread already has a goal; use update_goal only when the existing goal is complete"
+                    "cannot create a new goal because this thread has an unfinished goal; complete the existing goal first"
                         .to_string(),
                 )
             })?;
@@ -191,6 +221,11 @@ impl GoalToolExecutor {
         let turn_id = self
             .accounting_state
             .mark_current_turn_goal_active(goal.goal_id.clone());
+        self.metrics.record_created();
+        self.analytics.created(
+            &goal,
+            GoalEventAttribution::Turn(invocation.turn_id.as_str()),
+        );
         let goal = protocol_goal_from_state(goal);
         self.emit_goal_updated_from_tool_call(&invocation, turn_id, goal.clone());
         goal_response(Some(goal), CompletionBudgetReport::Omit)
@@ -198,7 +233,7 @@ impl GoalToolExecutor {
 
     async fn handle_update(
         &self,
-        invocation: ToolCall,
+        invocation: ToolCall<'_>,
     ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
         let args: UpdateGoalArgs = parse_arguments(invocation.function_arguments()?)?;
         if !matches!(
@@ -224,6 +259,9 @@ impl GoalToolExecutor {
             BudgetLimitedGoalDisposition::ClearActive,
         )
         .await?;
+        let previous_status = self
+            .current_goal_status_for_metrics(/*expected_goal_id*/ None)
+            .await?;
         let goal = self
             .state_db
             .thread_goals()
@@ -240,12 +278,19 @@ impl GoalToolExecutor {
             .map_err(|err| {
                 FunctionCallError::RespondToModel(format!("failed to update goal: {err}"))
             })?
-            .map(protocol_goal_from_state)
             .ok_or_else(|| {
                 FunctionCallError::RespondToModel(
                     "cannot update goal because this thread has no goal".to_string(),
                 )
             })?;
+        self.metrics
+            .record_terminal_if_status_changed(previous_status, &goal);
+        self.analytics.status_changed(
+            &goal,
+            previous_status,
+            GoalEventAttribution::Turn(invocation.turn_id.as_str()),
+        );
+        let goal = protocol_goal_from_state(goal);
         let turn_id = self.accounting_state.clear_current_turn_goal();
         self.emit_goal_updated_from_tool_call(&invocation, turn_id, goal.clone());
         goal_response(
@@ -260,7 +305,7 @@ impl GoalToolExecutor {
 
     fn emit_goal_updated_from_tool_call(
         &self,
-        invocation: &ToolCall,
+        invocation: &ToolCall<'_>,
         turn_id: Option<String>,
         goal: ThreadGoal,
     ) {
@@ -277,9 +322,21 @@ impl GoalToolExecutor {
         let Some(turn_id) = self.accounting_state.current_turn_id() else {
             return Ok(None);
         };
+        let _accounting_permit = self
+            .accounting_state
+            .progress_accounting_permit()
+            .await
+            .map_err(|err| {
+                FunctionCallError::Fatal(format!(
+                    "goal progress accounting semaphore closed: {err}"
+                ))
+            })?;
         let Some(snapshot) = self.accounting_state.progress_snapshot(turn_id.as_str()) else {
             return Ok(None);
         };
+        let previous_status = self
+            .current_goal_status_for_metrics(Some(snapshot.expected_goal_id.as_str()))
+            .await?;
         let outcome = self
             .state_db
             .thread_goals()
@@ -296,6 +353,15 @@ impl GoalToolExecutor {
             })?;
         Ok(match outcome {
             codex_state::GoalAccountingOutcome::Updated(goal) => {
+                self.metrics
+                    .record_terminal_if_status_changed(previous_status, &goal);
+                self.analytics
+                    .usage_accounted(&goal, GoalEventAttribution::Turn(turn_id.as_str()));
+                self.analytics.status_changed(
+                    &goal,
+                    previous_status,
+                    GoalEventAttribution::Turn(turn_id.as_str()),
+                );
                 self.accounting_state.mark_progress_accounted_for_status(
                     turn_id.as_str(),
                     &snapshot,
@@ -313,6 +379,27 @@ impl GoalToolExecutor {
             codex_state::GoalAccountingOutcome::Unchanged(_) => None,
         })
     }
+
+    async fn current_goal_status_for_metrics(
+        &self,
+        expected_goal_id: Option<&str>,
+    ) -> Result<Option<codex_state::ThreadGoalStatus>, FunctionCallError> {
+        let goal = self
+            .state_db
+            .thread_goals()
+            .get_thread_goal(self.thread_id)
+            .await
+            .map_err(|err| {
+                FunctionCallError::RespondToModel(format!(
+                    "failed to read goal metrics status: {err}"
+                ))
+            })?;
+        Ok(goal.and_then(|goal| {
+            expected_goal_id
+                .is_none_or(|expected_goal_id| goal.goal_id == expected_goal_id)
+                .then_some(goal.status)
+        }))
+    }
 }
 
 fn parse_arguments<T>(arguments: &str) -> Result<T, FunctionCallError>
@@ -323,11 +410,22 @@ where
         .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))
 }
 
-fn validate_goal_budget(value: Option<i64>) -> Result<(), String> {
+pub(crate) fn validate_goal_budget(
+    value: Option<i64>,
+    max_goal_token_budget: Option<i64>,
+) -> Result<(), String> {
     if let Some(value) = value
         && value <= 0
     {
         return Err("goal budgets must be positive when provided".to_string());
+    }
+    if let Some(value) = value
+        && let Some(max_goal_token_budget) = max_goal_token_budget
+        && value > max_goal_token_budget
+    {
+        return Err(format!(
+            "goal token budget {value} exceeds the maximum allowed goal token budget of {max_goal_token_budget}"
+        ));
     }
     Ok(())
 }
@@ -362,7 +460,7 @@ impl GoalToolResponse {
     }
 }
 
-async fn fill_empty_thread_preview_if_possible(
+pub(crate) async fn fill_empty_thread_preview_if_possible(
     state_db: &codex_state::StateRuntime,
     thread_id: ThreadId,
     goal: &codex_state::ThreadGoal,
@@ -401,7 +499,9 @@ fn protocol_status_from_state(status: codex_state::ThreadGoalStatus) -> ThreadGo
     }
 }
 
-fn state_status_from_protocol(status: ThreadGoalStatus) -> codex_state::ThreadGoalStatus {
+pub(crate) fn state_status_from_protocol(
+    status: ThreadGoalStatus,
+) -> codex_state::ThreadGoalStatus {
     match status {
         ThreadGoalStatus::Active => codex_state::ThreadGoalStatus::Active,
         ThreadGoalStatus::Paused => codex_state::ThreadGoalStatus::Paused,

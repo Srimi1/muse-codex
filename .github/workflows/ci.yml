@@ -24,8 +24,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust 1.93.0
-        uses: dtolnay/rust-toolchain@283fb51ee3c8a49cd7c8ff30102f3fcf3cfbe0e1 # 1.93.0
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@46817827a5bfabe028bf34e1cce71fd40e2ff697 # 1.95.0
         with:
           components: rustfmt, clippy
           targets: aarch64-apple-darwin

@@ -88,24 +88,49 @@ class RustyV8BazelTest(unittest.TestCase):
             ),
         )
 
-    def test_bazel_remote_args_include_buildbuddy_header_when_present(self) -> None:
-        with patch.dict(environ, {"BUILDBUDDY_API_KEY": "token"}, clear=False):
+    def test_bazel_commands_use_shared_buildbuddy_remote_config_library(self) -> None:
+        with patch.dict(environ, {}, clear=True):
             self.assertEqual(
-                ["--remote_header=x-buildbuddy-api-key=token"],
-                rusty_v8_bazel.bazel_remote_args(),
+                [
+                    "bazel",
+                    "build",
+                    "//third_party/v8:release",
+                ],
+                rusty_v8_bazel.bazel_command(
+                    "build",
+                    "--config=ci-v8",
+                    "//third_party/v8:release",
+                ),
+            )
+        with patch.dict(environ, {"BUILDBUDDY_API_KEY": "token"}, clear=True):
+            self.assertEqual(
+                [
+                    "bazel",
+                    "build",
+                    "--config=buildbuddy-generic-rbe",
+                    "--remote_header=x-buildbuddy-api-key=token",
+                    "--config=ci-v8",
+                    "//third_party/v8:release",
+                ],
+                rusty_v8_bazel.bazel_command(
+                    "build",
+                    "--config=ci-v8",
+                    "//third_party/v8:release",
+                ),
             )
 
-        with patch.dict(environ, {}, clear=True):
-            self.assertEqual([], rusty_v8_bazel.bazel_remote_args())
-
-    def test_release_pair_labels_and_staged_names_distinguish_sandbox_artifacts(self) -> None:
+    def test_release_pair_labels_and_staged_names_distinguish_sandbox_artifacts(
+        self,
+    ) -> None:
         self.assertEqual(
             "//third_party/v8:rusty_v8_release_pair_x86_64_unknown_linux_musl",
             rusty_v8_bazel.release_pair_label("x86_64-unknown-linux-musl"),
         )
         self.assertEqual(
             "//third_party/v8:rusty_v8_sandbox_release_pair_x86_64_unknown_linux_musl",
-            rusty_v8_bazel.release_pair_label("x86_64-unknown-linux-musl", sandbox=True),
+            rusty_v8_bazel.release_pair_label(
+                "x86_64-unknown-linux-musl", sandbox=True
+            ),
         )
         self.assertEqual(
             "//third_party/v8:rusty_v8_sandbox_release_pair_x86_64_apple_darwin",
@@ -166,6 +191,11 @@ class RustyV8BazelTest(unittest.TestCase):
                 },
                 {path.name for path in Path(output_dir).iterdir()},
             )
+            checksums = (
+                Path(output_dir)
+                / "rusty_v8_ptrcomp_sandbox_release_aarch64-apple-darwin.sha256"
+            ).read_bytes()
+            self.assertNotIn(b"\r", checksums)
 
     def test_upstream_release_pair_paths(self) -> None:
         self.assertEqual(
@@ -180,8 +210,8 @@ class RustyV8BazelTest(unittest.TestCase):
                 ),
             ),
             rusty_v8_bazel.upstream_release_pair_paths(
-                Path("/tmp/rusty_v8"),
                 "x86_64-apple-darwin",
+                Path("/tmp/rusty_v8/target"),
             ),
         )
         self.assertEqual(
@@ -196,29 +226,25 @@ class RustyV8BazelTest(unittest.TestCase):
                 ),
             ),
             rusty_v8_bazel.upstream_release_pair_paths(
-                Path("/tmp/rusty_v8"),
                 "x86_64-pc-windows-msvc",
+                Path("/tmp/rusty_v8/target"),
             ),
         )
 
     def test_stage_upstream_release_pair(self) -> None:
-        with TemporaryDirectory() as source_dir, TemporaryDirectory() as output_dir:
-            source_root = Path(source_dir)
-            gn_out = (
-                source_root
-                / "target"
-                / "x86_64-pc-windows-msvc"
-                / "release"
-                / "gn_out"
-            )
+        with (
+            TemporaryDirectory() as target_dir,
+            TemporaryDirectory() as output_dir,
+        ):
+            gn_out = Path(target_dir) / "x86_64-pc-windows-msvc" / "release" / "gn_out"
             (gn_out / "obj").mkdir(parents=True)
             (gn_out / "obj" / "rusty_v8.lib").write_bytes(b"archive")
             (gn_out / "src_binding.rs").write_text("binding")
 
             rusty_v8_bazel.stage_upstream_release_pair(
-                source_root,
                 "x86_64-pc-windows-msvc",
                 Path(output_dir),
+                Path(target_dir),
                 sandbox=True,
             )
 

@@ -1,14 +1,17 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used)]
+
+use std::sync::Arc;
 
 use codex_core::NewThread;
+use codex_history::InitialHistory;
+use codex_history::ResumedHistory;
+use codex_history::RolloutItem;
 use codex_login::CodexAuth;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::InitialHistory;
-use codex_protocol::protocol::ResumedHistory;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::TurnStartedEvent;
@@ -27,19 +30,27 @@ fn resume_history(
     let turn_id = "resume-warning-seed-turn".to_string();
     let turn_ctx = TurnContextItem {
         turn_id: Some(turn_id.clone()),
-        cwd: config.cwd.to_path_buf(),
+        root_turn_id: None,
+        cwd: config.cwd.clone(),
+        workspace_roots: None,
         current_date: None,
         timezone: None,
         approval_policy: config.permissions.approval_policy.value(),
+        approvals_reviewer: None,
         sandbox_policy: config.legacy_sandbox_policy(),
         permission_profile: None,
+        active_permission_profile: None,
         network: None,
         file_system_sandbox_policy: None,
         model: previous_model.to_string(),
+        comp_hash: None,
         personality: None,
         collaboration_mode: None,
+        multi_agent_version: None,
+        multi_agent_mode: None,
         realtime_active: None,
-        effort: config.model_reasoning_effort,
+        cyber_access_program: None,
+        effort: config.model_reasoning_effort.clone(),
         summary: config
             .model_reasoning_summary
             .unwrap_or(ReasoningSummary::Auto),
@@ -47,14 +58,16 @@ fn resume_history(
 
     InitialHistory::Resumed(ResumedHistory {
         conversation_id: ThreadId::default(),
-        history: vec![
+        history: Arc::new(vec![
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: turn_id.clone(),
+                trace_id: None,
                 started_at: None,
                 model_context_window: None,
                 collaboration_mode_kind: ModeKind::Default,
             })),
             RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                client_id: None,
                 message: "seed".to_string(),
                 images: None,
                 local_images: vec![],
@@ -65,11 +78,13 @@ fn resume_history(
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id,
                 last_agent_message: None,
+                error: None,
+                started_at: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
             })),
-        ],
+        ]),
         rollout_path: Some(rollout_path.to_path_buf()),
     })
 }
@@ -104,8 +119,8 @@ async fn emits_warning_when_resumed_model_differs() {
             config.clone(),
             initial_history,
             auth_manager,
-            /*persist_extended_history*/ false,
             /*parent_trace*/ None,
+            ClientMcpExtensions::default(),
         )
         .await
         .expect("resume conversation");

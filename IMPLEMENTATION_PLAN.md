@@ -38,5 +38,5 @@ extensions, and orchestration.
 ## Upstream pins
 
 - Muse behavior baseline: `1.0.3-R2198.1`.
-- OpenAI Codex client: `rust-v0.133.0`, commit
-  `9474e5cfc4494b0ba319352aa86ce436c59e65c8`.
+- OpenAI Codex client: `rust-v0.153.4`, commit
+  `3d2ee51ca2d5db578f328aa75e20aa22c0197c9a`.

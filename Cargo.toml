@@ -13,7 +13,7 @@ edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/Srimi1/muse-codex"
 homepage = "https://github.com/Srimi1/muse-codex"
-rust-version = "1.93"
+rust-version = "1.95"
 publish = false
 
 [profile.release]
@@ -21,8 +21,9 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 
-# Required by the pinned Codex rust-v0.133.0 dependency graph. These are the
+# Required by the pinned Codex rust-v0.153.4 dependency graph. These are the
 # exact revisions recorded by that upstream release.
 [patch.crates-io]
-tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "132f5b39c862e3a970f731d709608b3e6276d5f6" }
-tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "9200079d3b54a1ff51072e24d81fd354f085156f" }
+crossterm = { git = "https://github.com/openai-oss-forks/crossterm", rev = "45fecb9508105988f42fe6ff0441783ed3717f92" }
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }

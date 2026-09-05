@@ -1,13 +1,18 @@
 use super::ContextualUserFragment;
+use codex_protocol::models::ContentItemKind;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct UserInstructions {
-    pub(crate) directory: String,
+    pub(crate) directory: Option<String>,
     pub(crate) text: String,
 }
 
 impl ContextualUserFragment for UserInstructions {
-    fn role() -> &'static str {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("agents_md.instructions".to_string())
+    }
+
+    fn role(&self) -> &'static str {
         "user"
     }
 
@@ -16,10 +21,15 @@ impl ContextualUserFragment for UserInstructions {
     }
 
     fn type_markers() -> (&'static str, &'static str) {
-        ("# AGENTS.md instructions for ", "</INSTRUCTIONS>")
+        ("# AGENTS.md instructions", "</INSTRUCTIONS>")
     }
 
     fn body(&self) -> String {
-        format!("{}\n\n<INSTRUCTIONS>\n{}\n", self.directory, self.text)
+        let directory = self
+            .directory
+            .as_ref()
+            .map(|directory| format!(" for {directory}"))
+            .unwrap_or_default();
+        format!("{directory}\n\n<INSTRUCTIONS>\n{}\n", self.text)
     }
 }

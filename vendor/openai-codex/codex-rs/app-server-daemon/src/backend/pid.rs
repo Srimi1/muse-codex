@@ -8,6 +8,8 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
+#[cfg(unix)]
+use codex_app_server_transport::REMOTE_CONTROL_DISABLED_ENV_VAR;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::fs;
@@ -164,6 +166,9 @@ impl PidBackend {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_log.into_std().await));
+        if let Some((key, value)) = self.command_env() {
+            command.env(key, value);
+        }
 
         #[cfg(unix)]
         {
@@ -249,12 +254,22 @@ impl PidBackend {
             let started_at = tokio::time::Instant::now();
             let deadline = tokio::time::Instant::now() + STOP_TIMEOUT;
             let mut forced = false;
-            while tokio::time::Instant::now() < deadline {
+            loop {
+                #[cfg(unix)]
+                if let Ok(raw_pid) = libc::pid_t::try_from(pid)
+                    && raw_pid > 0
+                {
+                    // A previous updater may have started this child; reap it if it has exited.
+                    unsafe { libc::waitpid(raw_pid, std::ptr::null_mut(), libc::WNOHANG) };
+                }
                 if !self.record_is_active(&record).await? {
                     match self.refresh_after_stale_record(&record).await? {
                         PidFileState::Missing => return Ok(()),
                         PidFileState::Starting | PidFileState::Running(_) => break,
                     }
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    break;
                 }
                 if !forced && started_at.elapsed() >= STOP_GRACE_PERIOD {
                     self.force_terminate_process(pid)?;
@@ -404,6 +419,19 @@ impl PidBackend {
                 remote_control_enabled: false,
             } => vec!["app-server", "--listen", "unix://"],
             PidCommandKind::UpdateLoop => vec!["app-server", "daemon", "pid-update-loop"],
+        }
+    }
+
+    #[cfg(unix)]
+    fn command_env(&self) -> Option<(&'static str, &'static str)> {
+        match self.command_kind {
+            PidCommandKind::AppServer {
+                remote_control_enabled: false,
+            } => Some((REMOTE_CONTROL_DISABLED_ENV_VAR, "1")),
+            PidCommandKind::AppServer {
+                remote_control_enabled: true,
+            }
+            | PidCommandKind::UpdateLoop => None,
         }
     }
 

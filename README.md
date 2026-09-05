@@ -13,7 +13,7 @@
 <p align="center">
   <a href="https://github.com/Srimi1/muse-codex/actions/workflows/ci.yml"><img alt="CI status" src="https://github.com/Srimi1/muse-codex/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-4c6ef5.svg"></a>
-  <a href="rust-toolchain.toml"><img alt="Rust 1.93" src="https://img.shields.io/badge/Rust-1.93-dea584.svg?logo=rust"></a>
+  <a href="rust-toolchain.toml"><img alt="Rust 1.95" src="https://img.shields.io/badge/Rust-1.95-dea584.svg?logo=rust"></a>
   <img alt="Platform: Apple-silicon macOS" src="https://img.shields.io/badge/platform-macOS%20arm64-111827.svg?logo=apple">
   <img alt="Status: experimental" src="https://img.shields.io/badge/status-experimental-8b5cf6.svg">
 </p>
@@ -72,8 +72,8 @@ See [Architecture](docs/ARCHITECTURE.md) and the
 | --- | --- |
 | Operating system | macOS on Apple silicon (`arm64`) |
 | Muse Code | Exactly `1.0.3-R2198.1` |
-| Rust | `1.93.0` for source builds |
-| OpenAI Codex source | `rust-v0.133.0` at `9474e5cfc4494b0ba319352aa86ce436c59e65c8` |
+| Rust | `1.95.0` for source builds |
+| OpenAI Codex source | `rust-v0.153.4` at `3d2ee51ca2d5db578f328aa75e20aa22c0197c9a` |
 | Authentication | ChatGPT browser/device login or an OpenAI API key |
 
 The current Meta installer may provide a newer Muse build. Muse Codex does not
@@ -85,6 +85,31 @@ Muse Code 1.0.3 (1.0.3-R2198.1)
 ```
 
 If the output differs, this version of Muse Codex will not start a session.
+
+### Models
+
+Muse Codex discovers models from the authenticated OpenAI catalog on every
+provider startup and never invents account entitlements. With Codex
+`rust-v0.153.4`, the compatibility layer understands the current catalog and
+Responses Lite contract used by:
+
+- `gpt-6-astra`
+- `gpt-5.6-sol`
+- `gpt-5.6-terra`
+- `gpt-5.6-luna`
+
+Only models returned as picker-visible for the active ChatGPT account are
+offered in subscription mode. Models that require a newer client protocol,
+advertise an unknown tool mode, omit text input, or have no recognized
+reasoning effort remain hidden until the transport is updated. For the
+first-party API, API-key discovery intersects endpoint-returned IDs with the
+pinned Codex protocol metadata, so unrelated embedding, audio, image, and
+moderation models are not presented as chat models. Explicit compatible custom
+endpoints remain permissive for models they advertise. See OpenAI's current
+[model catalog](https://developers.openai.com/api/docs/models) and
+[GPT-6 Astra guidance](https://developers.openai.com/api/docs/guides/latest-model)
+for public model information; the CLI treats its authenticated catalog as the
+source of truth for access, picker order, context limits, and effort choices.
 
 ## Quick start from source
 
@@ -141,6 +166,14 @@ muse-codex resume
 muse-codex serve
 ```
 
+Use Muse's `/model` picker in the TUI, or select an account-visible model
+explicitly:
+
+```sh
+muse-codex --model gpt-6-astra
+muse-codex exec --model gpt-6-astra "Review this repository"
+```
+
 Arguments unrelated to provider routing pass through to Muse. The public
 provider is either omitted or explicitly `--provider codex`; other provider
 values are rejected.
@@ -174,7 +207,8 @@ not a public issue.
   failures, and protocol routing. Full feature parity remains a release gate;
   the public CI suite cannot run the separately licensed stock binary.
 - Live subscription text, tool/result, and MSP restart/resume smoke tests pass
-  locally. These checks do not qualify every model, account, or Muse feature.
+  locally. Catalog fixtures cover GPT-6 Astra and the GPT-5.6 Sol, Terra, and
+  Luna models, but account access is never inferred from fixture data.
 - `serve --no-session-log` is unsupported because the pinned host does not
   deliver MSP turn events in memory-only mode. Use normal `serve` instead.
 - New response event types, auxiliary routes, and Muse releases require explicit

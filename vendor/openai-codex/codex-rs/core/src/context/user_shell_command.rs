@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use super::ContextualUserFragment;
+use codex_protocol::models::ContentItemKind;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct UserShellCommand {
@@ -27,7 +28,11 @@ impl UserShellCommand {
 }
 
 impl ContextualUserFragment for UserShellCommand {
-    fn role() -> &'static str {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("shell.user_command".to_string())
+    }
+
+    fn role(&self) -> &'static str {
         "user"
     }
 

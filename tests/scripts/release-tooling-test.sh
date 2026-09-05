@@ -22,9 +22,9 @@ mkdir -p "$work_dir/input" "$work_dir/release" "$work_dir/install" "$work_dir/fa
 launcher_source=$work_dir/input/muse-codex
 gateway_source=$work_dir/input/muse-codex-gateway
 stock_muse=$work_dir/input/muse-bin-1.0.3-R2198.1
-printf '#!/bin/sh\n[ "${1:-}" = --version ] && exec "$MUSE_CODEX_MUSE_BIN" --version\nprintf "launcher-v1\\n"\n' \
+printf '#!/bin/sh\nif [ "${1:-}" = self-test ]; then\n  [ "$("$MUSE_CODEX_MUSE_BIN" --version)" = "Muse Code 1.0.3 (1.0.3-R2198.1)" ] || exit 2\n  [ "$("$MUSE_CODEX_GATEWAY_BIN" self-test)" = "{\\"status\\":\\"ok\\",\\"ready_schema_version\\":2,\\"wire_compatibility_version\\":\\"0.153.4\\"}" ] || exit 3\n  printf "muse-codex self-test: ok\\n"\n  exit 0\nfi\nprintf "launcher-v1\\n"\n' \
   >"$launcher_source"
-printf '#!/bin/sh\n[ "${1:-}" = self-test ] && exit 0\nprintf "gateway-v1\\n"\n' \
+printf '#!/bin/sh\n[ "${1:-}" = self-test ] && { printf "{\\"status\\":\\"ok\\",\\"ready_schema_version\\":2,\\"wire_compatibility_version\\":\\"0.153.4\\"}\\n"; exit 0; }\nprintf "gateway-v1\\n"\n' \
   >"$gateway_source"
 printf '#!/bin/sh\n[ "${1:-}" = --version ] && printf "Muse Code 1.0.3 (1.0.3-R2198.1)\\n"\n' \
   >"$stock_muse"

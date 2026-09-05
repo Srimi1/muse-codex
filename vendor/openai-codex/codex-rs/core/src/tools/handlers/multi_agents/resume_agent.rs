@@ -1,27 +1,34 @@
 use super::*;
 use crate::agent::next_thread_spawn_depth;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::tools::handlers::multi_agents_spec::create_resume_agent_tool;
-use crate::turn_timing::now_unix_timestamp_ms;
 use codex_tools::ToolSpec;
 use std::sync::Arc;
 
 pub(crate) struct Handler;
 
-#[async_trait::async_trait]
 impl ToolExecutor<ToolInvocation> for Handler {
     fn tool_name(&self) -> ToolName {
         ToolName::namespaced(MULTI_AGENT_V1_NAMESPACE, "resume_agent")
     }
 
-    fn spec(&self) -> Option<ToolSpec> {
-        Some(create_resume_agent_tool())
+    fn spec(&self) -> ToolSpec {
+        create_resume_agent_tool()
     }
 
-    async fn handle(
-        &self,
-        invocation: ToolInvocation,
-    ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
-        handle_resume_agent(invocation).await.map(boxed_tool_output)
+    fn search_info(&self) -> Option<ToolSearchInfo> {
+        multi_agent_tool_search_info(
+            "resume_agent resume reopen closed agent subagent thread id target",
+            self.spec(),
+        )
+    }
+
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
+        Box::pin(async move { handle_resume_agent(invocation).await.map(boxed_tool_output) })
     }
 }
 
@@ -54,17 +61,24 @@ async fn handle_resume_agent(
     }
 
     session
-        .send_event(
+        .emit_turn_item_started(
             &turn,
-            CollabResumeBeginEvent {
-                call_id: call_id.clone(),
-                started_at_ms: now_unix_timestamp_ms(),
-                sender_thread_id: session.conversation_id,
-                receiver_thread_id,
-                receiver_agent_nickname: receiver_agent.agent_nickname.clone(),
-                receiver_agent_role: receiver_agent.agent_role.clone(),
-            }
-            .into(),
+            &TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
+                id: call_id.clone(),
+                tool: CollabAgentTool::ResumeAgent,
+                status: CollabAgentToolCallStatus::InProgress,
+                sender_thread_id: session.thread_id,
+                receiver_thread_ids: vec![receiver_thread_id],
+                receiver_agents: vec![CollabAgentRef {
+                    thread_id: receiver_thread_id,
+                    agent_nickname: receiver_agent.agent_nickname.clone(),
+                    agent_role: receiver_agent.agent_role.clone(),
+                }],
+                prompt: None,
+                model: None,
+                reasoning_effort: None,
+                agents_states: Default::default(),
+            }),
         )
         .await;
 
@@ -110,18 +124,24 @@ async fn handle_resume_agent(
         (receiver_agent, None)
     };
     session
-        .send_event(
+        .emit_turn_item_completed(
             &turn,
-            CollabResumeEndEvent {
-                call_id,
-                completed_at_ms: now_unix_timestamp_ms(),
-                sender_thread_id: session.conversation_id,
-                receiver_thread_id,
-                receiver_agent_nickname: receiver_agent.agent_nickname,
-                receiver_agent_role: receiver_agent.agent_role,
-                status: status.clone(),
-            }
-            .into(),
+            TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
+                id: call_id,
+                tool: CollabAgentTool::ResumeAgent,
+                status: collab_tool_call_status(&status, Some(receiver_thread_id)),
+                sender_thread_id: session.thread_id(),
+                receiver_thread_ids: vec![receiver_thread_id],
+                receiver_agents: vec![CollabAgentRef {
+                    thread_id: receiver_thread_id,
+                    agent_nickname: receiver_agent.agent_nickname,
+                    agent_role: receiver_agent.agent_role,
+                }],
+                prompt: None,
+                model: None,
+                reasoning_effort: None,
+                agents_states: [(receiver_thread_id, status.clone())].into_iter().collect(),
+            }),
         )
         .await;
 
@@ -135,13 +155,6 @@ async fn handle_resume_agent(
 }
 
 impl CoreToolRuntime for Handler {
-    fn search_info(&self) -> Option<ToolSearchInfo> {
-        multi_agent_tool_search_info(
-            "resume_agent resume reopen closed agent subagent thread id target",
-            self.spec()?,
-        )
-    }
-
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }
@@ -158,7 +171,7 @@ pub(crate) struct ResumeAgentResult {
 }
 
 impl ToolOutput for ResumeAgentResult {
-    fn log_preview(&self) -> String {
+    fn log_output(&self) -> String {
         tool_output_json_text(self, "resume_agent")
     }
 
@@ -181,12 +194,12 @@ async fn try_resume_closed_agent(
     receiver_thread_id: ThreadId,
     child_depth: i32,
 ) -> Result<(), FunctionCallError> {
-    let config = build_agent_resume_config(turn.as_ref(), child_depth)?;
+    let config = build_agent_resume_config(turn.as_ref())?;
     Box::pin(session.services.agent_control.resume_agent_from_rollout(
         config,
         receiver_thread_id,
         thread_spawn_source(
-            session.conversation_id,
+            session.thread_id(),
             &turn.session_source,
             child_depth,
             /*agent_role*/ None,

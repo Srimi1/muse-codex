@@ -72,6 +72,10 @@ pub(crate) enum TerminalTitleItem {
     TotalInputTokens,
     /// Total output tokens generated.
     TotalOutputTokens,
+    /// Estimated credits attributed directly to the current enterprise thread.
+    ThreadCredits,
+    /// Estimated dollar cost attributed directly to the current enterprise thread.
+    EstimatedThreadCost,
     /// Full thread UUID.
     #[strum(to_string = "thread-id", serialize = "session-id")]
     SessionId,
@@ -82,6 +86,8 @@ pub(crate) enum TerminalTitleItem {
     Model,
     /// Current model name with reasoning level.
     ModelWithReasoning,
+    /// Current reasoning level.
+    Reasoning,
     /// Latest checklist task progress from `update_plan` (if available).
     TaskProgress,
 }
@@ -116,12 +122,19 @@ impl TerminalTitleItem {
             TerminalTitleItem::UsedTokens => "Total tokens used in session (omitted when zero)",
             TerminalTitleItem::TotalInputTokens => "Total input tokens used in session",
             TerminalTitleItem::TotalOutputTokens => "Total output tokens used in session",
+            TerminalTitleItem::ThreadCredits => {
+                "Estimated current-thread credits (Enterprise workspaces only; omitted when unavailable)"
+            }
+            TerminalTitleItem::EstimatedThreadCost => {
+                "Estimated current-thread cost (Enterprise workspaces only; omitted when unavailable)"
+            }
             TerminalTitleItem::SessionId => {
                 "Current thread identifier (omitted until thread starts)"
             }
             TerminalTitleItem::FastMode => "Whether Fast mode is currently active",
             TerminalTitleItem::Model => "Current model name",
             TerminalTitleItem::ModelWithReasoning => "Current model name with reasoning level",
+            TerminalTitleItem::Reasoning => "Current reasoning level",
             TerminalTitleItem::TaskProgress => {
                 "Latest task progress from update_plan (omitted until available)"
             }
@@ -147,12 +160,17 @@ impl TerminalTitleItem {
             TerminalTitleItem::TotalOutputTokens => {
                 Some(StatusSurfacePreviewItem::TotalOutputTokens)
             }
+            TerminalTitleItem::ThreadCredits => Some(StatusSurfacePreviewItem::ThreadCredits),
+            TerminalTitleItem::EstimatedThreadCost => {
+                Some(StatusSurfacePreviewItem::EstimatedThreadCost)
+            }
             TerminalTitleItem::SessionId => Some(StatusSurfacePreviewItem::SessionId),
             TerminalTitleItem::FastMode => Some(StatusSurfacePreviewItem::FastMode),
             TerminalTitleItem::Model => Some(StatusSurfacePreviewItem::Model),
             TerminalTitleItem::ModelWithReasoning => {
                 Some(StatusSurfacePreviewItem::ModelWithReasoning)
             }
+            TerminalTitleItem::Reasoning => Some(StatusSurfacePreviewItem::Reasoning),
             TerminalTitleItem::TaskProgress => Some(StatusSurfacePreviewItem::TaskProgress),
         }
     }
@@ -341,6 +359,10 @@ impl TerminalTitleSetupView {
 }
 
 impl BottomPaneView for TerminalTitleSetupView {
+    fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
+        crate::keymap::KeymapContextSet::new(crate::keymap::KeymapContext::List)
+    }
+
     fn handle_key_event(&mut self, key_event: crossterm::event::KeyEvent) {
         self.picker.handle_key_event(key_event);
     }
@@ -517,6 +539,26 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_is_selectable_id() {
+        assert_eq!(TerminalTitleItem::Reasoning.to_string(), "reasoning");
+        assert_eq!(
+            "reasoning".parse::<TerminalTitleItem>(),
+            Ok(TerminalTitleItem::Reasoning)
+        );
+    }
+
+    #[test]
+    fn thread_usage_items_are_independently_selectable() {
+        assert_eq!(
+            parse_terminal_title_items(["thread-credits", "estimated-thread-cost"].into_iter()),
+            Some(vec![
+                TerminalTitleItem::ThreadCredits,
+                TerminalTitleItem::EstimatedThreadCost,
+            ])
+        );
+    }
+
+    #[test]
     fn parse_terminal_title_items_accepts_kebab_case_variants() {
         let items = parse_terminal_title_items(
             [
@@ -530,11 +572,14 @@ mod tests {
                 "project-name",
                 "model",
                 "model-with-reasoning",
+                "reasoning",
                 "weekly-limit",
                 "codex-version",
                 "used-tokens",
                 "total-input-tokens",
                 "total-output-tokens",
+                "thread-credits",
+                "estimated-thread-cost",
                 "session-id",
                 "fast-mode",
             ]
@@ -553,11 +598,14 @@ mod tests {
                 TerminalTitleItem::Project,
                 TerminalTitleItem::Model,
                 TerminalTitleItem::ModelWithReasoning,
+                TerminalTitleItem::Reasoning,
                 TerminalTitleItem::WeeklyLimit,
                 TerminalTitleItem::CodexVersion,
                 TerminalTitleItem::UsedTokens,
                 TerminalTitleItem::TotalInputTokens,
                 TerminalTitleItem::TotalOutputTokens,
+                TerminalTitleItem::ThreadCredits,
+                TerminalTitleItem::EstimatedThreadCost,
                 TerminalTitleItem::SessionId,
                 TerminalTitleItem::FastMode,
             ])

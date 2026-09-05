@@ -23,6 +23,7 @@ pub const STOCK_MUSE_COMMAND: &str = "muse";
 pub const GATEWAY_BASENAME: &str = "muse-codex-gateway";
 pub const DEFAULT_GATEWAY_READY_TIMEOUT: Duration = Duration::from_secs(100);
 pub const GATEWAY_READY_SCHEMA_VERSION: u32 = 2;
+pub const SUPPORTED_CODEX_WIRE_VERSION: &str = "0.153.4";
 const MAX_GATEWAY_READY_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_GATEWAY_MODELS: usize = 4096;
 const STOCK_MODEL_CATALOG_FILE: &str = "6d657461__p746268.json";
@@ -46,6 +47,7 @@ const SECRET_ENVIRONMENT: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Invocation {
     GatewayAuth(Vec<OsString>),
+    SelfTest,
     Muse(Vec<OsString>),
     Output { text: String, code: i32 },
 }
@@ -54,6 +56,9 @@ pub enum Invocation {
 /// arguments. It must never reach the stock provider's credential handlers.
 pub fn classify_invocation(args: &[OsString]) -> Result<Invocation> {
     let (_, without_provider) = validate_and_remove_provider(args)?;
+    if without_provider == [OsString::from("self-test")] {
+        return Ok(Invocation::SelfTest);
+    }
     if let Some(index) = stock_subcommand_index(&without_provider)
         && matches!(
             without_provider[index].to_str(),
@@ -1591,6 +1596,14 @@ pub fn run() -> Result<i32> {
             let gateway = discover_gateway(&discovery)?;
             run_gateway_auth(&gateway, &gateway_arguments)
         }
+        Invocation::SelfTest => {
+            let stock_muse = discover_stock_muse(&discovery)?;
+            verify_stock_muse_version(&stock_muse)?;
+            let gateway = discover_gateway(&discovery)?;
+            verify_gateway_self_test(&gateway)?;
+            println!("muse-codex self-test: ok");
+            Ok(0)
+        }
         Invocation::Muse(muse_arguments) => {
             let stock_muse = discover_stock_muse(&discovery)?;
             verify_stock_muse_version(&stock_muse)?;
@@ -1604,6 +1617,45 @@ pub fn run() -> Result<i32> {
             }
         }
     }
+}
+
+fn verify_gateway_self_test(executable: &Path) -> Result<()> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct GatewaySelfTest {
+        status: String,
+        ready_schema_version: u32,
+        wire_compatibility_version: String,
+    }
+
+    let mut command = Command::new(executable);
+    command
+        .arg("self-test")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    scrub_secret_environment(&mut command);
+    let output = command
+        .output()
+        .with_context(|| format!("failed to self-test gateway {}", executable.display()))?;
+    if !output.status.success() {
+        bail!(
+            "gateway self-test failed ({})",
+            display_exit_status(output.status)
+        );
+    }
+    if output.stdout.len() > 4096 {
+        bail!("gateway self-test output exceeded the size limit");
+    }
+    let result: GatewaySelfTest = serde_json::from_slice(&output.stdout)
+        .context("gateway self-test returned invalid JSON")?;
+    if result.status != "ok"
+        || result.ready_schema_version != GATEWAY_READY_SCHEMA_VERSION
+        || result.wire_compatibility_version != SUPPORTED_CODEX_WIRE_VERSION
+    {
+        bail!("gateway self-test reported an incompatible launcher/gateway protocol");
+    }
+    Ok(())
 }
 
 fn run_gateway_auth(executable: &Path, arguments: &[OsString]) -> Result<i32> {
@@ -1925,6 +1977,10 @@ mod tests {
 
     #[test]
     fn intercepts_owned_auth_commands_only() {
+        assert_eq!(
+            classify_invocation(&args(&["self-test"])).unwrap(),
+            Invocation::SelfTest
+        );
         assert_eq!(
             classify_invocation(&args(&["login"])).unwrap(),
             Invocation::GatewayAuth(args(&["auth", "login"]))
@@ -2316,6 +2372,33 @@ mod tests {
         create_version_executable(&wrong, "Muse Code 1.0.4 (1.0.4-R2200.1)");
         verify_stock_muse_version(&exact).unwrap();
         assert!(verify_stock_muse_version(&wrong).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gateway_self_test_requires_the_matching_pair_contract() {
+        let temporary = tempfile::tempdir().unwrap();
+        let exact = temporary.path().join("exact-gateway");
+        let wrong = temporary.path().join("wrong-gateway");
+        fs::write(
+            &exact,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{{\"status\":\"ok\",\"ready_schema_version\":{},\"wire_compatibility_version\":\"{}\"}}'\n",
+                GATEWAY_READY_SCHEMA_VERSION, SUPPORTED_CODEX_WIRE_VERSION
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &wrong,
+            "#!/bin/sh\nprintf '%s\\n' '{\"status\":\"ok\",\"ready_schema_version\":999,\"wire_compatibility_version\":\"future\"}'\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&exact, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&wrong, fs::Permissions::from_mode(0o700)).unwrap();
+
+        verify_gateway_self_test(&exact).unwrap();
+        assert!(verify_gateway_self_test(&wrong).is_err());
     }
 
     #[test]

@@ -8,7 +8,7 @@ binary release.
 
 - Apple-silicon Mac (`arm64`)
 - Muse Code exactly `1.0.3-R2198.1`, installed and licensed separately
-- Rust `1.93.0` and Cargo for a source build
+- Rust `1.95.0` and Cargo for a source build
 - An OpenAI account eligible for the authentication mode you choose
 
 Install Muse Code through
@@ -33,7 +33,7 @@ cd muse-codex
 cargo build --workspace --release --locked
 ```
 
-The repository toolchain file selects Rust `1.93.0`. A locked build uses the
+The repository toolchain file selects Rust `1.95.0`. A locked build uses the
 committed dependency graph and pinned Codex source.
 
 Install both executables together:
@@ -56,11 +56,14 @@ export MUSE_CODEX_MUSE_BIN='/absolute/path/to/muse-bin-1.0.3-R2198.1'
 ## Verify the build
 
 ```sh
-muse-codex-gateway self-test
+MUSE_CODEX_MUSE_BIN="$(command -v muse)" muse-codex self-test
 MUSE_CODEX_MUSE_BIN="$(command -v muse)" muse-codex --version
 ```
 
-The second command should print the exact stock Muse version shown above.
+The first command validates the installed launcher/gateway protocol pair and
+the stock Muse prerequisite without opening Keychain or making a provider
+request. The second command should print the exact stock Muse version shown
+above.
 
 ## Authenticate and run
 

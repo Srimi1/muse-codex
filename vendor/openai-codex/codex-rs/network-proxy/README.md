@@ -5,6 +5,10 @@
 - an HTTP proxy (default `127.0.0.1:3128`)
 - a SOCKS5 proxy (default `127.0.0.1:8081`, enabled by default)
 
+On Windows, managed HTTP listeners prefer ports `3128-3159`, and SOCKS5 listeners prefer ports
+`8081-8112`. An explicitly configured port is attempted first. If every preferred port is occupied,
+the proxy preserves its existing ephemeral loopback fallback.
+
 It enforces an allow/deny policy and a "limited" mode intended for read-only network access.
 
 ## Quickstart
@@ -34,11 +38,15 @@ allow_upstream_proxy = true
 dangerously_allow_non_loopback_proxy = false
 mode = "full" # default when unset; use "limited" for read-only mode
 # HTTPS MITM is enabled automatically when `mode = "limited"` or when MITM hooks are configured.
-# CA cert/key are managed internally under $CODEX_HOME/proxy/ (ca.pem + ca.key).
+# The CA private key remains in proxy memory. When MITM is active, spawned commands receive CA
+# bundle env vars pointing at immutable public files under $CODEX_HOME/proxy/ so common HTTPS
+# clients trust the managed CA.
 
 # If false, local/private networking is rejected. Explicit allowlisting of local IP literals
 # (or `localhost`) is required to permit them.
 # Hostnames that resolve to local/private IPs are still blocked even if allowlisted.
+# Clients that always bypass proxies for loopback, such as Go's `net/http`, remain blocked by
+# the operating-system sandbox when local binding is disabled.
 allow_local_binding = false
 
 # DANGEROUS (macOS-only): bypasses unix socket allowlisting and permits any
@@ -105,9 +113,9 @@ When a request is blocked, the proxy responds with `403` and includes:
   - `blocked-by-method-policy`
   - `blocked-by-policy`
 
-In "limited" mode, only `GET`, `HEAD`, and `OPTIONS` are allowed. HTTPS `CONNECT` requests require
-MITM to enforce limited-mode method policy; otherwise they are blocked. SOCKS5 remains blocked in
-limited mode.
+In "limited" mode, only `GET`, `HEAD`, and `OPTIONS` are allowed. HTTPS `CONNECT` requests and
+HTTPS SOCKS5 TCP targets on `:443` require MITM to enforce limited-mode method policy; otherwise
+they are blocked. SOCKS5 UDP and non-HTTPS SOCKS5 TCP remain blocked in limited mode.
 
 Websocket clients typically tunnel `wss://` through HTTPS `CONNECT`; those CONNECT targets still go
 through the same host allowlist/denylist checks.
@@ -213,7 +221,8 @@ what it can reasonably guarantee.
   allowlisted (best-effort DNS lookup).
 - Limited mode enforcement:
   - only `GET`, `HEAD`, and `OPTIONS` are allowed
-  - HTTPS `CONNECT` remains a tunnel; limited-mode method enforcement does not apply to HTTPS
+  - HTTPS `CONNECT` requests and HTTPS SOCKS5 TCP targets on `:443` require MITM so the proxy can
+    enforce limited-mode method policy; SOCKS5 UDP and non-HTTPS SOCKS5 TCP remain blocked
 - Listener safety defaults:
   - the HTTP proxy listener clamps non-loopback binds unless explicitly enabled via
     `dangerously_allow_non_loopback_proxy`

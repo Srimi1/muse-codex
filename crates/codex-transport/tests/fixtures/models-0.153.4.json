@@ -1,0 +1,98 @@
+{
+  "models": [
+    {
+      "slug": "gpt-6-astra",
+      "display_name": "GPT-6-Astra",
+      "context_window": 272000,
+      "minimal_client_version": "0.153.0",
+      "supported_reasoning_levels": [
+        { "effort": "low" },
+        { "effort": "medium" },
+        { "effort": "high" },
+        { "effort": "xhigh" },
+        { "effort": "max" },
+        { "effort": "ultra" }
+      ],
+      "default_reasoning_level": "low",
+      "priority": 1,
+      "visibility": "list",
+      "use_responses_lite": true,
+      "tool_mode": "code_mode_only",
+      "input_modalities": ["text", "image"]
+    },
+    {
+      "slug": "gpt-5.6-sol",
+      "display_name": "GPT-5.6-Sol",
+      "context_window": 272000,
+      "minimal_client_version": "0.144.0",
+      "supported_reasoning_levels": [
+        { "effort": "low" }, { "effort": "medium" }, { "effort": "high" },
+        { "effort": "xhigh" }, { "effort": "max" }, { "effort": "ultra" }
+      ],
+      "default_reasoning_level": "low",
+      "priority": 6,
+      "visibility": "list",
+      "use_responses_lite": true,
+      "tool_mode": "code_mode_only",
+      "input_modalities": ["text", "image"]
+    },
+    {
+      "slug": "gpt-5.6-terra",
+      "display_name": "GPT-5.6-Terra",
+      "context_window": 272000,
+      "minimal_client_version": "0.144.0",
+      "supported_reasoning_levels": [
+        { "effort": "low" }, { "effort": "medium" }, { "effort": "high" },
+        { "effort": "xhigh" }, { "effort": "max" }, { "effort": "ultra" }
+      ],
+      "default_reasoning_level": "medium",
+      "priority": 7,
+      "visibility": "list",
+      "use_responses_lite": true,
+      "tool_mode": "code_mode_only",
+      "input_modalities": ["text", "image"]
+    },
+    {
+      "slug": "gpt-5.6-luna",
+      "display_name": "GPT-5.6-Luna",
+      "context_window": 272000,
+      "minimal_client_version": "0.144.0",
+      "supported_reasoning_levels": [
+        { "effort": "low" }, { "effort": "medium" }, { "effort": "high" },
+        { "effort": "xhigh" }, { "effort": "max" }
+      ],
+      "default_reasoning_level": "medium",
+      "priority": 8,
+      "visibility": "list",
+      "use_responses_lite": true,
+      "tool_mode": "code_mode_only",
+      "input_modalities": ["text", "image"]
+    },
+    {
+      "slug": "future-wire-model",
+      "minimal_client_version": "99.0.0",
+      "priority": 9,
+      "visibility": "list",
+      "use_responses_lite": true,
+      "tool_mode": "code_mode_only",
+      "input_modalities": ["text"]
+    },
+    {
+      "slug": "future-tool-mode",
+      "minimal_client_version": "0.153.0",
+      "priority": 10,
+      "visibility": "list",
+      "tool_mode": "future_mode",
+      "input_modalities": ["text"]
+    },
+    {
+      "slug": "codex-auto-review",
+      "minimal_client_version": "0.98.0",
+      "priority": 43,
+      "visibility": "hide",
+      "use_responses_lite": true,
+      "tool_mode": "code_mode_only",
+      "input_modalities": ["text"]
+    }
+  ]
+}

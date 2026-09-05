@@ -1,11 +1,20 @@
 //! Hook run lifecycle handling for `ChatWidget`.
 //!
-//! This module keeps active hook cells, hook timers, and hook completion output
-//! together.
+//! This module keeps hook timers, compact activity-row progress, and durable
+//! hook completion output together.
 
 use super::*;
 
 impl ChatWidget {
+    /// Drop transient live hook status without flushing it into history.
+    pub(super) fn clear_active_hook_cell(&mut self) {
+        self.bottom_pane.set_hook_status_message(/*message*/ None);
+        if self.active_hook_cell.take().is_some() {
+            self.bump_active_cell_revision();
+            self.request_pending_usage_output_insertion();
+        }
+    }
+
     pub(super) fn on_hook_started(&mut self, run: codex_app_server_protocol::HookRunSummary) {
         self.flush_answer_stream_with_separator();
         self.flush_completed_hook_output();
@@ -15,13 +24,11 @@ impl ChatWidget {
                 self.bump_active_cell_revision();
             }
             None => {
-                self.active_hook_cell = Some(history_cell::new_active_hook_cell(
-                    run,
-                    self.config.animations,
-                ));
+                self.active_hook_cell = Some(history_cell::new_active_hook_cell(run));
                 self.bump_active_cell_revision();
             }
         }
+        self.sync_hook_status_message();
         self.request_redraw();
     }
 
@@ -43,8 +50,7 @@ impl ChatWidget {
                     self.bump_active_cell_revision();
                 }
                 None => {
-                    let cell =
-                        history_cell::new_completed_hook_cell(completed, self.config.animations);
+                    let cell = history_cell::new_completed_hook_cell(completed);
                     if !cell.is_empty() {
                         self.active_hook_cell = Some(cell);
                         self.bump_active_cell_revision();
@@ -54,6 +60,7 @@ impl ChatWidget {
         }
         self.flush_completed_hook_output();
         self.finish_active_hook_cell_if_idle();
+        self.sync_hook_status_message();
         self.request_redraw();
     }
 
@@ -72,10 +79,12 @@ impl ChatWidget {
         if active_cell_is_empty {
             self.active_hook_cell = None;
         }
+        self.flush_completed_command_activity();
         self.bump_active_cell_revision();
         self.transcript.needs_final_message_separator = true;
         self.app_event_tx
             .send(AppEvent::InsertHistoryCell(Box::new(completed_cell)));
+        self.request_pending_usage_output_insertion();
     }
 
     pub(super) fn finish_active_hook_cell_if_idle(&mut self) {
@@ -85,6 +94,7 @@ impl ChatWidget {
         if cell.is_empty() {
             self.active_hook_cell = None;
             self.bump_active_cell_revision();
+            self.request_pending_usage_output_insertion();
             return;
         }
         if cell.should_flush()
@@ -94,6 +104,7 @@ impl ChatWidget {
             self.transcript.needs_final_message_separator = true;
             self.app_event_tx
                 .send(AppEvent::InsertHistoryCell(Box::new(cell)));
+            self.request_pending_usage_output_insertion();
         }
     }
 
@@ -106,6 +117,15 @@ impl ChatWidget {
             self.bump_active_cell_revision();
         }
         self.finish_active_hook_cell_if_idle();
+        self.sync_hook_status_message();
+    }
+
+    fn sync_hook_status_message(&mut self) {
+        let status_message = self
+            .active_hook_cell
+            .as_ref()
+            .and_then(HookCell::running_status_summary);
+        self.bottom_pane.set_hook_status_message(status_message);
     }
 
     pub(super) fn schedule_hook_timer_if_needed(&self) {

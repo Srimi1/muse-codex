@@ -20,14 +20,12 @@ async fn emits_deprecation_notice_for_legacy_feature_flag() -> anyhow::Result<()
 
     let mut builder = test_codex().with_config(|config| {
         let mut features = config.features.get().clone();
-        features.enable(Feature::UnifiedExec);
         features
             .record_legacy_usage_force("use_experimental_unified_exec_tool", Feature::UnifiedExec);
         config
             .features
             .set(features)
             .expect("test config should allow managed feature metadata updates");
-        config.use_experimental_unified_exec_tool = true;
     });
 
     let TestCodex { codex, .. } = builder.build(&server).await?;
@@ -92,7 +90,7 @@ async fn emits_deprecation_notice_for_web_search_feature_flag_values() -> anyhow
         assert_eq!(
             details.as_deref(),
             Some(
-                "Set `web_search` to `\"live\"`, `\"cached\"`, or `\"disabled\"` at the top level (or under a profile) in config.toml if you want to override it."
+                "Set `web_search` to `\"live\"`, `\"indexed\"`, `\"cached\"`, or `\"disabled\"` at the top level (or under a profile) in config.toml if you want to override it."
             ),
         );
     }

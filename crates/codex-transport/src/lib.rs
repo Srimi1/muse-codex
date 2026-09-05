@@ -28,7 +28,10 @@ pub use transport::Transport;
 pub use url::Url;
 
 /// The immutable OpenAI Codex source revision used by this adapter.
-pub const CODEX_GIT_REVISION: &str = "9474e5cfc4494b0ba319352aa86ce436c59e65c8";
+pub const CODEX_GIT_REVISION: &str = "3d2ee51ca2d5db578f328aa75e20aa22c0197c9a";
 
-/// Codex client version sent to upstream model discovery.
-pub const CODEX_CLIENT_VERSION: &str = "0.133.0";
+/// Responses/catalog compatibility level implemented by this adapter.
+///
+/// Bump this only with the pinned source revision and after the corresponding
+/// model request shapes pass fixture and live compatibility tests.
+pub const CODEX_WIRE_COMPATIBILITY_VERSION: &str = "0.153.4";

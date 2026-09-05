@@ -68,10 +68,9 @@ impl EventProcessorWithHumanOutput {
         match item {
             ThreadItem::CommandExecution { command, cwd, .. } => {
                 eprintln!(
-                    "{}\n{} in {}",
+                    "{}\n{} in {cwd}",
                     "exec".style(self.italic).style(self.magenta),
                     command.style(self.bold),
-                    cwd.display()
                 );
             }
             ThreadItem::McpToolCall { server, tool, .. } => {
@@ -82,8 +81,8 @@ impl EventProcessorWithHumanOutput {
                     "started".style(self.dimmed)
                 );
             }
-            ThreadItem::WebSearch { query, .. } => {
-                eprintln!("{} {}", "web search:".style(self.bold), query);
+            ThreadItem::WebSearch(item) => {
+                eprintln!("{} {}", "web search:".style(self.bold), item.query);
             }
             ThreadItem::FileChange { .. } => {
                 eprintln!("{}", "apply patch".style(self.bold));
@@ -197,8 +196,8 @@ impl EventProcessorWithHumanOutput {
                     eprintln!("{}", error.message.style(self.red));
                 }
             }
-            ThreadItem::WebSearch { query, .. } => {
-                eprintln!("{} {}", "web search:".style(self.bold), query);
+            ThreadItem::WebSearch(item) => {
+                eprintln!("{} {}", "web search:".style(self.bold), item.query);
             }
             ThreadItem::ContextCompaction { .. } => {
                 eprintln!("{}", "context compacted".style(self.dimmed));
@@ -237,6 +236,15 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                     notification.summary,
                     details
                 );
+                CodexStatus::Running
+            }
+            ServerNotification::Warning(notification) => self.process_warning(notification.message),
+            ServerNotification::AuthRecoveryStarted(notification) => {
+                eprintln!("{}", notification.message);
+                CodexStatus::Running
+            }
+            ServerNotification::AuthRecoveryCompleted(notification) => {
+                eprintln!("{}", notification.message.style(self.green));
                 CodexStatus::Running
             }
             ServerNotification::Error(notification) => {
@@ -446,7 +454,8 @@ fn config_summary_entries(
             "reasoning effort",
             config
                 .model_reasoning_effort
-                .map(|effort| effort.to_string())
+                .as_ref()
+                .map(std::string::ToString::to_string)
                 .unwrap_or_else(|| "none".to_string()),
         ));
         entries.push((

@@ -19,7 +19,7 @@ By participating, you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Development setup
 
-Development requires Apple-silicon macOS, Rust `1.93.0`, and the exact stock
+Development requires Apple-silicon macOS, Rust `1.95.0`, and the exact stock
 Muse Code baseline `1.0.3-R2198.1` for host integration checks. Unit and fixture
 tests do not require OpenAI credentials.
 

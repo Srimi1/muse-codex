@@ -22,6 +22,41 @@ impl HistoryCell for PlainHistoryCell {
         plain_lines(self.lines.clone())
     }
 }
+
+#[derive(Debug)]
+pub(crate) struct WebHyperlinkHistoryCell {
+    lines: Vec<HyperlinkLine>,
+}
+
+impl WebHyperlinkHistoryCell {
+    pub(crate) fn new(lines: Vec<Line<'static>>) -> Self {
+        Self {
+            lines: crate::terminal_hyperlinks::annotate_web_urls(lines),
+        }
+    }
+
+    pub(crate) fn new_hyperlink_lines(lines: Vec<HyperlinkLine>) -> Self {
+        Self { lines }
+    }
+}
+
+impl HistoryCell for WebHyperlinkHistoryCell {
+    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        self.lines.iter().map(|line| line.line.clone()).collect()
+    }
+
+    fn display_hyperlink_lines(&self, _width: u16) -> Vec<HyperlinkLine> {
+        self.lines.clone()
+    }
+
+    fn transcript_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
+        self.display_hyperlink_lines(width)
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        plain_lines(self.lines.iter().map(|line| line.line.clone()))
+    }
+}
 #[derive(Debug)]
 pub(crate) struct PrefixedWrappedHistoryCell {
     text: Text<'static>,
@@ -86,6 +121,38 @@ impl HistoryCell for CompositeHistoryCell {
         out
     }
 
+    fn display_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
+        let mut out = Vec::new();
+        let mut first = true;
+        for part in &self.parts {
+            let mut lines = part.display_hyperlink_lines(width);
+            if !lines.is_empty() {
+                if !first {
+                    out.push(HyperlinkLine::from(""));
+                }
+                out.append(&mut lines);
+                first = false;
+            }
+        }
+        out
+    }
+
+    fn transcript_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
+        let mut out = Vec::new();
+        let mut first = true;
+        for part in &self.parts {
+            let mut lines = part.transcript_hyperlink_lines(width);
+            if !lines.is_empty() {
+                if !first {
+                    out.push(HyperlinkLine::from(""));
+                }
+                out.append(&mut lines);
+                first = false;
+            }
+        }
+        out
+    }
+
     fn raw_lines(&self) -> Vec<Line<'static>> {
         let mut out: Vec<Line<'static>> = Vec::new();
         let mut first = true;
@@ -100,5 +167,9 @@ impl HistoryCell for CompositeHistoryCell {
             }
         }
         out
+    }
+
+    fn has_stable_transcript_height(&self) -> bool {
+        false
     }
 }

@@ -1,12 +1,11 @@
 ---
-source: tui/src/history_cell.rs
+source: tui/src/history_cell/tests.rs
 expression: rendered
 ---
 /mcp
 
 🔌  MCP Tools
 
-  • plugin_docs
-    • Auth: Unsupported
-    • Command: docs-server --stdio
-    • Tools: lookup
+  • plugin_docs: unknown (1 tool)
+
+  Use /mcp verbose for tools and resources.

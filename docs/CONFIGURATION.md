@@ -75,7 +75,14 @@ uses the first picker-visible default in the authenticated upstream catalog.
 The launcher atomically seeds Muse's isolated normalized catalog cache so
 unknown release dates and output limits remain unknown instead of being
 fabricated, while authenticated reasoning-effort choices retain upstream order.
-The gateway then translates the selected model's Responses stream.
+The gateway then translates the selected model's Responses stream, selecting
+the Responses Lite wire form when the catalog says that model requires it.
+
+The current pinned client understands catalog entries for GPT-6 Astra and
+GPT-5.6 Sol, Terra, and Luna. This is protocol support, not an entitlement: a
+subscription model is usable only when the active account's catalog returns it
+as picker-visible. Rows requiring a newer client version or an unknown tool
+mode are hidden rather than exposed optimistically.
 
 ## Environment isolation
 

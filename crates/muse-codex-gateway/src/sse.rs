@@ -148,13 +148,24 @@ impl State {
             match inspect_frame(&frame) {
                 Ok(FrameDisposition::Keep(event)) => {
                     self.observe(&event);
-                    if matches!(event.kind.as_str(), "error" | "response.failed") {
+                    if matches!(
+                        event.kind.as_str(),
+                        "error" | "response.failed" | "response.cancelled"
+                    ) {
                         // Provider error messages can echo request or account
                         // data. Replace both supported failure shapes with a
                         // complete static terminal event, retaining only the
                         // small code/parameter allowlist Muse needs for error
                         // handling and compaction.
-                        let failure = sanitize_stream_failure(&event.value);
+                        let failure = if event.kind == "response.cancelled" {
+                            SanitizedStreamFailure {
+                                code: "invalid_request",
+                                message: "The Codex stream was cancelled; the request was not replayed and the session is resumable.",
+                                parameter: None,
+                            }
+                        } else {
+                            sanitize_stream_failure(&event.value)
+                        };
                         let frame = failure_frame(
                             self.response_id.as_deref(),
                             self.model.as_deref(),
@@ -345,6 +356,16 @@ fn validate_event_shape(kind: &str, value: &Value) -> Result<(), &'static str> {
             .ok_or("upstream response lifecycle event had no valid response id")?;
     }
 
+    if kind == "response.cancelled" {
+        value
+            .get("response")
+            .and_then(|response| response.get("id"))
+            .or_else(|| value.get("response_id"))
+            .and_then(Value::as_str)
+            .filter(|id| safe_protocol_identifier(id))
+            .ok_or("upstream response cancellation event had no valid response id")?;
+    }
+
     if matches!(
         kind,
         "response.output_text.delta"
@@ -480,12 +501,15 @@ fn json_string_or_first(value: &Value) -> Option<&str> {
 fn is_terminal_event(kind: &str) -> bool {
     matches!(
         kind,
-        "response.completed" | "response.failed" | "response.incomplete"
+        "response.completed" | "response.failed" | "response.incomplete" | "response.cancelled"
     )
 }
 
 fn is_metadata_event(kind: &str) -> bool {
-    matches!(kind, "response.metadata" | "codex.rate_limits")
+    matches!(
+        kind,
+        "response.metadata" | "codex.response.metadata" | "codex.rate_limits"
+    )
 }
 
 fn is_known_event(kind: &str) -> bool {
@@ -498,6 +522,7 @@ fn is_known_event(kind: &str) -> bool {
             | "response.completed"
             | "response.failed"
             | "response.incomplete"
+            | "response.cancelled"
             | "response.output_item.added"
             | "response.output_item.done"
             | "response.content_part.added"
@@ -741,10 +766,14 @@ mod tests {
     #[tokio::test]
     async fn rejects_unknown_non_metadata_event_but_drops_metadata() {
         let input = format!(
-            "{}{}{}",
+            "{}{}{}{}",
             event(
                 "response.metadata",
                 ",\"metadata\":{\"future_secret\":\"must-not-cross\"}",
+            ),
+            event(
+                "codex.response.metadata",
+                ",\"metadata\":{\"backend_secret\":\"must-not-cross-either\"}",
             ),
             event("response.future_mutation", ",\"secret\":\"not reflected\""),
             event(
@@ -757,6 +786,7 @@ mod tests {
                 .unwrap();
         assert!(!output.contains("response.metadata"));
         assert!(!output.contains("must-not-cross"));
+        assert!(!output.contains("backend_secret"));
         assert!(!output.contains("response.future_mutation"));
         assert!(!output.contains("not reflected"));
         assert!(output.contains("muse_codex_protocol_error"));
@@ -817,6 +847,27 @@ mod tests {
         let input = format!("{completed}this must not be forwarded");
         let output = collect(validated_stream(body(vec![Ok(Bytes::from(input))]))).await;
         assert_eq!(output, completed.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn response_cancelled_is_translated_to_a_resumable_failure() {
+        let cancelled = event(
+            "response.cancelled",
+            ",\"sequence_number\":5,\"response_id\":\"resp-cancelled\"",
+        );
+        let input = format!(
+            "{cancelled}{}",
+            event(
+                "response.output_text.delta",
+                ",\"sequence_number\":6,\"delta\":\"must not cross\"",
+            )
+        );
+        let output = collect(validated_stream(body(vec![Ok(Bytes::from(input))]))).await;
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("event: response.failed"));
+        assert!(output.contains("\"id\":\"resp-cancelled\""));
+        assert!(output.contains("stream was cancelled"));
+        assert!(!output.contains("must not cross"));
     }
 
     #[tokio::test]

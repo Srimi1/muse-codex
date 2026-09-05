@@ -1,7 +1,11 @@
 use crate::Error;
 use crate::Result;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
 use codex_login::AuthCredentialsStoreMode;
+use codex_login::AuthKeyringBackendKind;
 use codex_login::AuthManager;
+use codex_login::AuthRouteConfig;
 use codex_login::CLIENT_ID;
 use codex_login::ServerOptions;
 use secrecy::ExposeSecret;
@@ -125,7 +129,10 @@ impl AuthConfig {
             self.home.clone(),
             /* enable_codex_api_key_env */ false,
             AuthCredentialsStoreMode::Keyring,
+            /* forced_chatgpt_workspace_id */ None,
             /* chatgpt_base_url */ None,
+            AuthKeyringBackendKind::Direct,
+            auth_route_config(),
         )
         .await
     }
@@ -136,8 +143,16 @@ impl AuthConfig {
             CLIENT_ID.to_string(),
             /* forced_chatgpt_workspace_id */ None,
             AuthCredentialsStoreMode::Keyring,
+            AuthKeyringBackendKind::Direct,
+            auth_route_config(),
         )
     }
+}
+
+fn auth_route_config() -> AuthRouteConfig {
+    AuthRouteConfig::from_http_client_factory(HttpClientFactory::new(
+        OutboundProxyPolicy::ReqwestDefault,
+    ))
 }
 
 fn dedicated_root(home: &Path) -> Result<&Path> {
@@ -322,9 +337,14 @@ where
 }
 
 pub async fn logout(config: &AuthConfig) -> Result<bool> {
-    codex_login::logout_with_revoke(config.home(), AuthCredentialsStoreMode::Keyring)
-        .await
-        .map_err(Error::from)
+    codex_login::logout_with_revoke(
+        config.home(),
+        AuthCredentialsStoreMode::Keyring,
+        AuthKeyringBackendKind::Direct,
+        &auth_route_config(),
+    )
+    .await
+    .map_err(Error::from)
 }
 
 pub fn set_api_key(config: &AuthConfig, api_key: SecretString) -> Result<()> {
@@ -333,6 +353,7 @@ pub fn set_api_key(config: &AuthConfig, api_key: SecretString) -> Result<()> {
         config.home(),
         api_key.expose_secret(),
         AuthCredentialsStoreMode::Keyring,
+        AuthKeyringBackendKind::Direct,
     )
     .map_err(Error::from)
 }

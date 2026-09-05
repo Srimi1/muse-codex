@@ -17,6 +17,8 @@ impl IntoProtocol<ImageDetail> for CodeModeImageDetail {
     fn into_protocol(self) -> ImageDetail {
         let value = self;
         match value {
+            CodeModeImageDetail::Auto => ImageDetail::Auto,
+            CodeModeImageDetail::Low => ImageDetail::Low,
             CodeModeImageDetail::High => ImageDetail::High,
             CodeModeImageDetail::Original => ImageDetail::Original,
         }
@@ -39,6 +41,9 @@ impl IntoProtocol<FunctionCallOutputContentItem>
                         .map(IntoProtocol::into_protocol)
                         .or(Some(DEFAULT_IMAGE_DETAIL)),
                 }
+            }
+            codex_code_mode::FunctionCallOutputContentItem::InputAudio { audio_url } => {
+                FunctionCallOutputContentItem::InputAudio { audio_url }
             }
         }
     }

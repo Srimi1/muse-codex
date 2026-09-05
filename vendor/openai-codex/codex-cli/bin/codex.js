@@ -2,7 +2,7 @@
 // Unified entry point for the Codex CLI.
 
 import { spawn } from "node:child_process";
-import { existsSync, realpathSync } from "fs";
+import { existsSync, readFileSync, realpathSync } from "fs";
 import { createRequire } from "node:module";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -11,6 +11,7 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const require = createRequire(import.meta.url);
+const codexPackageRoot = realpathSync(path.join(__dirname, ".."));
 
 const PLATFORM_PACKAGE_BY_TARGET = {
   "x86_64-unknown-linux-musl": "@openai/codex-linux-x64",
@@ -75,56 +76,40 @@ if (!platformPackage) {
   throw new Error(`Unsupported target triple: ${targetTriple}`);
 }
 
-const codexBinaryName = process.platform === "win32" ? "codex.exe" : "codex";
-const localVendorRoot = path.join(__dirname, "..", "vendor");
-const packageBinaryPath = (vendorRoot) =>
-  path.join(vendorRoot, targetTriple, "bin", codexBinaryName);
-const legacyBinaryPath = (vendorRoot) =>
-  path.join(vendorRoot, targetTriple, "codex", codexBinaryName);
-
-function resolveNativePackage(vendorRoot) {
-  const packageRoot = path.join(vendorRoot, targetTriple);
-  const binaryPath = packageBinaryPath(vendorRoot);
-  if (existsSync(binaryPath)) {
-    return {
-      binaryPath,
-      pathDir: path.join(packageRoot, "codex-path"),
-    };
+function findCodexExecutable() {
+  let vendorRoot;
+  try {
+    const packageJsonPath = require.resolve(`${platformPackage}/package.json`);
+    vendorRoot = path.join(path.dirname(packageJsonPath), "vendor");
+  } catch {
+    vendorRoot = path.join(__dirname, "..", "vendor");
   }
 
-  const legacyPath = legacyBinaryPath(vendorRoot);
-  if (existsSync(legacyPath)) {
-    return {
-      binaryPath: legacyPath,
-      pathDir: path.join(packageRoot, "path"),
-    };
-  }
-
-  return null;
-}
-
-let nativePackage;
-try {
-  const packageJsonPath = require.resolve(`${platformPackage}/package.json`);
-  nativePackage = resolveNativePackage(
-    path.join(path.dirname(packageJsonPath), "vendor"),
+  const codexExecutable = path.join(
+    vendorRoot,
+    targetTriple,
+    "bin",
+    process.platform === "win32" ? "codex.exe" : "codex",
   );
-} catch {
-  nativePackage = resolveNativePackage(localVendorRoot);
-}
+  if (existsSync(codexExecutable)) {
+    return codexExecutable;
+  }
 
-if (!nativePackage) {
   const packageManager = detectPackageManager();
   const updateCommand =
     packageManager === "bun"
       ? "bun install -g @openai/codex@latest"
-      : "npm install -g @openai/codex@latest";
+      : packageManager === "pnpm"
+        ? "pnpm add -g @openai/codex@latest"
+        : packageManager === "vite-plus"
+          ? "vp install -g @openai/codex@latest"
+          : "npm install -g @openai/codex@latest";
   throw new Error(
     `Missing optional dependency ${platformPackage}. Reinstall Codex: ${updateCommand}`,
   );
 }
 
-const { binaryPath, pathDir } = nativePackage;
+const binaryPath = findCodexExecutable();
 
 // Use an asynchronous spawn instead of spawnSync so that Node is able to
 // respond to signals (e.g. Ctrl-C / SIGINT) while the native binary is
@@ -132,14 +117,57 @@ const { binaryPath, pathDir } = nativePackage;
 // and guarantees that when either the child terminates or the parent
 // receives a fatal signal, both processes exit in a predictable manner.
 
-function getUpdatedPath(newDirs) {
-  const pathSep = process.platform === "win32" ? ";" : ":";
-  const existingPath = process.env.PATH || "";
-  const updatedPath = [
-    ...newDirs,
-    ...existingPath.split(pathSep).filter(Boolean),
-  ].join(pathSep);
-  return updatedPath;
+function isPnpmOwnedCodexInstall(nodeModulesDir) {
+  if (!existsSync(path.join(nodeModulesDir, ".modules.yaml"))) {
+    return false;
+  }
+
+  try {
+    return (
+      realpathSync(path.join(nodeModulesDir, "@openai", "codex")) ===
+      codexPackageRoot
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isVitePlusOwnedCodexInstall(packagesDir) {
+  if (path.basename(packagesDir) !== "packages") {
+    return false;
+  }
+
+  try {
+    const metadata = JSON.parse(
+      readFileSync(path.join(packagesDir, "@openai", "codex.json"), "utf8"),
+    );
+    if (metadata.name !== "@openai/codex") {
+      return false;
+    }
+
+    // Vite+ records the active global installation in packages/@openai/codex.json.
+    // Older installs have no ID or append a #-prefixed ID to the package name;
+    // newer installs put the ID in a subdirectory of the package prefix.
+    const installId = metadata.installId || "";
+    const installDir = installId.startsWith("#")
+      ? path.join(packagesDir, `@openai/codex${installId}`)
+      : path.join(packagesDir, "@openai/codex", installId);
+    for (const nodeModulesDir of [
+      path.join(installDir, "lib", "node_modules"),
+      path.join(installDir, "node_modules"),
+    ]) {
+      const packageRoot = path.join(nodeModulesDir, "@openai", "codex");
+      if (
+        existsSync(packageRoot) &&
+        realpathSync(packageRoot) === codexPackageRoot
+      ) {
+        return true;
+      }
+    }
+  } catch {
+    // Missing or unreadable ownership metadata must not prevent Codex starting.
+  }
+  return false;
 }
 
 /**
@@ -147,6 +175,30 @@ function getUpdatedPath(newDirs) {
  * in order to give the user a hint about how to update it.
  */
 function detectPackageManager() {
+  // Package-manager ownership metadata can be several parents above the package.
+  // Search ancestors of both the canonical package root and lexical entrypoint
+  // because the package manager may link either path.
+  const entrypointDir = path.dirname(path.resolve(process.argv[1]));
+  for (const startDir of new Set([codexPackageRoot, entrypointDir])) {
+    const filesystemRoot = path.parse(startDir).root;
+    for (
+      let currentDir = startDir;
+      currentDir !== filesystemRoot;
+      currentDir = path.dirname(currentDir)
+    ) {
+      if (isVitePlusOwnedCodexInstall(currentDir)) {
+        return "vite-plus";
+      }
+      if (isPnpmOwnedCodexInstall(path.join(currentDir, "node_modules"))) {
+        return "pnpm";
+      }
+    }
+
+    if (isPnpmOwnedCodexInstall(path.join(filesystemRoot, "node_modules"))) {
+      return "pnpm";
+    }
+  }
+
   const userAgent = process.env.npm_config_user_agent || "";
   if (/\bbun\//.test(userAgent)) {
     return "bun";
@@ -167,19 +219,24 @@ function detectPackageManager() {
   return userAgent ? "npm" : null;
 }
 
-const additionalDirs = [];
-if (existsSync(pathDir)) {
-  additionalDirs.push(pathDir);
-}
-const updatedPath = getUpdatedPath(additionalDirs);
-
-const env = { ...process.env, PATH: updatedPath };
+const packageManager = detectPackageManager();
 const packageManagerEnvVar =
-  detectPackageManager() === "bun"
+  packageManager === "bun"
     ? "CODEX_MANAGED_BY_BUN"
-    : "CODEX_MANAGED_BY_NPM";
+    : packageManager === "pnpm"
+      ? "CODEX_MANAGED_BY_PNPM"
+      : packageManager === "vite-plus"
+        ? "CODEX_MANAGED_BY_VITE_PLUS"
+        : "CODEX_MANAGED_BY_NPM";
+const env = {
+  ...process.env,
+  CODEX_MANAGED_PACKAGE_ROOT: codexPackageRoot,
+};
+delete env.CODEX_MANAGED_BY_NPM;
+delete env.CODEX_MANAGED_BY_BUN;
+delete env.CODEX_MANAGED_BY_PNPM;
+delete env.CODEX_MANAGED_BY_VITE_PLUS;
 env[packageManagerEnvVar] = "1";
-env.CODEX_MANAGED_PACKAGE_ROOT = realpathSync(path.join(__dirname, ".."));
 
 const child = spawn(binaryPath, process.argv.slice(2), {
   stdio: "inherit",

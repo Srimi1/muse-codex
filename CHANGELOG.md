@@ -11,8 +11,19 @@ All notable project changes will be documented here. The format follows
 - Initial Rust launcher, loopback compatibility gateway, and transport layer.
 - Isolated ChatGPT and OpenAI API-key authentication flows.
 - Deterministic model, streaming, error, cancellation, and launcher fixtures.
+- Authenticated catalog fixtures for GPT-6 Astra and GPT-5.6 Sol, Terra, and
+  Luna, without granting or fabricating model entitlements.
 - Signed private-release manifest and installer tooling.
 - Project branding, community standards, support policy, and GitHub templates.
+
+### Changed
+
+- Repin the vendored OpenAI Codex client from `rust-v0.133.0` to
+  `rust-v0.153.4` (`3d2ee51ca2d5db578f328aa75e20aa22c0197c9a`) and move source builds to
+  Rust `1.95.0`.
+- Use the authenticated catalog's minimum-client version, visibility,
+  modalities, reasoning efforts, tool mode, and Responses Lite flag to decide
+  which models are offered and how requests are encoded.
 
 ### Fixed
 
@@ -28,6 +39,8 @@ All notable project changes will be documented here. The format follows
   handshake with actionable login, Keychain, endpoint, and network guidance.
 - Normalize complete Muse history into stateless Codex Responses requests,
   including message content, reasoning, parallel tool calls, and results.
+- Encode the Responses Lite request contract used by current Codex models while
+  keeping Muse in control of history, tools, approvals, and follow-up turns.
 - Restore namespaced tool-call fields when replaying Muse's flattened history,
   fixing rejection of the request immediately after a successful tool call.
 - Translate MSP provider fields without modifying opaque payloads or the
@@ -43,6 +56,8 @@ All notable project changes will be documented here. The format follows
   stock raw-catalog decoder to discard otherwise valid models.
 - Allow slow authenticated catalog discovery to finish within a bounded
   startup handshake and provide actionable authentication guidance on failure.
+- Treat `response.cancelled` as terminal, drop known
+  `codex.response.metadata`, and continue to reject unknown non-metadata events.
 
 ### Security
 

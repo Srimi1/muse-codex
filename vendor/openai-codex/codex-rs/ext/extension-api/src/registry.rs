@@ -2,46 +2,49 @@ use std::sync::Arc;
 
 use codex_protocol::protocol::ReviewDecision;
 
+use crate::ApprovalAssessment;
 use crate::ApprovalReviewContributor;
+use crate::ApprovalReviewError;
+use crate::ApprovalReviewInput;
 use crate::ConfigContributor;
 use crate::ContextContributor;
 use crate::ExtensionData;
 use crate::ExtensionEventSink;
+use crate::ExtensionMetrics;
+use crate::McpServerContributor;
 use crate::NoopExtensionEventSink;
+use crate::SkillInvocationContributor;
 use crate::ThreadLifecycleContributor;
 use crate::TokenUsageContributor;
 use crate::ToolContributor;
 use crate::ToolLifecycleContributor;
+use crate::TurnInputContributor;
 use crate::TurnItemContributor;
 use crate::TurnLifecycleContributor;
 
 /// Mutable registry used while hosts register typed runtime contributions.
 pub struct ExtensionRegistryBuilder<C: Sync> {
-    event_sink: Arc<dyn ExtensionEventSink>,
-    thread_lifecycle_contributors: Vec<Arc<dyn ThreadLifecycleContributor<C>>>,
-    turn_lifecycle_contributors: Vec<Arc<dyn TurnLifecycleContributor>>,
-    config_contributors: Vec<Arc<dyn ConfigContributor<C>>>,
-    token_usage_contributors: Vec<Arc<dyn TokenUsageContributor>>,
-    context_contributors: Vec<Arc<dyn ContextContributor>>,
-    tool_contributors: Vec<Arc<dyn ToolContributor>>,
-    tool_lifecycle_contributors: Vec<Arc<dyn ToolLifecycleContributor>>,
-    turn_item_contributors: Vec<Arc<dyn TurnItemContributor>>,
-    approval_review_contributors: Vec<Arc<dyn ApprovalReviewContributor>>,
+    registry: ExtensionRegistry<C>,
 }
 
 impl<C: Sync> Default for ExtensionRegistryBuilder<C> {
     fn default() -> Self {
         Self {
-            event_sink: Arc::new(NoopExtensionEventSink),
-            thread_lifecycle_contributors: Vec::new(),
-            turn_lifecycle_contributors: Vec::new(),
-            config_contributors: Vec::new(),
-            token_usage_contributors: Vec::new(),
-            approval_review_contributors: Vec::new(),
-            context_contributors: Vec::new(),
-            tool_contributors: Vec::new(),
-            tool_lifecycle_contributors: Vec::new(),
-            turn_item_contributors: Vec::new(),
+            registry: ExtensionRegistry {
+                event_sink: Arc::new(NoopExtensionEventSink),
+                thread_lifecycle_contributors: Vec::new(),
+                turn_lifecycle_contributors: Vec::new(),
+                config_contributors: Vec::new(),
+                token_usage_contributors: Vec::new(),
+                skill_invocation_contributors: Vec::new(),
+                approval_review_contributors: Vec::new(),
+                context_contributors: Vec::new(),
+                mcp_server_contributors: Vec::new(),
+                turn_input_contributors: Vec::new(),
+                tool_contributors: Vec::new(),
+                tool_lifecycle_contributors: Vec::new(),
+                turn_item_contributors: Vec::new(),
+            },
         }
     }
 }
@@ -54,20 +57,19 @@ impl<C: Sync> ExtensionRegistryBuilder<C> {
 
     /// Creates an empty registry builder with a host-provided event sink.
     pub fn with_event_sink(event_sink: Arc<dyn ExtensionEventSink>) -> Self {
-        Self {
-            event_sink,
-            ..Self::default()
-        }
+        let mut builder = Self::default();
+        builder.registry.event_sink = event_sink;
+        builder
     }
 
     /// Returns the host event sink to pass into extension constructors.
     pub fn event_sink(&self) -> Arc<dyn ExtensionEventSink> {
-        Arc::clone(&self.event_sink)
+        Arc::clone(&self.registry.event_sink)
     }
 
     /// Registers one approval-review contributor.
     pub fn approval_review_contributor(&mut self, contributor: Arc<dyn ApprovalReviewContributor>) {
-        self.approval_review_contributors.push(contributor);
+        self.registry.approval_review_contributors.push(contributor);
     }
 
     /// Registers one thread-lifecycle contributor.
@@ -75,58 +77,69 @@ impl<C: Sync> ExtensionRegistryBuilder<C> {
         &mut self,
         contributor: Arc<dyn ThreadLifecycleContributor<C>>,
     ) {
-        self.thread_lifecycle_contributors.push(contributor);
+        self.registry
+            .thread_lifecycle_contributors
+            .push(contributor);
     }
 
     /// Registers one turn-lifecycle contributor.
     pub fn turn_lifecycle_contributor(&mut self, contributor: Arc<dyn TurnLifecycleContributor>) {
-        self.turn_lifecycle_contributors.push(contributor);
+        self.registry.turn_lifecycle_contributors.push(contributor);
     }
 
     /// Registers one config contributor.
     pub fn config_contributor(&mut self, contributor: Arc<dyn ConfigContributor<C>>) {
-        self.config_contributors.push(contributor);
+        self.registry.config_contributors.push(contributor);
     }
 
     /// Registers one token-usage contributor.
     pub fn token_usage_contributor(&mut self, contributor: Arc<dyn TokenUsageContributor>) {
-        self.token_usage_contributors.push(contributor);
+        self.registry.token_usage_contributors.push(contributor);
+    }
+
+    /// Registers one skill-invocation contributor.
+    pub fn skill_invocation_contributor(
+        &mut self,
+        contributor: Arc<dyn SkillInvocationContributor>,
+    ) {
+        self.registry
+            .skill_invocation_contributors
+            .push(contributor);
     }
 
     /// Registers one prompt contributor.
     pub fn prompt_contributor(&mut self, contributor: Arc<dyn ContextContributor>) {
-        self.context_contributors.push(contributor);
+        self.registry.context_contributors.push(contributor);
+    }
+
+    /// Registers one runtime MCP server contributor.
+    pub fn mcp_server_contributor(&mut self, contributor: Arc<dyn McpServerContributor<C>>) {
+        self.registry.mcp_server_contributors.push(contributor);
+    }
+
+    /// Registers one turn-input contributor.
+    pub fn turn_input_contributor(&mut self, contributor: Arc<dyn TurnInputContributor>) {
+        self.registry.turn_input_contributors.push(contributor);
     }
 
     /// Registers one native tool contributor.
     pub fn tool_contributor(&mut self, contributor: Arc<dyn ToolContributor>) {
-        self.tool_contributors.push(contributor);
+        self.registry.tool_contributors.push(contributor);
     }
 
     /// Registers one tool-lifecycle contributor.
     pub fn tool_lifecycle_contributor(&mut self, contributor: Arc<dyn ToolLifecycleContributor>) {
-        self.tool_lifecycle_contributors.push(contributor);
+        self.registry.tool_lifecycle_contributors.push(contributor);
     }
 
     /// Registers one ordered turn-item contributor.
     pub fn turn_item_contributor(&mut self, contributor: Arc<dyn TurnItemContributor>) {
-        self.turn_item_contributors.push(contributor);
+        self.registry.turn_item_contributors.push(contributor);
     }
 
     /// Finishes construction and returns the immutable registry.
     pub fn build(self) -> ExtensionRegistry<C> {
-        ExtensionRegistry {
-            event_sink: self.event_sink,
-            thread_lifecycle_contributors: self.thread_lifecycle_contributors,
-            turn_lifecycle_contributors: self.turn_lifecycle_contributors,
-            config_contributors: self.config_contributors,
-            token_usage_contributors: self.token_usage_contributors,
-            approval_review_contributors: self.approval_review_contributors,
-            context_contributors: self.context_contributors,
-            tool_contributors: self.tool_contributors,
-            tool_lifecycle_contributors: self.tool_lifecycle_contributors,
-            turn_item_contributors: self.turn_item_contributors,
-        }
+        self.registry
     }
 }
 
@@ -137,7 +150,10 @@ pub struct ExtensionRegistry<C: Sync> {
     turn_lifecycle_contributors: Vec<Arc<dyn TurnLifecycleContributor>>,
     config_contributors: Vec<Arc<dyn ConfigContributor<C>>>,
     token_usage_contributors: Vec<Arc<dyn TokenUsageContributor>>,
+    skill_invocation_contributors: Vec<Arc<dyn SkillInvocationContributor>>,
     context_contributors: Vec<Arc<dyn ContextContributor>>,
+    mcp_server_contributors: Vec<Arc<dyn McpServerContributor<C>>>,
+    turn_input_contributors: Vec<Arc<dyn TurnInputContributor>>,
     tool_contributors: Vec<Arc<dyn ToolContributor>>,
     tool_lifecycle_contributors: Vec<Arc<dyn ToolLifecycleContributor>>,
     turn_item_contributors: Vec<Arc<dyn TurnItemContributor>>,
@@ -170,17 +186,52 @@ impl<C: Sync> ExtensionRegistry<C> {
         &self.token_usage_contributors
     }
 
-    /// Claims the first rendered approval-review prompt accepted by an
-    /// installed contributor.
-    pub async fn approval_review(
+    /// Returns the registered skill-invocation contributors.
+    pub fn skill_invocation_contributors(&self) -> &[Arc<dyn SkillInvocationContributor>] {
+        &self.skill_invocation_contributors
+    }
+
+    /// Whether any installed skill contributor needs a snapshot of host-owned skills.
+    ///
+    /// Registries without skill contributors retain legacy host discovery behavior.
+    pub fn requires_host_skill_discovery(&self) -> bool {
+        self.skill_invocation_contributors.is_empty()
+            || self
+                .skill_invocation_contributors
+                .iter()
+                .any(|contributor| contributor.requires_host_skill_discovery())
+    }
+
+    /// Returns the first full approval assessment claimed by a contributor.
+    pub async fn full_approval_review(
+        &self,
+        input: ApprovalReviewInput<'_>,
+    ) -> Option<Result<ApprovalAssessment, ApprovalReviewError>> {
+        for contributor in &self.approval_review_contributors {
+            if let Some(assessment) = contributor.full_review(&input).await {
+                return Some(assessment);
+            }
+        }
+
+        None
+    }
+
+    /// Returns the first fast approval decision claimed by a contributor.
+    pub async fn fast_approval_decision(
         &self,
         session_store: &ExtensionData,
         thread_store: &ExtensionData,
         prompt: &str,
+        extension_metrics: Option<Arc<dyn ExtensionMetrics>>,
     ) -> Option<ReviewDecision> {
         for contributor in &self.approval_review_contributors {
             if let Some(decision) = contributor
-                .contribute(session_store, thread_store, prompt)
+                .fast_decision(
+                    session_store,
+                    thread_store,
+                    prompt,
+                    extension_metrics.clone(),
+                )
                 .await
             {
                 return Some(decision);
@@ -193,6 +244,16 @@ impl<C: Sync> ExtensionRegistry<C> {
     /// Returns the registered prompt contributors.
     pub fn context_contributors(&self) -> &[Arc<dyn ContextContributor>] {
         &self.context_contributors
+    }
+
+    /// Returns the registered runtime MCP server contributors.
+    pub fn mcp_server_contributors(&self) -> &[Arc<dyn McpServerContributor<C>>] {
+        &self.mcp_server_contributors
+    }
+
+    /// Returns the registered turn-input contributors.
+    pub fn turn_input_contributors(&self) -> &[Arc<dyn TurnInputContributor>] {
+        &self.turn_input_contributors
     }
 
     /// Returns the registered native tool contributors.

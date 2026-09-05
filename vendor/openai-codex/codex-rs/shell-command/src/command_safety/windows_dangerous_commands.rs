@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use once_cell::sync::Lazy;
 use regex::Regex;
 use shlex::split as shlex_split;
@@ -315,9 +313,10 @@ fn looks_like_url(token: &str) -> bool {
         Lazy::new(|| Regex::new(r#"^[ "'\(\s]*([^\s"'\);]+)[\s;\)]*$"#).ok());
     // If the token embeds a URL alongside other text (e.g., Start-Process('https://...'))
     // as a single shlex token, grab the substring starting at the first URL prefix.
-    let urlish = token
+    let lowercase_token = token.to_ascii_lowercase();
+    let urlish = lowercase_token
         .find("https://")
-        .or_else(|| token.find("http://"))
+        .or_else(|| lowercase_token.find("http://"))
         .map(|idx| &token[idx..])
         .unwrap_or(token);
 
@@ -334,10 +333,15 @@ fn looks_like_url(token: &str) -> bool {
 }
 
 fn executable_basename(exe: &str) -> Option<String> {
-    Path::new(exe)
-        .file_name()
-        .and_then(|osstr| osstr.to_str())
-        .map(str::to_ascii_lowercase)
+    let name = exe
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())?;
+    let name = match name.as_bytes() {
+        [drive, b':', ..] if drive.is_ascii_alphabetic() => &name[2..],
+        _ => name,
+    };
+    (!name.is_empty()).then(|| name.to_ascii_lowercase())
 }
 
 fn is_powershell_executable(exe: &str) -> bool {
@@ -432,6 +436,19 @@ mod tests {
             "-Command",
             "Start-Process('https://example.com');"
         ])));
+    }
+
+    #[test]
+    fn powershell_start_process_mixed_case_urls_are_dangerous() {
+        for script in [
+            "Start-Process('HTTP://example.com');",
+            "Start-Process('hTtPs://example.com');",
+        ] {
+            assert!(
+                is_dangerous_command_windows(&vec_str(&["powershell", "-Command", script])),
+                "{script}"
+            );
+        }
     }
 
     #[test]

@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import sys
 import tarfile
 import urllib.error
@@ -10,8 +11,21 @@ from pathlib import Path
 
 import pytest
 import tomllib
+from pydantic import ValidationError
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_root_format_script_module():
+    """Load the root formatter driver so tests exercise its real command graph."""
+    script_path = ROOT.parents[1] / "scripts" / "format.py"
+    spec = importlib.util.spec_from_file_location("format_repo", script_path)
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"Failed to load script module: {script_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _load_update_script_module():
@@ -38,12 +52,25 @@ def _load_runtime_setup_module():
     return module
 
 
+def _load_release_version_module():
+    """Load the shared release-version conversions used by release tooling."""
+    script_path = ROOT / "release_version.py"
+    spec = importlib.util.spec_from_file_location("release_version", script_path)
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"Failed to load release-version module: {script_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def _write_fake_codex_package(package_dir: Path, script) -> Path:
     (package_dir / "bin").mkdir(parents=True)
     (package_dir / "codex-resources").mkdir()
     (package_dir / "codex-path").mkdir()
     (package_dir / "codex-package.json").write_text('{"variant":"codex"}\n')
     (package_dir / "bin" / script.runtime_binary_name()).write_text("fake codex\n")
+    (package_dir / "bin" / script.runtime_code_mode_host_name()).write_text("fake code mode host\n")
     (package_dir / "codex-resources" / "bwrap").write_text("fake bwrap\n")
     (package_dir / "codex-path" / "rg").write_text("fake rg\n")
     return package_dir
@@ -68,37 +95,257 @@ def test_generation_has_single_maintenance_entrypoint_script() -> None:
     assert scripts == ["update_sdk_artifacts.py"]
 
 
-def test_root_fmt_recipe_formats_rust_and_python_sdk() -> None:
-    """The repo fmt command should work from Rust and Python SDK directories."""
+def test_root_fmt_recipes_use_shared_formatter_driver() -> None:
+    """The root formatting recipes should use the shared cross-platform driver."""
     justfile = ROOT.parents[1] / "justfile"
     lines = justfile.read_text().splitlines()
     fmt_index = lines.index("fmt:")
+    fmt_check_index = lines.index("fmt-check:")
     next_recipe_index = next(
         index
-        for index in range(fmt_index + 1, len(lines))
+        for index in range(fmt_check_index + 1, len(lines))
         if lines[index] and not lines[index].startswith((" ", "\t", "#"))
     )
-    fmt_recipe = lines[fmt_index:next_recipe_index]
     actual = {
         "working_directory": lines[0],
-        "previous_attribute": lines[fmt_index - 1],
-        "commands": [line.strip() for line in fmt_recipe[1:] if line.strip()],
+        "fmt_comment": next(line for line in reversed(lines[:fmt_index]) if line.startswith("#")),
+        "fmt_commands": [
+            line.strip()
+            for line in lines[fmt_index + 1 : fmt_check_index]
+            if line.strip() and not line.startswith("#")
+        ],
+        "fmt_check_comment": next(
+            line for line in reversed(lines[:fmt_check_index]) if line.startswith("#")
+        ),
+        "fmt_check_commands": [
+            line.strip() for line in lines[fmt_check_index + 1 : next_recipe_index] if line.strip()
+        ],
     }
     expected = {
         "working_directory": 'set working-directory := "codex-rs"',
-        "previous_attribute": "# Format Rust and Python SDK code.",
-        "commands": [
-            "cargo fmt -- --config imports_granularity=Item 2>/dev/null",
-            "uv run --frozen --project ../sdk/python --extra dev ruff check --fix --fix-only ../sdk/python",
-            "uv run --frozen --project ../sdk/python --extra dev ruff format ../sdk/python",
-        ],
+        "fmt_comment": (
+            "# Format the justfile, Rust, Bazel/Starlark, Python SDK code, and Python scripts."
+        ),
+        "fmt_commands": ["@{{ python }} ../scripts/format.py"],
+        "fmt_check_comment": "# Check formatting without modifying files.",
+        "fmt_check_commands": ["@{{ python }} ../scripts/format.py --check"],
     }
 
     assert actual == expected, (
-        "The root `just fmt` recipe must run Rust fmt and Python SDK Ruff. "
-        "Fix the `fmt` recipe in `justfile`, then run `just fmt`.\n"
+        "The root formatting recipes must use the shared formatter driver. "
+        "Fix the recipes in `justfile`, then run `just fmt`.\n"
         f"Expected: {json.dumps(expected, indent=2)}\n"
         f"Actual: {json.dumps(actual, indent=2)}"
+    )
+
+
+def test_root_format_driver_covers_all_formatter_groups(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The shared driver should retain every formatter in both modes."""
+    script = _load_root_format_script_module()
+    for name in (
+        "bazel/rules/example.rs",
+        "codex-rs/src/lib.rs",
+        "codex-rs/new file.rs",
+    ):
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("")
+    git_ls_files_args = [
+        "git",
+        "ls-files",
+        "-z",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+    ]
+
+    # The Python SDK CI image has no Git; keep discovery mocked at the process boundary.
+    def fake_check_output(args, *, cwd):
+        assert cwd == tmp_path
+        if args == git_ls_files_args + ["--", "*.rs"]:
+            return (
+                b"codex-rs/src/lib.rs\0bazel/rules/example.rs\0"
+                b"codex-rs/new file.rs\0codex-rs/deleted.rs\0"
+            )
+        assert args == git_ls_files_args
+        return b"MODULE.bazel\0README.md\0third_party/v8/libcxx.BUILD.bazel\0"
+
+    monkeypatch.setattr(script, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(script.subprocess, "check_output", fake_check_output)
+    formatters = script.formatter_groups(check=False)
+    checks = script.formatter_groups(check=True)
+
+    assert [group.name for group in formatters] == [
+        "Just",
+        "Rust",
+        "Bazel/Starlark",
+        "Python SDK",
+        "Python scripts",
+    ]
+    assert [group.name for group in checks] == [group.name for group in formatters]
+    assert [len(group.commands) for group in formatters] == [1, 1, 1, 2, 1]
+    assert [len(group.commands) for group in checks] == [
+        len(group.commands) for group in formatters
+    ]
+    sdk_uv_run_args = (
+        "uv",
+        "run",
+        "--frozen",
+        "--project",
+        "sdk/python",
+        "--only-group",
+        "format",
+    )
+    scripts_uv_run_args = (
+        "uv",
+        "run",
+        "--frozen",
+        "--project",
+        "scripts",
+    )
+    assert all(
+        command.args[: len(sdk_uv_run_args)] == sdk_uv_run_args
+        for group in (formatters[3], checks[3])
+        for command in group.commands
+    )
+    assert all(
+        command.args[: len(scripts_uv_run_args)] == scripts_uv_run_args
+        for group in (formatters[4], checks[4])
+        for command in group.commands
+    )
+    assert formatters[3].commands[0].args[-5:] == (
+        "ruff",
+        "check",
+        "--fix",
+        "--fix-only",
+        "sdk/python",
+    )
+    assert checks[3].commands[0].args[-4:] == (
+        "ruff",
+        "check",
+        "--diff",
+        "sdk/python",
+    )
+    assert formatters[0].commands[-1].args == ("just", "--unstable", "--fmt")
+    assert checks[0].commands[-1].args == ("just", "--unstable", "--fmt", "--check")
+    rustfmt_args = (
+        "rustfmt",
+        "--edition",
+        "2024",
+        "--config-path",
+        str(tmp_path / "codex-rs/rustfmt.toml"),
+        "--config",
+        "imports_granularity=Item,skip_children=true",
+    )
+    rust_files = (
+        os.path.join("..", "bazel", "rules", "example.rs"),
+        "new file.rs",
+        os.path.join("src", "lib.rs"),
+    )
+    assert formatters[1].commands == (
+        script.Command(rustfmt_args + rust_files, tmp_path / "codex-rs"),
+    )
+    assert checks[1].commands == (
+        script.Command(rustfmt_args + ("--check",) + rust_files, tmp_path / "codex-rs"),
+    )
+    format_buildifier_args = formatters[2].commands[-1].args
+    check_buildifier_args = checks[2].commands[-1].args
+    assert format_buildifier_args[:4] == (
+        "dotslash",
+        str(script.REPO_ROOT / "tools" / "buildifier"),
+        "-mode=fix",
+        "-lint=off",
+    )
+    assert check_buildifier_args[:4] == (
+        "dotslash",
+        str(script.REPO_ROOT / "tools" / "buildifier"),
+        "-mode=check",
+        "-lint=off",
+    )
+    assert format_buildifier_args[4:] == check_buildifier_args[4:]
+    assert format_buildifier_args[4:] == (
+        "MODULE.bazel",
+        "third_party/v8/libcxx.BUILD.bazel",
+    )
+    assert [group.commands[-1].args[-3:] for group in formatters[3:]] == [
+        ("ruff", "format", "sdk/python"),
+        ("ruff", "format", "."),
+    ]
+    assert [group.commands[-1].args[-4:] for group in checks[3:]] == [
+        ("ruff", "format", "--check", "sdk/python"),
+        ("ruff", "format", "--check", "."),
+    ]
+
+
+def test_root_format_driver_discards_successful_command_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = _load_root_format_script_module()
+    processes = iter(
+        (
+            script.subprocess.CompletedProcess(("first",), 0, "routine output\n"),
+            script.subprocess.CompletedProcess(("second",), 2, "failure output\n"),
+        )
+    )
+    monkeypatch.setattr(script.subprocess, "run", lambda *args, **kwargs: next(processes))
+    group = script.FormatterGroup(
+        "Test",
+        (script.Command(("first",)), script.Command(("second",))),
+    )
+
+    assert script.run_formatter_group(group) == script.FormatterResult(
+        "Test",
+        "$ second\nfailure output\n",
+        2,
+    )
+
+
+def test_root_format_driver_is_silent_when_all_formatters_succeed(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    script = _load_root_format_script_module()
+    groups = (script.FormatterGroup("Quiet", ()),)
+    monkeypatch.setattr(script, "formatter_groups", lambda *, check: groups)
+    monkeypatch.setattr(
+        script,
+        "run_formatter_group",
+        lambda group: script.FormatterResult(group.name, "hidden output\n", 0),
+    )
+    monkeypatch.setattr(sys, "argv", ["format.py"])
+
+    assert script.main() == 0
+    captured = capsys.readouterr()
+    assert (captured.out, captured.err) == ("", "")
+
+
+def test_root_format_driver_reports_only_failed_formatters(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    script = _load_root_format_script_module()
+    groups = (
+        script.FormatterGroup("Quiet", ()),
+        script.FormatterGroup("Broken", ()),
+    )
+    monkeypatch.setattr(script, "formatter_groups", lambda *, check: groups)
+
+    def fake_run(group):
+        if group.name == "Broken":
+            return script.FormatterResult(group.name, "$ broken\nfailure output\n", 2)
+        return script.FormatterResult(group.name, "hidden output\n", 0)
+
+    monkeypatch.setattr(script, "run_formatter_group", fake_run)
+    monkeypatch.setattr(sys, "argv", ["format.py"])
+
+    assert script.main() == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        "==> Broken formatter failed\n$ broken\nfailure output\nFormatting failed: Broken\n"
     )
 
 
@@ -151,16 +398,44 @@ def test_schema_normalization_only_flattens_string_literal_oneofs(
         if isinstance(definition, dict) and script._flatten_string_enum_one_of(definition.copy())
     ]
 
-    assert flattened == [
-        "MessagePhase",
-        "TurnItemsView",
-        "PluginAvailability",
+    assert sorted(flattened) == [
         "AuthMode",
-        "InputModality",
-        "ExperimentalFeatureStage",
+        "AutoCompactTokenLimitScope",
         "CommandExecOutputStream",
+        "ConsumeAccountRateLimitResetCreditOutcome",
+        "ExperimentalFeatureStage",
+        "InputModality",
+        "MessagePhase",
+        "PluginAvailability",
         "ProcessOutputStream",
+        "TurnItemsView",
     ]
+
+
+def test_schema_normalization_makes_chatgpt_account_email_nullable() -> None:
+    script = _load_update_script_module()
+    schema = {
+        "definitions": {
+            "Account": {
+                "oneOf": [
+                    {
+                        "properties": {
+                            "email": {"type": "string"},
+                            "type": {"enum": ["chatgpt"], "type": "string"},
+                        },
+                        "required": ["email", "type"],
+                        "type": "object",
+                    }
+                ]
+            }
+        }
+    }
+
+    script._make_chatgpt_account_email_nullable(schema)
+
+    chatgpt_account = schema["definitions"]["Account"]["oneOf"][0]
+    assert chatgpt_account["properties"]["email"]["type"] == ["string", "null"]
+    assert "email" in chatgpt_account["required"]
 
 
 def test_python_codegen_schema_annotation_adds_stable_variant_titles(
@@ -207,6 +482,17 @@ def test_generate_v2_all_uses_titles_for_generated_names() -> None:
     assert "ruff-format" in source
 
 
+def test_generated_chatgpt_account_email_is_required_nullable() -> None:
+    from openai_codex.generated.v2_all import ChatgptAccount
+
+    account = ChatgptAccount.model_validate({"email": None, "planType": "pro", "type": "chatgpt"})
+    assert account.email is None
+    assert ChatgptAccount.model_fields["email"].is_required()
+
+    with pytest.raises(ValidationError):
+        ChatgptAccount.model_validate({"planType": "pro", "type": "chatgpt"})
+
+
 def test_runtime_package_template_has_no_checked_in_binaries() -> None:
     runtime_root = ROOT.parent / "python-runtime" / "src" / "codex_cli_bin"
     assert sorted(
@@ -239,22 +525,45 @@ def test_runtime_distribution_name_is_consistent() -> None:
     )
 
 
-def test_source_sdk_package_pins_published_runtime() -> None:
-    """The source package metadata should pin the runtime wheel that ships schemas."""
+def test_source_sdk_template_pins_published_runtime() -> None:
+    """The source template should carry a development version and reviewed runtime pin."""
     script = _load_update_script_module()
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
 
     assert {
-        "sdk_version": pyproject["project"]["version"],
+        "sdk_template_version": pyproject["project"]["version"],
         "runtime_pin": script.pinned_runtime_version(),
         "dependencies": pyproject["project"]["dependencies"],
     } == {
-        "sdk_version": "0.131.0a4",
-        "runtime_pin": "0.131.0a4",
+        "sdk_template_version": "0.0.0-dev",
+        "runtime_pin": "0.147.0",
         "dependencies": [
             "pydantic>=2.12",
-            "openai-codex-cli-bin==0.131.0a4",
+            "openai-codex-cli-bin==0.147.0",
         ],
+    }
+
+
+def test_source_sdk_package_declares_stable_documentation() -> None:
+    """Public package metadata should link stable docs."""
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    readme = (ROOT / "README.md").read_text()
+
+    assert {
+        "description": pyproject["project"]["description"],
+        "is_stable": "Development Status :: 5 - Production/Stable"
+        in pyproject["project"]["classifiers"],
+        "license": pyproject["project"]["license"],
+        "documentation": pyproject["project"]["urls"]["Documentation"],
+        "readme_is_stable": "# OpenAI Codex Python SDK\n" in readme,
+        "local_license_file": (ROOT / "LICENSE").exists(),
+    } == {
+        "description": "Python SDK for Codex",
+        "is_stable": True,
+        "license": "Apache-2.0",
+        "documentation": "https://github.com/openai/codex/tree/main/sdk/python/docs",
+        "readme_is_stable": True,
+        "local_license_file": False,
     }
 
 
@@ -284,19 +593,32 @@ def test_release_metadata_retries_without_invalid_auth(
     assert authorizations == ["Bearer invalid-token", None]
 
 
-def test_runtime_setup_uses_pep440_package_version_and_codex_release_tags() -> None:
-    """The SDK uses PEP 440 package pins and converts only when fetching releases."""
+def test_runtime_setup_reads_independent_runtime_pin_and_release_tags() -> None:
+    """Runtime package pins remain independent of the SDK template version."""
     runtime_setup = _load_runtime_setup_module()
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
 
-    assert runtime_setup.PACKAGE_NAME == "openai-codex-cli-bin"
-    assert runtime_setup.pinned_runtime_version() == pyproject["project"]["version"]
-    assert (
-        f"{runtime_setup.PACKAGE_NAME}=={pyproject['project']['version']}"
-        in pyproject["project"]["dependencies"]
-    )
-    assert runtime_setup._normalized_package_version("rust-v0.116.0-alpha.1") == "0.116.0a1"
-    assert runtime_setup._release_tag("0.116.0a1") == "rust-v0.116.0-alpha.1"
+    assert {
+        "package_name": runtime_setup.PACKAGE_NAME,
+        "sdk_template_version": pyproject["project"]["version"],
+        "runtime_pin": runtime_setup.pinned_runtime_version(),
+        "normalized_release_version": runtime_setup._normalized_package_version(
+            "rust-v0.116.0-alpha.1"
+        ),
+        "normalized_alpha_hotfix_version": runtime_setup._normalized_package_version(
+            "rust-v0.116.0-alpha.1.2"
+        ),
+        "release_tag": runtime_setup._release_tag("0.116.0a1"),
+        "alpha_hotfix_release_tag": runtime_setup._release_tag("0.116.0a1.post2"),
+    } == {
+        "package_name": "openai-codex-cli-bin",
+        "sdk_template_version": "0.0.0-dev",
+        "runtime_pin": "0.147.0",
+        "normalized_release_version": "0.116.0a1",
+        "normalized_alpha_hotfix_version": "0.116.0a1.post2",
+        "release_tag": "rust-v0.116.0-alpha.1",
+        "alpha_hotfix_release_tag": "rust-v0.116.0-alpha.1.2",
+    }
 
 
 @pytest.mark.parametrize(
@@ -403,11 +725,13 @@ def test_stage_runtime_release_copies_package_layout_and_sets_version(
     assert {
         "metadata": (package_root / "codex-package.json").read_text(),
         "codex": (package_root / "bin" / script.runtime_binary_name()).read_text(),
+        "code_mode_host": (package_root / "bin" / script.runtime_code_mode_host_name()).read_text(),
         "bwrap": (package_root / "codex-resources" / "bwrap").read_text(),
         "rg": (package_root / "codex-path" / "rg").read_text(),
     } == {
         "metadata": '{"variant":"codex"}\n',
         "codex": "fake codex\n",
+        "code_mode_host": "fake code mode host\n",
         "bwrap": "fake bwrap\n",
         "rg": "fake rg\n",
     }
@@ -419,9 +743,52 @@ def test_normalize_codex_version_accepts_release_tags_and_pep440_versions() -> N
     script = _load_update_script_module()
 
     assert script.normalize_codex_version("rust-v0.116.0-alpha.1") == "0.116.0a1"
+    assert script.normalize_codex_version("rust-v0.116.0-alpha.1.2") == "0.116.0a1.post2"
     assert script.normalize_codex_version("v0.116.0-beta.2") == "0.116.0b2"
     assert script.normalize_codex_version("0.116.0rc3") == "0.116.0rc3"
     assert script.normalize_codex_version("0.116.0") == "0.116.0"
+
+
+def test_release_version_conversions_map_python_versions_to_codex_tags() -> None:
+    release_version = _load_release_version_module()
+
+    assert {
+        version: release_version.codex_release_tag(version)
+        for version in ["0.116.0", "0.116.0a1", "0.116.0a1.post2"]
+    } == {
+        "0.116.0": "rust-v0.116.0",
+        "0.116.0a1": "rust-v0.116.0-alpha.1",
+        "0.116.0a1.post2": "rust-v0.116.0-alpha.1.2",
+    }
+
+
+def test_release_version_cli_writes_python_runtime_outputs(tmp_path: Path) -> None:
+    github_output = tmp_path / "github-output"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "release_version.py"),
+            "0.116.0a1.post2",
+            "--github-output",
+            str(github_output),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert {
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "github_output": github_output.read_text(),
+    } == {
+        "returncode": 0,
+        "stdout": "",
+        "stderr": "",
+        "github_output": ("python_version=0.116.0a1.post2\nrelease_tag=rust-v0.116.0-alpha.1.2\n"),
+    }
 
 
 def test_stage_runtime_release_replaces_existing_staging_dir(tmp_path: Path) -> None:
@@ -452,11 +819,11 @@ def test_stage_runtime_release_can_pin_wheel_platform_tag(tmp_path: Path) -> Non
         tmp_path / "runtime-stage",
         "0.116.0a1",
         package_archive,
-        platform_tag="musllinux_1_1_x86_64",
+        platform_tag="manylinux_2_17_x86_64",
     )
 
     pyproject = (staged / "pyproject.toml").read_text()
-    assert 'platform-tag = "musllinux_1_1_x86_64"' in pyproject
+    assert 'platform-tag = "manylinux_2_17_x86_64"' in pyproject
 
 
 def test_stage_runtime_release_rejects_incomplete_package_layout(tmp_path: Path) -> None:
@@ -491,23 +858,32 @@ def test_runtime_package_layout_is_included_by_wheel_config(
     ]
 
 
-def test_stage_sdk_release_injects_exact_runtime_pin(tmp_path: Path) -> None:
+def test_stage_sdk_release_preserves_reviewed_runtime_pin(tmp_path: Path) -> None:
     script = _load_update_script_module()
     staged = script.stage_python_sdk_package(
         tmp_path / "sdk-stage",
-        "rust-v0.116.0-alpha.1",
+        "0.147.0",
     )
 
-    pyproject = (staged / "pyproject.toml").read_text()
-    assert 'name = "openai-codex"' in pyproject
-    assert 'version = "0.116.0a1"' in pyproject
-    assert '"openai-codex-cli-bin==0.116.0a1"' in pyproject
+    pyproject = tomllib.loads((staged / "pyproject.toml").read_text())
+    assert {
+        "name": pyproject["project"]["name"],
+        "version": pyproject["project"]["version"],
+        "dependencies": pyproject["project"]["dependencies"],
+    } == {
+        "name": "openai-codex",
+        "version": "0.147.0",
+        "dependencies": [
+            "pydantic>=2.12",
+            "openai-codex-cli-bin==0.147.0",
+        ],
+    }
     assert (
-        '__version__ = "0.116.0a1"'
+        '__version__ = "0.147.0"'
         not in (staged / "src" / "openai_codex" / "__init__.py").read_text()
     )
     assert (
-        'client_version: str = "0.116.0a1"'
+        'client_version: str = "0.147.0"'
         not in (staged / "src" / "openai_codex" / "client.py").read_text()
     )
     assert not any((staged / "src" / "openai_codex").glob("bin/**"))
@@ -520,34 +896,41 @@ def test_stage_sdk_release_replaces_existing_staging_dir(tmp_path: Path) -> None
     old_file.parent.mkdir(parents=True)
     old_file.write_text("stale")
 
-    staged = script.stage_python_sdk_package(staging_dir, "0.116.0a1")
+    staged = script.stage_python_sdk_package(staging_dir, "0.147.0")
 
     assert staged == staging_dir
     assert not old_file.exists()
 
 
-def test_staged_sdk_and_runtime_versions_match(tmp_path: Path) -> None:
+def test_sdk_release_matches_stable_runtime(tmp_path: Path) -> None:
     script = _load_update_script_module()
     package_archive = _write_fake_codex_package_archive(tmp_path, script)
 
     sdk_stage = script.stage_python_sdk_package(
         tmp_path / "sdk-stage",
-        "rust-v0.116.0-alpha.1",
+        "0.147.0",
     )
     runtime_stage = script.stage_python_runtime_package(
         tmp_path / "runtime-stage",
-        "rust-v0.116.0-alpha.1",
+        "0.147.0",
         package_archive,
     )
 
     sdk_pyproject = tomllib.loads((sdk_stage / "pyproject.toml").read_text())
     runtime_pyproject = tomllib.loads((runtime_stage / "pyproject.toml").read_text())
 
-    assert sdk_pyproject["project"]["version"] == runtime_pyproject["project"]["version"]
-    assert sdk_pyproject["project"]["dependencies"] == [
-        "pydantic>=2.12",
-        "openai-codex-cli-bin==0.116.0a1",
-    ]
+    assert {
+        "sdk_version": sdk_pyproject["project"]["version"],
+        "runtime_version": runtime_pyproject["project"]["version"],
+        "sdk_dependencies": sdk_pyproject["project"]["dependencies"],
+    } == {
+        "sdk_version": "0.147.0",
+        "runtime_version": "0.147.0",
+        "sdk_dependencies": [
+            "pydantic>=2.12",
+            "openai-codex-cli-bin==0.147.0",
+        ],
+    }
 
 
 def test_stage_sdk_runs_type_generation_before_staging(tmp_path: Path) -> None:
@@ -557,16 +940,16 @@ def test_stage_sdk_runs_type_generation_before_staging(tmp_path: Path) -> None:
         [
             "stage-sdk",
             str(tmp_path / "sdk-stage"),
-            "--codex-version",
-            "rust-v0.116.0-alpha.1",
+            "--sdk-version",
+            "0.147.0",
         ]
     )
 
     def fake_generate_types() -> None:
         calls.append("generate_types")
 
-    def fake_stage_sdk_package(_staging_dir: Path, codex_version: str) -> Path:
-        calls.append(f"stage_sdk:{codex_version}")
+    def fake_stage_sdk_package(_staging_dir: Path, sdk_version: str) -> Path:
+        calls.append(f"stage_sdk:{sdk_version}")
         return tmp_path / "sdk-stage"
 
     def fake_stage_runtime_package(
@@ -589,26 +972,7 @@ def test_stage_sdk_runs_type_generation_before_staging(tmp_path: Path) -> None:
 
     script.run_command(args, ops)
 
-    assert calls == ["generate_types", "stage_sdk:0.116.0a1"]
-
-
-def test_stage_sdk_rejects_mismatched_legacy_versions(tmp_path: Path) -> None:
-    script = _load_update_script_module()
-    args = script.parse_args(
-        [
-            "stage-sdk",
-            str(tmp_path / "sdk-stage"),
-            "--codex-version",
-            "0.116.0a1",
-            "--runtime-version",
-            "0.116.0a1",
-            "--sdk-version",
-            "0.115.0",
-        ]
-    )
-
-    with pytest.raises(RuntimeError, match="versions must match"):
-        script.run_command(args, script.default_cli_ops())
+    assert calls == ["generate_types", "stage_sdk:0.147.0"]
 
 
 def test_stage_runtime_stages_package_without_type_generation(tmp_path: Path) -> None:
@@ -623,7 +987,7 @@ def test_stage_runtime_stages_package_without_type_generation(tmp_path: Path) ->
             "--codex-version",
             "rust-v0.116.0-alpha.1",
             "--platform-tag",
-            "musllinux_1_1_x86_64",
+            "manylinux_2_17_x86_64",
         ]
     )
 
@@ -654,7 +1018,7 @@ def test_stage_runtime_stages_package_without_type_generation(tmp_path: Path) ->
 
     script.run_command(args, ops)
 
-    assert calls == ["stage_runtime:0.116.0a1:musllinux_1_1_x86_64:codex-package.tar.gz"]
+    assert calls == ["stage_runtime:0.116.0a1:manylinux_2_17_x86_64:codex-package.tar.gz"]
 
 
 def test_default_runtime_is_resolved_from_installed_runtime_package(
@@ -669,7 +1033,7 @@ def test_default_runtime_is_resolved_from_installed_runtime_package(
         path_exists=lambda path: path == fake_binary,
     )
 
-    config = client_module.AppServerConfig()
+    config = client_module.CodexConfig()
     assert config.codex_bin is None
     assert client_module.resolve_codex_bin(config, ops) == fake_binary
 
@@ -717,7 +1081,7 @@ def test_explicit_codex_bin_override_takes_priority(tmp_path: Path) -> None:
         path_exists=lambda path: path == explicit_binary,
     )
 
-    config = client_module.AppServerConfig(codex_bin=str(explicit_binary))
+    config = client_module.CodexConfig(codex_bin=str(explicit_binary))
     assert client_module.resolve_codex_bin(config, ops) == explicit_binary
 
 
@@ -732,7 +1096,7 @@ def test_missing_runtime_package_requires_explicit_codex_bin() -> None:
     )
 
     with pytest.raises(FileNotFoundError, match="missing packaged runtime"):
-        client_module.resolve_codex_bin(client_module.AppServerConfig(), ops)
+        client_module.resolve_codex_bin(client_module.CodexConfig(), ops)
 
 
 def test_broken_runtime_package_does_not_fall_back() -> None:
@@ -746,6 +1110,6 @@ def test_broken_runtime_package_does_not_fall_back() -> None:
     )
 
     with pytest.raises(FileNotFoundError) as exc_info:
-        client_module.resolve_codex_bin(client_module.AppServerConfig(), ops)
+        client_module.resolve_codex_bin(client_module.CodexConfig(), ops)
 
     assert str(exc_info.value) == ("missing packaged binary")

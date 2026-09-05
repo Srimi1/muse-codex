@@ -1,8 +1,8 @@
 # Downstream patch record
 
 OpenAI Codex source files are not modified. The vendored tree is based on
-upstream commit `9474e5cfc4494b0ba319352aa86ce436c59e65c8`, with the following
-auditable downstream manifest change.
+upstream commit `3d2ee51ca2d5db578f328aa75e20aa22c0197c9a` (`rust-v0.153.4`), with
+the following auditable downstream manifest change.
 
 ## `gix` security update
 
@@ -12,18 +12,20 @@ auditable downstream manifest change.
 path-traversal, credential-disclosure, command-execution, worktree-escape, and
 denial-of-service advisories. No Codex Rust source is changed.
 
-The update passed formatting, clippy with warnings denied, all 50 first-party
-tests, the signed release-tooling suite, CodeQL, and an Apple-silicon release
-build with gateway self-test.
+Repin qualification must include formatting, Clippy with warnings denied, all
+first-party tests, release tooling, the stock/wrapped compatibility suite, an
+Apple-silicon release build with gateway self-test, and opt-in real-account
+smoke tests before an artifact is released.
 
 Local crates depend on selected upstream packages by path, so builds do not
 silently substitute a moving Codex checkout.
 
-The root Cargo manifest carries the two dependency overrides present in the
-pinned Codex `rust-v0.133.0` workspace:
+The root Cargo manifest mirrors the three dependency overrides present in the
+pinned Codex `rust-v0.153.4` workspace:
 
-- `tokio-tungstenite` at `132f5b39c862e3a970f731d709608b3e6276d5f6`
-- `tungstenite` at `9200079d3b54a1ff51072e24d81fd354f085156f`
+- `crossterm` at `45fecb9508105988f42fe6ff0441783ed3717f92`
+- `tokio-tungstenite` at `0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186`
+- `tungstenite` at `4fffad30fe373adbdcffab9545e9e9bf4f2fc19f`
 
 Muse compatibility behavior lives entirely in the local `codex-transport`,
 `muse-codex-gateway`, and `muse-codex` crates. Updating an upstream revision or

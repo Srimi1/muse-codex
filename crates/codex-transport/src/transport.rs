@@ -1,4 +1,4 @@
-use crate::CODEX_CLIENT_VERSION;
+use crate::CODEX_WIRE_COMPATIBILITY_VERSION;
 use crate::Error;
 use crate::Result;
 use crate::auth::AuthConfig;
@@ -28,6 +28,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Map;
 use serde_json::Value;
+use sha2::Digest;
+use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt;
@@ -37,6 +39,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -50,7 +53,13 @@ const MAX_PRESTREAM_ATTEMPTS: usize = 2;
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(2);
 const CREDENTIAL_REFRESH_LOCK_NAME: &str = ".credential-refresh.lock";
 const MUSE_CODEX_USER_AGENT: &str = concat!("muse-codex/", env!("CARGO_PKG_VERSION"));
+const RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
+const BUNDLED_MODEL_CATALOG: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../vendor/openai-codex/codex-rs/models-manager/models.json"
+));
 static BROWSER_OPEN_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static RESPONSES_LITE_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub type RawBody = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send + 'static>>;
 
@@ -103,6 +112,30 @@ pub struct ModelInfo {
     pub default_reasoning_effort: Option<String>,
     pub is_visible: bool,
     pub is_default: bool,
+    /// Provider-wire capability used internally and omitted from Muse's stable
+    /// readiness/catalog format.
+    #[serde(skip)]
+    pub use_responses_lite: bool,
+    /// Upstream execution selector used to fail closed on unknown wire modes.
+    #[serde(skip)]
+    pub tool_mode: Option<String>,
+    /// Authenticated input capabilities. Muse's stable catalog has no field
+    /// for these, so they remain private to request validation.
+    #[serde(skip)]
+    pub input_modalities: Vec<String>,
+    /// Whether the bundled Codex metadata permits API-key use. The public
+    /// readiness schema intentionally omits this provider-only selector.
+    #[serde(skip)]
+    pub supported_in_api: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ModelCapabilities {
+    is_visible: bool,
+    use_responses_lite: bool,
+    tool_mode: Option<String>,
+    input_modalities: Vec<String>,
+    supported_reasoning_efforts: Vec<String>,
 }
 
 /// Muse's compact search request. It is mapped to Codex's pinned
@@ -141,6 +174,7 @@ pub struct Transport {
     api_key_base_url: Option<Url>,
     auth_manager: Option<Arc<AuthManager>>,
     client: reqwest::Client,
+    model_capabilities: Arc<RwLock<BTreeMap<String, ModelCapabilities>>>,
 }
 
 impl fmt::Debug for Transport {
@@ -180,6 +214,7 @@ impl Transport {
             api_key_base_url,
             auth_manager,
             client: build_http_client()?,
+            model_capabilities: Arc::new(RwLock::new(BTreeMap::new())),
         };
 
         // Fail during construction rather than after the gateway begins
@@ -190,6 +225,8 @@ impl Transport {
 
     /// Fetches and normalizes the pinned Codex `/models` response.
     pub async fn list_models(&self) -> Result<Vec<ModelInfo>> {
+        let use_bundled_api_metadata =
+            self.api_key_base_url.is_none() && self.resolve_auth().await?.is_api_key_auth();
         let response = self
             .execute_with_401_recovery(|| async { self.send_models_once().await })
             .await?;
@@ -198,7 +235,32 @@ impl Transport {
             return Err(upstream_error(response).await);
         }
         let bytes = collect_response(response, MAX_MODELS_RESPONSE_BYTES).await?;
-        normalize_models(&bytes)
+        let models = if use_bundled_api_metadata {
+            normalize_api_models_with_bundled_metadata(&bytes)?
+        } else {
+            normalize_models(&bytes)?
+        };
+        let capabilities = models
+            .iter()
+            .map(|model| {
+                (
+                    model.id.clone(),
+                    ModelCapabilities {
+                        is_visible: model.is_visible,
+                        use_responses_lite: model.use_responses_lite,
+                        tool_mode: model.tool_mode.clone(),
+                        input_modalities: model.input_modalities.clone(),
+                        supported_reasoning_efforts: model.supported_reasoning_efforts.clone(),
+                    },
+                )
+            })
+            .collect();
+        *self
+            .model_capabilities
+            .write()
+            .map_err(|_| Error::Provider("model capability state is unavailable".to_string()))? =
+            capabilities;
+        Ok(models)
     }
 
     /// Forwards a Responses API JSON body and preserves upstream response bytes,
@@ -209,7 +271,17 @@ impl Transport {
         extra_headers: HeaderMap,
     ) -> Result<RawResponse> {
         let api_key_auth = self.resolve_auth().await?.is_api_key_auth();
-        let body = normalize_responses_request(body, api_key_auth)?;
+        let use_responses_lite = self
+            .validate_model_request(&body, api_key_auth)?
+            .is_some_and(|capabilities| capabilities.use_responses_lite);
+        let lite_request_namespace =
+            use_responses_lite.then(|| responses_lite_request_namespace(&extra_headers));
+        let body = normalize_responses_request(
+            body,
+            api_key_auth,
+            use_responses_lite,
+            lite_request_namespace.as_deref(),
+        )?;
         let response = self
             .execute_with_401_recovery(|| async {
                 self.send_json_once(
@@ -218,11 +290,79 @@ impl Transport {
                     &body,
                     &extra_headers,
                     "text/event-stream",
+                    use_responses_lite,
                 )
                 .await
             })
             .await?;
         Ok(RawResponse::from_reqwest(response))
+    }
+
+    fn validate_model_request(
+        &self,
+        body: &Value,
+        api_key_auth: bool,
+    ) -> Result<Option<ModelCapabilities>> {
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::InvalidRequest("model must be a string".to_string()))?;
+        let capabilities = self
+            .model_capabilities
+            .read()
+            .map_err(|_| Error::Provider("model capability state is unavailable".to_string()))?
+            .get(model)
+            .cloned();
+        let Some(capabilities) = capabilities else {
+            if api_key_auth {
+                // Public and compatible custom Responses endpoints can accept a model
+                // that their compact /models response did not describe. In that case
+                // retain the standard Responses request shape. Subscription requests
+                // must remain bound to the authenticated Codex catalog.
+                return Ok(None);
+            }
+            return Err(Error::InvalidRequest(
+                "model is not available in the authenticated Codex catalog".to_string(),
+            ));
+        };
+        if !capabilities.is_visible {
+            return Err(Error::InvalidRequest(
+                "model is not available for interactive use".to_string(),
+            ));
+        }
+        if capabilities.tool_mode.as_deref() == Some("code_mode_only")
+            && !capabilities.use_responses_lite
+        {
+            return Err(Error::InvalidRequest(
+                "model requires the Responses Lite tool protocol".to_string(),
+            ));
+        }
+        if request_contains_image(body)
+            && !capabilities
+                .input_modalities
+                .iter()
+                .any(|modality| modality == "image")
+        {
+            return Err(Error::InvalidRequest(
+                "model does not accept image input".to_string(),
+            ));
+        }
+        if let Some(effort) = body
+            .get("reasoning")
+            .and_then(Value::as_object)
+            .and_then(|reasoning| reasoning.get("effort"))
+            .and_then(Value::as_str)
+            && !capabilities.supported_reasoning_efforts.is_empty()
+            && !capabilities
+                .supported_reasoning_efforts
+                .iter()
+                .any(|supported| supported == effort)
+        {
+            return Err(Error::InvalidRequest(
+                "reasoning effort is not supported by the selected model".to_string(),
+            ));
+        }
+        Ok(Some(capabilities))
     }
 
     /// Executes Codex's raw search endpoint. The encrypted search output is not
@@ -241,6 +381,7 @@ impl Transport {
                     &body,
                     &extra_headers,
                     "application/json",
+                    false,
                 )
                 .await
             })
@@ -318,6 +459,7 @@ impl Transport {
                     &body,
                     &extra_headers,
                     "application/json",
+                    false,
                 )
                 .await
             })
@@ -330,7 +472,7 @@ impl Transport {
             .prepare_request("models", &HeaderMap::new(), "application/json")
             .await?;
         url.query_pairs_mut()
-            .append_pair("client_version", CODEX_CLIENT_VERSION);
+            .append_pair("client_version", CODEX_WIRE_COMPATIBILITY_VERSION);
         self.client
             .get(url)
             .headers(headers)
@@ -346,8 +488,10 @@ impl Transport {
         body: &Value,
         extra_headers: &HeaderMap,
         accept: &'static str,
+        use_responses_lite: bool,
     ) -> Result<reqwest::Response> {
-        let (url, headers) = self.prepare_request(path, extra_headers, accept).await?;
+        let (url, mut headers) = self.prepare_request(path, extra_headers, accept).await?;
+        set_internal_responses_lite_header(&mut headers, use_responses_lite);
         self.client
             .request(method, url)
             .headers(headers)
@@ -377,13 +521,18 @@ impl Transport {
 
         let mut headers = provider.headers.clone();
         merge_safe_request_headers(&mut headers, extra_headers);
+        headers.insert(
+            HeaderName::from_static("version"),
+            HeaderValue::from_static(CODEX_WIRE_COMPATIBILITY_VERSION),
+        );
         attach_auth_headers(&mut headers, &auth)?;
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert(ACCEPT, HeaderValue::from_static(accept));
         let upstream_agent = codex_login::default_client::get_codex_user_agent();
-        let user_agent =
-            HeaderValue::from_str(&format!("{MUSE_CODEX_USER_AGENT} {upstream_agent}"))
-                .map_err(|_| Error::InvalidHeader("generated user-agent".to_string()))?;
+        let user_agent = HeaderValue::from_str(&format!(
+            "{MUSE_CODEX_USER_AGENT} wire/{CODEX_WIRE_COMPATIBILITY_VERSION} {upstream_agent}"
+        ))
+        .map_err(|_| Error::InvalidHeader("generated user-agent".to_string()))?;
         headers.insert(USER_AGENT, user_agent);
         Ok((url, headers))
     }
@@ -428,14 +577,44 @@ impl Transport {
     }
 }
 
+fn request_contains_image(body: &Value) -> bool {
+    body.get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|content| {
+                        content.iter().any(|part| {
+                            matches!(
+                                part.get("type").and_then(Value::as_str),
+                                Some("input_image" | "image_url")
+                            )
+                        })
+                    })
+                    || item
+                        .get("output")
+                        .and_then(Value::as_array)
+                        .is_some_and(|output| {
+                            output.iter().any(|part| {
+                                matches!(
+                                    part.get("type").and_then(Value::as_str),
+                                    Some("input_image" | "image_url")
+                                )
+                            })
+                        })
+            })
+        })
+}
+
 fn build_http_client() -> Result<reqwest::Client> {
     let builder = reqwest::Client::builder()
         .default_headers(codex_login::default_client::default_headers())
         .connect_timeout(Duration::from_secs(15))
         .read_timeout(Duration::from_secs(150))
         .redirect(reqwest::redirect::Policy::none());
-    let builder = codex_client::with_chatgpt_cloudflare_cookie_store(builder);
-    codex_client::build_reqwest_client_with_custom_ca(builder)
+    let builder = codex_http_client::with_chatgpt_cloudflare_cookie_store(builder);
+    codex_http_client::build_reqwest_client_with_custom_ca(builder)
         .map_err(|error| Error::HttpClient(error.to_string()))
 }
 
@@ -443,7 +622,12 @@ fn build_http_client() -> Result<reqwest::Client> {
 /// shape emitted by the pinned Codex client. Public API-key requests retain
 /// standard API parameters that the ChatGPT subscription backend does not
 /// accept.
-fn normalize_responses_request(mut body: Value, api_key_auth: bool) -> Result<Value> {
+fn normalize_responses_request(
+    mut body: Value,
+    api_key_auth: bool,
+    use_responses_lite: bool,
+    lite_request_namespace: Option<&str>,
+) -> Result<Value> {
     let object = body
         .as_object_mut()
         .ok_or_else(|| Error::InvalidRequest("request body must be an object".to_string()))?;
@@ -527,8 +711,8 @@ fn normalize_responses_request(mut body: Value, api_key_auth: bool) -> Result<Va
         }
     }
 
-    let has_reasoning = normalize_reasoning(object, api_key_auth)?;
-    normalize_include(object, has_reasoning)?;
+    normalize_reasoning(object, api_key_auth)?;
+    normalize_include(object)?;
 
     if api_key_auth {
         validate_optional_positive_integer(object, "max_output_tokens")?;
@@ -541,10 +725,207 @@ fn normalize_responses_request(mut body: Value, api_key_auth: bool) -> Result<Va
         object.remove("metadata");
     }
 
+    if use_responses_lite {
+        normalize_responses_lite_request(
+            object,
+            lite_request_namespace.ok_or_else(|| {
+                Error::InvalidRequest(
+                    "Responses Lite request namespace was not initialized".to_string(),
+                )
+            })?,
+        )?;
+    }
+
     // Muse owns persistence and always replays the complete normalized history.
     object.insert("store".to_string(), Value::Bool(false));
     object.insert("stream".to_string(), Value::Bool(true));
     Ok(body)
+}
+
+/// Applies the Responses Lite wire contract used by current Codex models.
+/// Muse still owns the complete stateless history and agent loop; only the
+/// placement of instructions and tool schemas changes at this boundary.
+fn normalize_responses_lite_request(
+    object: &mut Map<String, Value>,
+    request_namespace: &str,
+) -> Result<()> {
+    let instructions = object
+        .remove("instructions")
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .ok_or_else(|| Error::InvalidRequest("instructions must be a string".to_string()))?;
+    let tools = object
+        .remove("tools")
+        .and_then(|value| value.as_array().cloned())
+        .ok_or_else(|| Error::InvalidRequest("tools must be an array".to_string()))?;
+    let tools = group_responses_lite_tools(tools)?;
+
+    let input = object
+        .get_mut("input")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| Error::InvalidRequest("input must be an array".to_string()))?;
+    strip_responses_lite_image_details(input);
+
+    let mut prefix = vec![serde_json::json!({
+        "id": stable_prefix_item_id("at", request_namespace, &Value::Array(tools.clone()))?,
+        "type": "additional_tools",
+        "role": "developer",
+        "tools": tools,
+    })];
+    if !instructions.is_empty() {
+        prefix.push(serde_json::json!({
+            "id": stable_prefix_item_id("msg", request_namespace, &Value::String(instructions.clone()))?,
+            "type": "message",
+            "role": "developer",
+            "content": [{"type":"input_text", "text":instructions}],
+            "internal_chat_message_metadata_passthrough": {
+                "content_item_kinds": ["model.base_instructions"]
+            },
+        }));
+    }
+    input.splice(0..0, prefix);
+
+    object.insert("parallel_tool_calls".to_string(), Value::Bool(false));
+    let reasoning = object
+        .entry("reasoning".to_string())
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| Error::InvalidRequest("reasoning must be an object".to_string()))?;
+    reasoning.insert(
+        "context".to_string(),
+        Value::String("all_turns".to_string()),
+    );
+    Ok(())
+}
+
+fn group_responses_lite_tools(tools: Vec<Value>) -> Result<Vec<Value>> {
+    let mut functions = Vec::new();
+    let mut function_namespace_description = String::new();
+    let mut function_namespace_index = None;
+    let mut grouped = Vec::new();
+
+    for tool in tools {
+        let tool_type = tool.get("type").and_then(Value::as_str).ok_or_else(|| {
+            Error::InvalidRequest("each tool must have a string type".to_string())
+        })?;
+        if is_hosted_responses_tool(tool_type) {
+            // Responses Lite accepts only client-executed tool schemas. Muse's
+            // provider-independent browser and extension tools are namespaces
+            // and continue through this adapter unchanged.
+            continue;
+        }
+        let is_function_namespace = tool_type == "namespace"
+            && tool.get("name").and_then(Value::as_str) == Some("functions");
+        if matches!(tool_type, "function" | "custom") {
+            function_namespace_index.get_or_insert(grouped.len());
+            functions.push(tool);
+        } else if is_function_namespace {
+            function_namespace_index.get_or_insert(grouped.len());
+            let namespace = tool.as_object().expect("validated tool object");
+            if let Some(description) = namespace
+                .get("description")
+                .and_then(Value::as_str)
+                .filter(|description| !description.trim().is_empty())
+            {
+                function_namespace_description = description.to_string();
+            }
+            let namespace_tools = namespace
+                .get("tools")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    Error::InvalidRequest("functions namespace tools must be an array".to_string())
+                })?;
+            functions.extend(namespace_tools.iter().cloned());
+        } else {
+            grouped.push(tool);
+        }
+    }
+
+    if let Some(index) = function_namespace_index
+        && !functions.is_empty()
+    {
+        grouped.insert(
+            index,
+            serde_json::json!({
+                "type": "namespace",
+                "name": "functions",
+                "description": function_namespace_description,
+                "tools": functions,
+            }),
+        );
+    }
+    Ok(grouped)
+}
+
+fn is_hosted_responses_tool(tool_type: &str) -> bool {
+    matches!(
+        tool_type,
+        "web_search"
+            | "web_search_preview"
+            | "file_search"
+            | "computer_use"
+            | "computer_use_preview"
+            | "code_interpreter"
+            | "image_generation"
+    )
+}
+
+fn strip_responses_lite_image_details(input: &mut [Value]) {
+    for item in input {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                if let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) {
+                    strip_image_details_from_parts(content);
+                }
+            }
+            Some("function_call_output" | "custom_tool_call_output") => {
+                if let Some(output) = item.get_mut("output").and_then(Value::as_array_mut) {
+                    strip_image_details_from_parts(output);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn strip_image_details_from_parts(parts: &mut [Value]) {
+    for part in parts {
+        if part.get("type").and_then(Value::as_str) == Some("input_image")
+            && let Some(part) = part.as_object_mut()
+        {
+            part.remove("detail");
+        }
+    }
+}
+
+fn responses_lite_request_namespace(headers: &HeaderMap) -> String {
+    if let Some(request_id) = headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty() && value.len() <= 512)
+    {
+        return format!("request:{request_id}");
+    }
+    format!(
+        "process:{}:{}",
+        std::process::id(),
+        RESPONSES_LITE_REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn stable_prefix_item_id(prefix: &str, request_namespace: &str, value: &Value) -> Result<String> {
+    let bytes = serde_json::to_vec(value).map_err(|error| {
+        Error::InvalidRequest(format!("could not encode Responses Lite prefix: {error}"))
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(request_namespace.as_bytes());
+    hasher.update([0]);
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let suffix = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!("{prefix}_{suffix}"))
 }
 
 fn validate_model_id(model: &str) -> std::result::Result<(), String> {
@@ -686,13 +1067,19 @@ fn normalize_response_item(
         normalize_message_item(object, index)?;
     }
 
-    let parsed: ResponseItem = serde_json::from_value(item).map_err(|error| {
+    let mut parsed: ResponseItem = serde_json::from_value(item).map_err(|error| {
         Error::InvalidRequest(format!("input item {index} is invalid: {error}"))
     })?;
     if matches!(parsed, ResponseItem::Other) {
         return Err(Error::InvalidRequest(format!(
             "input item {index} has unsupported type"
         )));
+    }
+    // The pinned client accepts legacy rollout IDs when reading local state but
+    // never forwards them unless they contain a non-empty type prefix and
+    // suffix. This prevents old arbitrary IDs from becoming server identities.
+    if parsed.id().is_some_and(|id| !id.is_prefixed()) {
+        parsed.set_id(None);
     }
     let mut normalized = serde_json::to_value(parsed).map_err(|error| {
         Error::InvalidRequest(format!(
@@ -887,7 +1274,7 @@ fn is_reasoning_summary(value: &str) -> bool {
     matches!(value, "auto" | "concise" | "detailed" | "none")
 }
 
-fn normalize_include(object: &mut Map<String, Value>, has_reasoning: bool) -> Result<()> {
+fn normalize_include(object: &mut Map<String, Value>) -> Result<()> {
     let include = object
         .entry("include".to_string())
         .or_insert_with(|| Value::Array(Vec::new()));
@@ -901,14 +1288,14 @@ fn normalize_include(object: &mut Map<String, Value>, has_reasoning: bool) -> Re
             "include entries must be strings".to_string(),
         ));
     }
-    let mut unique = Vec::with_capacity(include.len() + usize::from(has_reasoning));
+    let mut unique = Vec::with_capacity(include.len() + 1);
     for value in std::mem::take(include) {
         if !unique.contains(&value) {
             unique.push(value);
         }
     }
     let encrypted_reasoning = Value::String("reasoning.encrypted_content".to_string());
-    if has_reasoning && !unique.contains(&encrypted_reasoning) {
+    if !unique.contains(&encrypted_reasoning) {
         unique.push(encrypted_reasoning);
     }
     *include = unique;
@@ -982,6 +1369,17 @@ fn merge_safe_request_headers(destination: &mut HeaderMap, source: &HeaderMap) {
     }
 }
 
+fn set_internal_responses_lite_header(headers: &mut HeaderMap, enabled: bool) {
+    if enabled {
+        headers.insert(
+            HeaderName::from_static(RESPONSES_LITE_HEADER),
+            HeaderValue::from_static("true"),
+        );
+    } else {
+        headers.remove(RESPONSES_LITE_HEADER);
+    }
+}
+
 fn is_forbidden_forwarded_header(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
@@ -1006,6 +1404,7 @@ fn is_forbidden_forwarded_header(name: &HeaderName) -> bool {
             | "originator"
             | "user-agent"
             | "version"
+            | RESPONSES_LITE_HEADER
     )
 }
 
@@ -1289,6 +1688,23 @@ struct UpstreamModel {
     priority: i32,
     #[serde(default)]
     visibility: Option<String>,
+    #[serde(default)]
+    minimal_client_version: Option<UpstreamClientVersion>,
+    #[serde(default)]
+    use_responses_lite: bool,
+    #[serde(default)]
+    tool_mode: Option<String>,
+    #[serde(default)]
+    input_modalities: Vec<String>,
+    #[serde(default = "default_true")]
+    supported_in_api: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum UpstreamClientVersion {
+    Text(String),
+    Triple([u64; 3]),
 }
 
 #[derive(Debug, Deserialize)]
@@ -1337,7 +1753,7 @@ fn normalize_models(bytes: &[u8]) -> Result<Vec<ModelInfo>> {
                     "model catalog returned duplicate ids".to_string(),
                 ));
             }
-            let is_visible = match model.visibility.as_deref() {
+            let mut is_visible = match model.visibility.as_deref() {
                 None | Some("list") => true,
                 Some("hide" | "none") => false,
                 Some(_) => {
@@ -1346,25 +1762,42 @@ fn normalize_models(bytes: &[u8]) -> Result<Vec<ModelInfo>> {
                     ));
                 }
             };
+            if let Some(minimal_version) = model.minimal_client_version.as_ref()
+                && compare_client_version(minimal_version, CODEX_WIRE_COMPATIBILITY_VERSION)?
+                    == std::cmp::Ordering::Greater
+            {
+                is_visible = false;
+            }
+            if model
+                .tool_mode
+                .as_deref()
+                .is_some_and(|mode| !matches!(mode, "direct" | "code_mode" | "code_mode_only"))
+            {
+                is_visible = false;
+            }
             let mut supported_reasoning_efforts = Vec::new();
+            let had_reasoning_efforts = !model.supported_reasoning_levels.is_empty();
             for preset in model.supported_reasoning_levels {
                 if !is_reasoning_effort(&preset.effort) {
-                    return Err(Error::InvalidUpstreamResponse(
-                        "model catalog returned an invalid reasoning effort".to_string(),
-                    ));
+                    continue;
                 }
                 if !supported_reasoning_efforts.contains(&preset.effort) {
                     supported_reasoning_efforts.push(preset.effort);
                 }
             }
-            if let Some(default) = model.default_reasoning_level.as_deref()
-                && !supported_reasoning_efforts
+            if had_reasoning_efforts && supported_reasoning_efforts.is_empty() {
+                is_visible = false;
+            }
+            let default_reasoning_effort = model.default_reasoning_level.filter(|default| {
+                supported_reasoning_efforts
                     .iter()
                     .any(|supported| supported == default)
+            });
+            let input_modalities = normalize_input_modalities(model.input_modalities)?;
+            if !input_modalities.is_empty()
+                && !input_modalities.iter().any(|modality| modality == "text")
             {
-                return Err(Error::InvalidUpstreamResponse(
-                    "model catalog default reasoning effort is not supported".to_string(),
-                ));
+                is_visible = false;
             }
             Ok(ModelInfo {
                 id: model.slug,
@@ -1373,9 +1806,13 @@ fn normalize_models(bytes: &[u8]) -> Result<Vec<ModelInfo>> {
                 context_window: normalize_model_limit(model.context_window)?,
                 max_output_tokens: normalize_model_limit(model.max_output_tokens)?,
                 supported_reasoning_efforts,
-                default_reasoning_effort: model.default_reasoning_level,
+                default_reasoning_effort,
                 is_visible,
                 is_default: false,
+                use_responses_lite: model.use_responses_lite,
+                tool_mode: model.tool_mode,
+                input_modalities,
+                supported_in_api: model.supported_in_api,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1387,6 +1824,43 @@ fn normalize_models(bytes: &[u8]) -> Result<Vec<ModelInfo>> {
         })?;
     models[default_index].is_default = true;
     Ok(models)
+}
+
+/// The standard OpenAI `/v1/models` response proves model availability but is
+/// intentionally sparse. For the first-party endpoint only, enrich models in
+/// that response with the exact wire capabilities bundled at the pinned Codex
+/// revision. The intersection rule avoids claiming access to a model the
+/// account's API catalog did not return.
+fn normalize_api_models_with_bundled_metadata(bytes: &[u8]) -> Result<Vec<ModelInfo>> {
+    let mut available = normalize_models(bytes)?;
+    let bundled = normalize_models(BUNDLED_MODEL_CATALOG)?;
+    let mut merged = Vec::with_capacity(available.len());
+
+    for metadata in bundled {
+        let Some(index) = available.iter().position(|model| model.id == metadata.id) else {
+            continue;
+        };
+        let account_model = available.remove(index);
+        if !metadata.supported_in_api {
+            continue;
+        }
+        let mut model = metadata;
+        model.is_visible &= account_model.is_visible;
+        model.is_default = false;
+        merged.push(model);
+    }
+    let default_index = merged
+        .iter()
+        .position(|model| model.is_visible)
+        .ok_or_else(|| {
+            Error::InvalidUpstreamResponse("model catalog has no visible models".to_string())
+        })?;
+    merged[default_index].is_default = true;
+    Ok(merged)
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn normalize_catalog_text(
@@ -1420,6 +1894,47 @@ fn normalize_model_limit(value: Option<i64>) -> Result<Option<u64>> {
             "model catalog returned a non-positive token limit".to_string(),
         )),
     }
+}
+
+fn normalize_input_modalities(modalities: Vec<String>) -> Result<Vec<String>> {
+    let mut normalized = Vec::new();
+    for modality in modalities {
+        if modality.is_empty()
+            || modality.len() > 32
+            || modality.chars().any(char::is_whitespace)
+            || modality.chars().any(char::is_control)
+        {
+            return Err(Error::InvalidUpstreamResponse(
+                "model catalog returned an invalid input modality".to_string(),
+            ));
+        }
+        if !normalized.contains(&modality) {
+            normalized.push(modality);
+        }
+    }
+    Ok(normalized)
+}
+
+fn compare_client_version(left: &UpstreamClientVersion, right: &str) -> Result<std::cmp::Ordering> {
+    fn parse(version: &str) -> Option<[u64; 3]> {
+        let mut parts = version.split('.');
+        let parsed = [
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+        ];
+        parts.next().is_none().then_some(parsed)
+    }
+    let left = match left {
+        UpstreamClientVersion::Text(version) => parse(version).ok_or_else(|| {
+            Error::InvalidUpstreamResponse(
+                "model catalog returned an invalid minimum client version".to_string(),
+            )
+        })?,
+        UpstreamClientVersion::Triple(version) => *version,
+    };
+    let right = parse(right).expect("wire compatibility version is a semantic version");
+    Ok(left.cmp(&right))
 }
 
 #[cfg(test)]
@@ -1465,8 +1980,8 @@ mod tests {
             "../tests/fixtures/muse-responses-request.json"
         ))
         .expect("request fixture");
-        let normalized =
-            normalize_responses_request(request, false).expect("normalized subscription request");
+        let normalized = normalize_responses_request(request, false, false, None)
+            .expect("normalized subscription request");
 
         assert_eq!(normalized["store"], false);
         assert_eq!(normalized["stream"], true);
@@ -1489,10 +2004,10 @@ mod tests {
             "data:image/png;base64,iVBORw0KGgo="
         );
         assert_eq!(input[3]["content"][0]["type"], "output_text");
-        assert!(input[2].get("id").is_none());
+        assert_eq!(input[2]["id"], "rs_fixture");
         assert_eq!(input[2]["encrypted_content"], "encrypted-fixture");
-        assert!(input[3].get("id").is_none());
-        assert!(input[4].get("id").is_none());
+        assert_eq!(input[3]["id"], "msg_fixture");
+        assert_eq!(input[4]["id"], "fc_fixture");
         assert_eq!(input[4]["call_id"], "call_fixture");
         assert_eq!(input[5]["call_id"], "call_fixture");
         assert_eq!(input[5]["output"], "fixture output");
@@ -1505,8 +2020,8 @@ mod tests {
             "../tests/fixtures/muse-tool-result-followup.json"
         ))
         .expect("tool-result followup fixture");
-        let normalized =
-            normalize_responses_request(request, false).expect("normalized tool-result followup");
+        let normalized = normalize_responses_request(request, false, false, None)
+            .expect("normalized tool-result followup");
         let input = normalized["input"].as_array().expect("input array");
 
         assert_eq!(input[2]["type"], "reasoning");
@@ -1547,6 +2062,8 @@ mod tests {
                 }]
             }),
             false,
+            false,
+            None,
         )
         .expect("normalized dotted standalone function");
 
@@ -1570,6 +2087,8 @@ mod tests {
                 ]
             }),
             false,
+            false,
+            None,
         )
         .expect_err("ambiguous flattened name must fail closed");
 
@@ -1582,8 +2101,8 @@ mod tests {
             "../tests/fixtures/muse-responses-request.json"
         ))
         .expect("request fixture");
-        let normalized =
-            normalize_responses_request(request, true).expect("normalized API request");
+        let normalized = normalize_responses_request(request, true, false, None)
+            .expect("normalized API request");
 
         assert_eq!(normalized["max_output_tokens"], 4096);
         assert_eq!(normalized["parallel_tool_calls"], false);
@@ -1602,7 +2121,7 @@ mod tests {
                 "input": "hello"
             });
             request[field] = Value::String("secret-state-id".to_string());
-            let error = normalize_responses_request(request, false)
+            let error = normalize_responses_request(request, false, false, None)
                 .expect_err("stateful request must fail closed");
             assert!(matches!(error, Error::InvalidRequest(message) if message.contains(field)));
         }
@@ -1613,6 +2132,8 @@ mod tests {
                 "input": [{"type":"future_private_item","secret":"do-not-log"}]
             }),
             false,
+            false,
+            None,
         )
         .expect_err("unknown input item must fail closed");
         let rendered = error.to_string();
@@ -1627,9 +2148,9 @@ mod tests {
             "input": "hello",
             "reasoning": {"effort":"low", "summary":"none"}
         });
-        let subscription =
-            normalize_responses_request(request.clone(), false).expect("subscription request");
-        let api = normalize_responses_request(request, true).expect("API request");
+        let subscription = normalize_responses_request(request.clone(), false, false, None)
+            .expect("subscription request");
+        let api = normalize_responses_request(request, true, false, None).expect("API request");
 
         assert!(subscription["reasoning"].get("summary").is_none());
         assert_eq!(api["reasoning"]["summary"], "none");
@@ -1656,6 +2177,8 @@ mod tests {
                 }]
             }),
             false,
+            false,
+            None,
         )
         .expect("normalized request");
 
@@ -1667,6 +2190,40 @@ mod tests {
             normalized["input"][0]["content"][1]["image_url"],
             "data:image/png;base64,AA=="
         );
+        assert_eq!(
+            normalized["include"],
+            serde_json::json!(["reasoning.encrypted_content"])
+        );
+    }
+
+    #[test]
+    fn response_normalizer_strips_unprefixed_legacy_item_ids() {
+        let normalized = normalize_responses_request(
+            serde_json::json!({
+                "model": "gpt-fixture",
+                "input": [
+                    {
+                        "type": "message",
+                        "id": "legacy-id",
+                        "role": "assistant",
+                        "content": "legacy"
+                    },
+                    {
+                        "type": "message",
+                        "id": "msg_current",
+                        "role": "assistant",
+                        "content": "current"
+                    }
+                ]
+            }),
+            false,
+            false,
+            None,
+        )
+        .expect("normalized request");
+
+        assert!(normalized["input"][0].get("id").is_none());
+        assert_eq!(normalized["input"][1]["id"], "msg_current");
     }
 
     #[test]
@@ -1681,6 +2238,223 @@ mod tests {
         assert_eq!(models[0].supported_reasoning_efforts, ["low", "high"]);
         assert!(models[0].is_visible);
         assert!(!models[1].is_default);
+    }
+
+    #[test]
+    fn normalizes_current_catalog_and_hides_unsupported_future_wire_modes() {
+        let models = normalize_models(include_bytes!("../tests/fixtures/models-0.153.4.json"))
+            .expect("current models fixture");
+        assert_eq!(models[0].id, "gpt-6-astra");
+        assert!(models[0].is_default);
+        assert!(models[0].use_responses_lite);
+        assert_eq!(models[0].tool_mode.as_deref(), Some("code_mode_only"));
+        assert_eq!(models[0].input_modalities, ["text", "image"]);
+        assert_eq!(models[0].context_window, Some(272_000));
+        assert_eq!(models[0].max_output_tokens, None);
+
+        for id in [
+            "gpt-6-astra",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        ] {
+            assert!(
+                models
+                    .iter()
+                    .find(|model| model.id == id)
+                    .is_some_and(|model| model.is_visible && model.use_responses_lite)
+            );
+        }
+        let luna = models
+            .iter()
+            .find(|model| model.id == "gpt-5.6-luna")
+            .expect("Luna model");
+        assert!(
+            !luna
+                .supported_reasoning_efforts
+                .contains(&"ultra".to_string())
+        );
+        for id in ["future-wire-model", "future-tool-mode", "codex-auto-review"] {
+            assert!(
+                !models
+                    .iter()
+                    .find(|model| model.id == id)
+                    .expect("fixture model")
+                    .is_visible
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_bundled_catalog_parses_and_contains_every_latest_model() {
+        let models = normalize_models(BUNDLED_MODEL_CATALOG).expect("pinned bundled catalog");
+        assert_eq!(models[0].id, "gpt-6-astra");
+        for id in [
+            "gpt-6-astra",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        ] {
+            let model = models
+                .iter()
+                .find(|model| model.id == id)
+                .expect("latest model in bundled catalog");
+            assert!(model.is_visible);
+            assert!(model.supported_in_api);
+            assert!(model.use_responses_lite);
+            assert_eq!(model.tool_mode.as_deref(), Some("code_mode_only"));
+        }
+    }
+
+    #[test]
+    fn public_api_catalog_is_enriched_only_for_returned_bundled_models() {
+        let models = normalize_api_models_with_bundled_metadata(
+            br#"{"data":[{"id":"unlisted-public-model"},{"id":"gpt-6-astra"}]}"#,
+        )
+        .expect("enriched public catalog");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "gpt-6-astra");
+        assert!(models[0].is_default);
+        assert!(models[0].use_responses_lite);
+        assert_eq!(models[0].context_window, Some(272_000));
+        assert!(
+            !models
+                .iter()
+                .any(|model| model.id == "unlisted-public-model")
+        );
+        assert!(!models.iter().any(|model| model.id == "gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn responses_lite_moves_instructions_and_tools_into_stable_prefix_items() {
+        let request: Value = serde_json::from_slice(include_bytes!(
+            "../tests/fixtures/muse-responses-request.json"
+        ))
+        .expect("request fixture");
+        let normalized =
+            normalize_responses_request(request.clone(), false, true, Some("session-a"))
+                .expect("Responses Lite request");
+        let repeated = normalize_responses_request(request.clone(), false, true, Some("session-a"))
+            .expect("repeated Responses Lite request");
+        let other_session = normalize_responses_request(request, false, true, Some("session-b"))
+            .expect("other-session Responses Lite request");
+
+        assert!(normalized.get("instructions").is_none());
+        assert!(normalized.get("tools").is_none());
+        assert_eq!(normalized["parallel_tool_calls"], false);
+        assert_eq!(normalized["reasoning"]["context"], "all_turns");
+        assert_eq!(normalized["input"][0]["type"], "additional_tools");
+        assert!(
+            normalized["input"][0]["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("at_"))
+        );
+        assert_eq!(normalized["input"][1]["type"], "message");
+        assert_eq!(normalized["input"][1]["role"], "developer");
+        assert_eq!(
+            normalized["input"][1]["content"][0]["text"],
+            "Fixture instructions"
+        );
+        assert_eq!(normalized["input"][0]["id"], repeated["input"][0]["id"]);
+        assert_eq!(normalized["input"][1]["id"], repeated["input"][1]["id"]);
+        assert_ne!(
+            normalized["input"][0]["id"],
+            other_session["input"][0]["id"]
+        );
+        assert_ne!(
+            normalized["input"][1]["id"],
+            other_session["input"][1]["id"]
+        );
+        assert_eq!(normalized["input"][0]["tools"][0]["type"], "namespace");
+        assert_eq!(normalized["input"][0]["tools"][0]["name"], "muse");
+        assert!(normalized["input"][3]["content"][1].get("detail").is_none());
+    }
+
+    #[test]
+    fn responses_lite_groups_default_tools_and_strips_tool_output_image_details() {
+        let normalized = normalize_responses_request(
+            serde_json::json!({
+                "model": "gpt-6-astra",
+                "instructions": "Use the available tools.",
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call-function",
+                        "output": [{
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,AA==",
+                            "detail": "high"
+                        }]
+                    },
+                    {
+                        "type": "custom_tool_call_output",
+                        "call_id": "call-custom",
+                        "output": [{
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,BB==",
+                            "detail": "original"
+                        }]
+                    }
+                ],
+                "tools": [
+                    {"type": "web_search"},
+                    {
+                        "type": "function",
+                        "name": "lookup",
+                        "parameters": {"type":"object","properties":{}}
+                    },
+                    {
+                        "type": "custom",
+                        "name": "exec",
+                        "description": "Run JavaScript",
+                        "format": {"type":"grammar","syntax":"lark","definition":"start: /.+/"}
+                    },
+                    {
+                        "type": "namespace",
+                        "name": "functions",
+                        "description": "Existing default tools",
+                        "tools": [{
+                            "type": "function",
+                            "name": "existing",
+                            "parameters": {"type":"object","properties":{}}
+                        }]
+                    },
+                    {
+                        "type": "namespace",
+                        "name": "muse",
+                        "tools": [{
+                            "type": "function",
+                            "name": "read_file",
+                            "parameters": {"type":"object","properties":{}}
+                        }]
+                    }
+                ]
+            }),
+            false,
+            true,
+            Some("session-tools"),
+        )
+        .expect("Responses Lite request");
+
+        let tools = normalized["input"][0]["tools"]
+            .as_array()
+            .expect("additional tools");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["type"], "namespace");
+        assert_eq!(tools[0]["name"], "functions");
+        assert_eq!(tools[0]["description"], "Existing default tools");
+        assert_eq!(tools[0]["tools"][0]["name"], "lookup");
+        assert_eq!(tools[0]["tools"][1]["name"], "exec");
+        assert_eq!(tools[0]["tools"][2]["name"], "existing");
+        assert_eq!(tools[1]["name"], "muse");
+        assert_eq!(normalized["reasoning"]["context"], "all_turns");
+        assert_eq!(
+            normalized["include"],
+            serde_json::json!(["reasoning.encrypted_content"])
+        );
+        assert!(normalized["input"][2]["output"][0].get("detail").is_none());
+        assert!(normalized["input"][3]["output"][0].get("detail").is_none());
     }
 
     #[test]
@@ -1722,6 +2496,21 @@ mod tests {
     }
 
     #[test]
+    fn accepts_legacy_array_minimum_versions_and_filters_future_versions() {
+        let models = normalize_models(
+            br#"{
+                "models": [
+                    {"slug":"current","minimal_client_version":[0,153,4]},
+                    {"slug":"future","minimal_client_version":[99,0,0]}
+                ]
+            }"#,
+        )
+        .expect("array client versions");
+        assert!(models[0].is_visible);
+        assert!(!models[1].is_visible);
+    }
+
+    #[test]
     fn rejects_an_empty_model_catalog() {
         assert!(matches!(
             normalize_models(br#"{"models":[]}"#),
@@ -1749,14 +2538,25 @@ mod tests {
             br#"{"models":[{"slug":"one"}],"data":[{"id":"two"}]}"#.as_slice(),
             br#"{"models":[{"slug":"same"},{"slug":"same"}]}"#.as_slice(),
             br#"{"models":[{"slug":"bad","context_window":0}]}"#.as_slice(),
-            br#"{"models":[{"slug":"bad","supported_reasoning_levels":[{"effort":"low"}],"default_reasoning_level":"high"}]}"#.as_slice(),
-            br#"{"models":[{"slug":"bad","supported_reasoning_levels":[{"effort":"future"}]}]}"#.as_slice(),
+            br#"{"models":[{"slug":"bad","minimal_client_version":"not-semver"}]}"#.as_slice(),
+            br#"{"models":[{"slug":"bad","input_modalities":["bad modality"]}]}"#.as_slice(),
         ] {
             assert!(matches!(
                 normalize_models(fixture),
                 Err(Error::InvalidUpstreamResponse(_))
             ));
         }
+    }
+
+    #[test]
+    fn future_reasoning_efforts_are_filtered_without_poisoning_the_catalog() {
+        let models = normalize_models(
+            br#"{"models":[{"slug":"usable","supported_reasoning_levels":[{"effort":"low"},{"effort":"future"}],"default_reasoning_level":"future"}]}"#,
+        )
+        .expect("catalog with a future effort");
+        assert_eq!(models[0].supported_reasoning_efforts, ["low"]);
+        assert_eq!(models[0].default_reasoning_effort, None);
+        assert!(models[0].is_visible);
     }
 
     #[test]
@@ -1801,11 +2601,94 @@ mod tests {
             HeaderName::from_static("x-muse-session"),
             HeaderValue::from_static("preserved"),
         );
+        source.insert(
+            HeaderName::from_static(RESPONSES_LITE_HEADER),
+            HeaderValue::from_static("spoofed"),
+        );
         merge_safe_request_headers(&mut destination, &source);
         assert!(!destination.contains_key(AUTHORIZATION));
         assert!(!destination.contains_key("chatgpt-account-id"));
         assert!(!destination.contains_key("x-api-key"));
+        assert!(!destination.contains_key(RESPONSES_LITE_HEADER));
         assert_eq!(destination["x-muse-session"], "preserved");
+
+        set_internal_responses_lite_header(&mut destination, true);
+        assert_eq!(destination[RESPONSES_LITE_HEADER], "true");
+        set_internal_responses_lite_header(&mut destination, false);
+        assert!(!destination.contains_key(RESPONSES_LITE_HEADER));
+    }
+
+    #[tokio::test]
+    async fn send_json_once_emits_one_trusted_responses_lite_header() {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind request capture listener");
+        let address = listener.local_addr().expect("capture listener address");
+        let capture_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept captured request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 2048];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket
+                    .read(&mut buffer)
+                    .await
+                    .expect("read captured request");
+                assert_ne!(read, 0, "request ended before its headers were complete");
+                request.extend_from_slice(&buffer[..read]);
+            }
+
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await
+                .expect("write capture response");
+            String::from_utf8(request).expect("captured request is UTF-8")
+        });
+
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = AuthConfig::with_home(temporary.path().join("muse-codex"))
+            .expect("private auth directory");
+        let transport = Transport::new(
+            config,
+            Some(SecretString::from("sk-fixture".to_string())),
+            Some(Url::parse(&format!("http://{address}/v1")).expect("capture base URL")),
+        )
+        .await
+        .expect("local test transport");
+        let mut caller_headers = HeaderMap::new();
+        caller_headers.append(
+            HeaderName::from_static(RESPONSES_LITE_HEADER),
+            HeaderValue::from_static("spoofed"),
+        );
+        caller_headers.append(
+            HeaderName::from_static(RESPONSES_LITE_HEADER),
+            HeaderValue::from_static("also-spoofed"),
+        );
+
+        let response = transport
+            .send_json_once(
+                Method::POST,
+                "responses",
+                &serde_json::json!({"model":"gpt-fixture","input":[]}),
+                &caller_headers,
+                "text/event-stream",
+                true,
+            )
+            .await
+            .expect("captured response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let request = capture_task.await.expect("request capture task");
+        let header_values = request
+            .split("\r\n")
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(name, _)| name.eq_ignore_ascii_case(RESPONSES_LITE_HEADER))
+            .map(|(_, value)| value.trim())
+            .collect::<Vec<_>>();
+        assert_eq!(header_values, ["true"]);
+        assert!(!request.contains("spoofed"));
     }
 
     #[test]
@@ -1870,6 +2753,7 @@ mod tests {
             ),
             auth_manager: None,
             client: build_http_client().expect("HTTP client"),
+            model_capabilities: Arc::new(RwLock::new(BTreeMap::new())),
         };
 
         let debug = format!("{transport:?}");

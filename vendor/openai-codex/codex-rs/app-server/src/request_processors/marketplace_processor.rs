@@ -1,4 +1,5 @@
 use super::*;
+use crate::plugin_config_reload;
 
 #[derive(Clone)]
 pub(crate) struct MarketplaceRequestProcessor {
@@ -51,8 +52,10 @@ impl MarketplaceRequestProcessor {
         &self,
         params: MarketplaceRemoveParams,
     ) -> Result<MarketplaceRemoveResponse, JSONRPCErrorError> {
+        let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
         remove_marketplace(
-            self.config.codex_home.to_path_buf(),
+            config.codex_home.to_path_buf(),
+            config.config_layer_stack,
             CoreMarketplaceRemoveRequest {
                 marketplace_name: params.marketplace_name,
             },
@@ -76,16 +79,26 @@ impl MarketplaceRequestProcessor {
         let plugins_manager = self.thread_manager.plugins_manager();
         let MarketplaceUpgradeParams { marketplace_name } = params;
         let plugins_input = config.plugins_config_input();
+        let reload_config =
+            plugin_config_reload::for_cwd(self.config_manager.clone(), config.cwd.clone());
 
         let outcome = tokio::task::spawn_blocking(move || {
             plugins_manager.upgrade_configured_marketplaces_for_config(
                 &plugins_input,
                 marketplace_name.as_deref(),
+                &reload_config,
             )
         })
         .await
         .map_err(|err| internal_error(format!("failed to upgrade marketplaces: {err}")))?
         .map_err(invalid_request)?;
+
+        if !outcome.upgraded_roots.is_empty() {
+            self.thread_manager.plugins_manager().clear_cache();
+            self.thread_manager.skills_service().clear_cache();
+            self.thread_manager.invalidate_mcp_runtimes().await;
+            self.thread_manager.refresh_hook_runtimes().await;
+        }
 
         Ok(MarketplaceUpgradeResponse {
             selected_marketplaces: outcome.selected_marketplaces,
@@ -105,8 +118,10 @@ impl MarketplaceRequestProcessor {
         &self,
         params: MarketplaceAddParams,
     ) -> Result<MarketplaceAddResponse, JSONRPCErrorError> {
+        let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
         add_marketplace_to_codex_home(
             self.config.codex_home.to_path_buf(),
+            config.config_layer_stack.requirements().clone(),
             MarketplaceAddRequest {
                 source: params.source,
                 ref_name: params.ref_name,

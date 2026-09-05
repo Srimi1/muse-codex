@@ -1,11 +1,18 @@
 use axum::Router;
+use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::extract::State;
 use axum::extract::ws::WebSocketUpgrade;
+use axum::http::Request;
 use axum::http::StatusCode;
+use axum::http::header::ORIGIN;
+use axum::middleware;
+use axum::middleware::Next;
 use axum::response::IntoResponse;
+use axum::response::Response;
 use axum::routing::any;
 use axum::routing::get;
+use codex_http_client::HttpClientFactory;
 use std::io::Write as _;
 use std::net::SocketAddr;
 use tokio::io;
@@ -13,10 +20,14 @@ use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::net::TcpListener;
 use tracing::info;
+use tracing::warn;
 
 use crate::ExecServerRuntimePaths;
+use crate::ExecServerTelemetry;
 use crate::connection::JsonRpcConnection;
+use crate::server::RequestDispatchMode;
 use crate::server::processor::ConnectionProcessor;
+use crate::telemetry::ConnectionTransport;
 
 pub const DEFAULT_LISTEN_URL: &str = "ws://127.0.0.1:0";
 
@@ -73,49 +84,95 @@ pub(crate) fn parse_listen_url(
 pub(crate) async fn run_transport(
     listen_url: &str,
     runtime_paths: ExecServerRuntimePaths,
+    telemetry: ExecServerTelemetry,
+    http_client_factory: HttpClientFactory,
+    request_dispatch_mode: RequestDispatchMode,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match parse_listen_url(listen_url)? {
         ExecServerListenTransport::WebSocket(bind_address) => {
-            run_websocket_listener(bind_address, runtime_paths).await
+            run_websocket_listener(
+                bind_address,
+                runtime_paths,
+                telemetry,
+                http_client_factory,
+                request_dispatch_mode,
+            )
+            .await
         }
-        ExecServerListenTransport::Stdio => run_stdio_connection(runtime_paths).await,
+        ExecServerListenTransport::Stdio => {
+            run_stdio_connection(
+                runtime_paths,
+                telemetry,
+                http_client_factory,
+                request_dispatch_mode,
+            )
+            .await
+        }
     }
 }
 
 async fn run_stdio_connection(
     runtime_paths: ExecServerRuntimePaths,
+    telemetry: ExecServerTelemetry,
+    http_client_factory: HttpClientFactory,
+    request_dispatch_mode: RequestDispatchMode,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    run_stdio_connection_with_io(io::stdin(), io::stdout(), runtime_paths).await
+    run_stdio_connection_with_io(
+        io::stdin(),
+        io::stdout(),
+        runtime_paths,
+        telemetry,
+        http_client_factory,
+        request_dispatch_mode,
+    )
+    .await
 }
 
 async fn run_stdio_connection_with_io<R, W>(
     reader: R,
     writer: W,
     runtime_paths: ExecServerRuntimePaths,
+    telemetry: ExecServerTelemetry,
+    http_client_factory: HttpClientFactory,
+    request_dispatch_mode: RequestDispatchMode,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let processor = ConnectionProcessor::new(runtime_paths);
+    let processor = ConnectionProcessor::new_with_telemetry(
+        runtime_paths,
+        telemetry,
+        http_client_factory,
+        request_dispatch_mode,
+    );
     tracing::info!("codex-exec-server listening on stdio");
     processor
-        .run_connection(JsonRpcConnection::from_stdio(
-            reader,
-            writer,
-            "exec-server stdio".to_string(),
-        ))
+        .run_connection(
+            JsonRpcConnection::from_stdio(reader, writer, "exec-server stdio".to_string()),
+            ConnectionTransport::Stdio,
+        )
         .await;
+    // Stdio serves exactly one connection, so detached sessions cannot be resumed.
+    processor.shutdown().await;
     Ok(())
 }
 
 async fn run_websocket_listener(
     bind_address: SocketAddr,
     runtime_paths: ExecServerRuntimePaths,
+    telemetry: ExecServerTelemetry,
+    http_client_factory: HttpClientFactory,
+    request_dispatch_mode: RequestDispatchMode,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(bind_address).await?;
     let local_addr = listener.local_addr()?;
-    let processor = ConnectionProcessor::new(runtime_paths);
+    let processor = ConnectionProcessor::new_with_telemetry(
+        runtime_paths,
+        telemetry,
+        http_client_factory,
+        request_dispatch_mode,
+    );
     info!("codex-exec-server listening on ws://{local_addr}");
     println!("ws://{local_addr}");
     std::io::stdout().flush()?;
@@ -123,6 +180,7 @@ async fn run_websocket_listener(
     let router = Router::new()
         .route("/", any(websocket_upgrade_handler))
         .route("/readyz", get(readiness_handler))
+        .layer(middleware::from_fn(reject_requests_with_origin_header))
         .with_state(ExecServerWebSocketState { processor });
     axum::serve(
         listener,
@@ -141,6 +199,22 @@ async fn readiness_handler() -> StatusCode {
     StatusCode::OK
 }
 
+async fn reject_requests_with_origin_header(
+    request: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if request.headers().contains_key(ORIGIN) {
+        warn!(
+            method = %request.method(),
+            uri = %request.uri(),
+            "rejecting exec-server websocket listener request with Origin header"
+        );
+        Err(StatusCode::FORBIDDEN)
+    } else {
+        Ok(next.run(request).await)
+    }
+}
+
 async fn websocket_upgrade_handler(
     websocket: WebSocketUpgrade,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -150,10 +224,13 @@ async fn websocket_upgrade_handler(
     websocket.on_upgrade(move |stream| async move {
         state
             .processor
-            .run_connection(JsonRpcConnection::from_axum_websocket(
-                stream,
-                format!("exec-server websocket {peer_addr}"),
-            ))
+            .run_connection(
+                JsonRpcConnection::from_axum_websocket(
+                    stream,
+                    format!("exec-server websocket {peer_addr}"),
+                ),
+                ConnectionTransport::WebSocket,
+            )
             .await;
     })
 }

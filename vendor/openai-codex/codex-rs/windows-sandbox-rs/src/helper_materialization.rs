@@ -96,22 +96,26 @@ pub fn resolve_current_exe_for_launch(codex_home: &Path, fallback_executable: &s
         Ok(path) => path,
         Err(_) => return PathBuf::from(fallback_executable),
     };
+    resolve_exe_for_launch(&source, codex_home)
+}
+
+pub fn resolve_exe_for_launch(source: &Path, codex_home: &Path) -> PathBuf {
     let Some(file_name) = source.file_name() else {
-        return source;
+        return source.to_path_buf();
     };
     let destination = helper_bin_dir(codex_home).join(file_name);
-    match copy_from_source_if_needed(&source, &destination) {
+    match copy_from_source_if_needed(source, &destination) {
         Ok(_) => destination,
         Err(err) => {
             let sandbox_log_dir = crate::sandbox_dir(codex_home);
             log_note(
                 &format!(
-                    "helper copy failed for current executable: {err:#}; falling back to legacy path {}",
+                    "helper copy failed for executable: {err:#}; falling back to legacy path {}",
                     source.display()
                 ),
                 Some(&sandbox_log_dir),
             );
-            source
+            source.to_path_buf()
         }
     }
 }
@@ -188,23 +192,28 @@ fn sibling_source_path(kind: HelperExecutable) -> Result<PathBuf> {
 }
 
 pub(crate) fn bundled_executable_path_for_exe(exe: &Path, file_name: &str) -> Option<PathBuf> {
-    let dir = exe.parent()?;
-    let direct_candidate = dir.join(file_name);
-    if direct_candidate.is_file() {
-        return Some(direct_candidate);
-    }
-
-    if dir.file_name() == Some(OsStr::new(BIN_DIRNAME))
-        && let Some(package_dir) = dir.parent()
-    {
-        let package_resource_candidate = package_dir.join(RESOURCES_DIRNAME).join(file_name);
-        if package_resource_candidate.is_file() {
-            return Some(package_resource_candidate);
+    let find = |exe: &Path| {
+        let dir = exe.parent()?;
+        let direct_candidate = dir.join(file_name);
+        if direct_candidate.is_file() {
+            return Some(direct_candidate);
         }
-    }
 
-    let resource_candidate = dir.join(RESOURCES_DIRNAME).join(file_name);
-    resource_candidate.is_file().then_some(resource_candidate)
+        if dir.file_name() == Some(OsStr::new(BIN_DIRNAME))
+            && let Some(package_dir) = dir.parent()
+        {
+            let package_resource_candidate = package_dir.join(RESOURCES_DIRNAME).join(file_name);
+            if package_resource_candidate.is_file() {
+                return Some(package_resource_candidate);
+            }
+        }
+
+        let resource_candidate = dir.join(RESOURCES_DIRNAME).join(file_name);
+        resource_candidate.is_file().then_some(resource_candidate)
+    };
+
+    // Installer bin directories can be junctions, so retry beside the real executable once.
+    find(exe).or_else(|| find(&dunce::canonicalize(exe).ok()?))
 }
 
 fn helper_destination_for_source(
@@ -494,6 +503,38 @@ mod tests {
                 .expect("helper path");
 
         assert_eq!(resolved, helper);
+    }
+
+    #[test]
+    fn helper_source_lookup_resolves_bin_junctions() {
+        let tmp = TempDir::new().expect("tempdir");
+        let package_dir = tmp.path().join("package");
+        let bin_dir = package_dir.join(BIN_DIRNAME);
+        let resources_dir = package_dir.join(RESOURCES_DIRNAME);
+        let install_dir = tmp.path().join("install");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        fs::create_dir_all(&resources_dir).expect("create resources dir");
+        fs::create_dir_all(&install_dir).expect("create install dir");
+        fs::write(bin_dir.join("codex.exe"), b"codex").expect("write exe");
+        let helper = resources_dir.join("codex-windows-sandbox-setup.exe");
+        fs::write(&helper, b"setup").expect("write helper");
+
+        let junction = install_dir.join(BIN_DIRNAME);
+        let output = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&bin_dir)
+            .output()
+            .expect("create bin junction");
+        assert!(output.status.success());
+
+        assert_eq!(
+            bundled_executable_path_for_exe(
+                &junction.join("codex.exe"),
+                /*file_name*/ "codex-windows-sandbox-setup.exe"
+            ),
+            Some(dunce::canonicalize(&helper).expect("canonical helper"))
+        );
     }
 
     #[test]

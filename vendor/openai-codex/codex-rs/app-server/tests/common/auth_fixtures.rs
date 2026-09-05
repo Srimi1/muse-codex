@@ -6,12 +6,13 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::DateTime;
 use chrono::Utc;
-use codex_app_server_protocol::AuthMode;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_login::AuthDotJson;
+use codex_login::AuthKeyringBackendKind;
 use codex_login::save_auth;
 use codex_login::token_data::TokenData;
 use codex_login::token_data::parse_chatgpt_jwt_claims;
+use codex_protocol::auth::AuthMode;
 use serde_json::json;
 
 /// Builder for writing a fake ChatGPT auth.json in tests.
@@ -82,6 +83,7 @@ pub struct ChatGptIdTokenClaims {
     pub plan_type: Option<String>,
     pub chatgpt_user_id: Option<String>,
     pub chatgpt_account_id: Option<String>,
+    pub chatgpt_account_is_fedramp: bool,
 }
 
 impl ChatGptIdTokenClaims {
@@ -126,6 +128,9 @@ pub fn encode_id_token(claims: &ChatGptIdTokenClaims) -> Result<String> {
     if let Some(chatgpt_account_id) = &claims.chatgpt_account_id {
         auth_payload.insert("chatgpt_account_id".to_string(), json!(chatgpt_account_id));
     }
+    if claims.chatgpt_account_is_fedramp {
+        auth_payload.insert("chatgpt_account_is_fedramp".to_string(), json!(true));
+    }
     if !auth_payload.is_empty() {
         payload.insert(
             "https://api.openai.com/auth".to_string(),
@@ -164,7 +169,16 @@ pub fn write_chatgpt_auth(
         tokens: Some(tokens),
         last_refresh,
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
+        bedrock_access_keys: None,
     };
 
-    save_auth(codex_home, &auth, cli_auth_credentials_store_mode).context("write auth.json")
+    save_auth(
+        codex_home,
+        &auth,
+        cli_auth_credentials_store_mode,
+        AuthKeyringBackendKind::default(),
+    )
+    .context("write auth.json")
 }

@@ -7,7 +7,7 @@ feed. It must not publish or redistribute the stock Muse executable.
 ## Release prerequisites
 
 - Apple-silicon macOS
-- Rust `1.93.0` with the `aarch64-apple-darwin` target
+- Rust `1.95.0` with the `aarch64-apple-darwin` target
 - `ssh-keygen` with SSHSIG support
 - A protected Ed25519 signing key stored outside the repository and build output
 - An immutable HTTPS destination for release files
@@ -28,6 +28,8 @@ With the exact separately licensed stock binary and debug wrapper installed:
 
 ```sh
 cargo build --workspace --locked
+MUSE_CODEX_MUSE_BIN=/absolute/path/to/muse-bin-1.0.3-R2198.1 \
+  bash scripts/verify-muse-baseline.sh
 MUSE_CODEX_MUSE_BIN=/absolute/path/to/muse-bin-1.0.3-R2198.1 \
   python3 tests/scripts/cli-msp-parity-test.py
 ```
@@ -55,9 +57,11 @@ and Codex vendor revision in operator release notes.
 ## 2. Build the artifacts
 
 ```sh
-rustup target add aarch64-apple-darwin --toolchain 1.93.0
+rustup target add aarch64-apple-darwin --toolchain 1.95.0
 cargo build --workspace --release --locked --target aarch64-apple-darwin
-target/aarch64-apple-darwin/release/muse-codex-gateway self-test
+MUSE_CODEX_MUSE_BIN=/absolute/path/to/muse-bin-1.0.3-R2198.1 \
+MUSE_CODEX_GATEWAY_BIN="$PWD/target/aarch64-apple-darwin/release/muse-codex-gateway" \
+  target/aarch64-apple-darwin/release/muse-codex self-test
 ```
 
 ## 3. Prepare signing material
@@ -132,7 +136,7 @@ retains the accompanying license and notice files.
 - [ ] Source commit and changelog reviewed.
 - [ ] CI and local qualification checks pass.
 - [ ] Exact Muse and Codex pins recorded.
-- [ ] Release build and gateway self-test pass on Apple silicon.
+- [ ] Release build and launcher/gateway pair self-test pass on Apple silicon.
 - [ ] Manifest signature, filenames, sizes, and digests verify.
 - [ ] License and both third-party notice files are present and signed.
 - [ ] Bundle contains no stock Muse artifact or secret.

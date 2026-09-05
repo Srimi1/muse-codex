@@ -6,6 +6,7 @@
 //! suppress duplicate rows for pending steers.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -20,21 +21,23 @@ use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::models::local_image_label_text;
 use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
+use codex_utils_plugins::mention_syntax::PLUGIN_TEXT_MENTION_SIGIL;
+use codex_utils_plugins::mention_syntax::TOOL_MENTION_SIGIL;
 
 use super::ChatWidget;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct UserMessage {
-    pub(super) text: String,
-    pub(super) local_images: Vec<LocalImageAttachment>,
+    pub(crate) text: String,
+    pub(crate) local_images: Vec<LocalImageAttachment>,
     /// Remote image attachments represented as URLs (for example data URLs)
     /// provided by app-server clients.
     ///
     /// Unlike `local_images`, these are not created by TUI image attach/paste
     /// flows. The TUI can restore and remove them while editing/backtracking.
-    pub(super) remote_image_urls: Vec<String>,
-    pub(super) text_elements: Vec<TextElement>,
-    pub(super) mention_bindings: Vec<MentionBinding>,
+    pub(crate) remote_image_urls: Vec<String>,
+    pub(crate) text_elements: Vec<TextElement>,
+    pub(crate) mention_bindings: Vec<MentionBinding>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -59,6 +62,7 @@ pub(super) enum ShellEscapePolicy {
 pub(super) struct QueuedUserMessage {
     pub(super) user_message: UserMessage,
     pub(super) action: QueuedInputAction,
+    pub(super) pending_pastes: Vec<(String, String)>,
 }
 
 impl QueuedUserMessage {
@@ -66,6 +70,7 @@ impl QueuedUserMessage {
         Self {
             user_message,
             action,
+            pending_pastes: Vec::new(),
         }
     }
 
@@ -118,6 +123,7 @@ impl ThreadComposerState {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ThreadInputState {
     pub(super) composer: Option<ThreadComposerState>,
+    pub(super) safety_buffering_prompt: Option<UserMessage>,
     pub(super) pending_steers: VecDeque<UserMessage>,
     pub(super) pending_steer_history_records: VecDeque<UserMessageHistoryRecord>,
     pub(super) pending_steer_compare_keys: VecDeque<PendingSteerCompareKey>,
@@ -125,11 +131,18 @@ pub(crate) struct ThreadInputState {
     pub(super) rejected_steer_history_records: VecDeque<UserMessageHistoryRecord>,
     pub(super) queued_user_messages: VecDeque<QueuedUserMessage>,
     pub(super) queued_user_message_history_records: VecDeque<UserMessageHistoryRecord>,
+    pub(crate) recovered_queue: bool,
     pub(super) user_turn_pending_start: bool,
+    pub(super) submit_pending_steers_after_interrupt: bool,
     pub(super) current_collaboration_mode: CollaborationMode,
     pub(super) active_collaboration_mask: Option<CollaborationModeMask>,
     pub(super) task_running: bool,
     pub(super) agent_turn_running: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ThreadInputStateRestoreMode {
+    pub(crate) preserve_in_flight_turn: bool,
 }
 
 impl From<String> for UserMessage {
@@ -274,6 +287,34 @@ fn remap_placeholders_in_text(
     }
 
     (rebuilt, rebuilt_elements)
+}
+
+pub(super) fn remap_colliding_paste_placeholders(
+    mut message: UserMessage,
+    mut pending_pastes: Vec<(String, String)>,
+    used: &mut HashSet<String>,
+) -> (UserMessage, Vec<(String, String)>) {
+    let mut mapping = HashMap::new();
+    for (placeholder, text) in &mut pending_pastes {
+        if used.insert(placeholder.clone()) {
+            continue;
+        }
+
+        let base = format!("[Pasted Content {} chars]", text.chars().count());
+        let mut suffix = 2;
+        let replacement = loop {
+            let candidate = format!("{base} #{suffix}");
+            if used.insert(candidate.clone()) {
+                break candidate;
+            }
+            suffix += 1;
+        };
+        mapping.insert(placeholder.clone(), replacement.clone());
+        *placeholder = replacement;
+    }
+    (message.text, message.text_elements) =
+        remap_placeholders_in_text(message.text, message.text_elements, &mapping);
+    (message, pending_pastes)
 }
 
 // When merging multiple queued drafts (e.g., after interrupt), each draft starts numbering
@@ -493,11 +534,123 @@ pub(super) fn merge_user_messages_with_history_record(
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct UserMessageDisplay {
-    pub(super) message: String,
-    pub(super) remote_image_urls: Vec<String>,
-    pub(super) local_images: Vec<PathBuf>,
-    pub(super) text_elements: Vec<TextElement>,
+pub(crate) struct UserMessageDisplay {
+    pub(crate) message: String,
+    pub(crate) remote_image_urls: Vec<String>,
+    pub(crate) local_images: Vec<PathBuf>,
+    pub(crate) text_elements: Vec<TextElement>,
+}
+
+pub(crate) fn mention_bindings_from_user_inputs(
+    items: &[UserInput],
+    message: &str,
+) -> Vec<MentionBinding> {
+    let mention_start = |sigil: char, mention: &str| {
+        let token = format!("{sigil}{mention}");
+        message.match_indices(&token).find_map(|(start, _)| {
+            let end = start + token.len();
+            message
+                .as_bytes()
+                .get(end)
+                .is_none_or(|byte| !byte.is_ascii_alphanumeric() && !matches!(byte, b'_' | b'-'))
+                .then_some(start)
+        })
+    };
+    let mut mention_bindings: Vec<MentionBinding> = items
+        .iter()
+        .filter_map(|item| match item {
+            UserInput::Skill { name, path } => Some(MentionBinding {
+                sigil: TOOL_MENTION_SIGIL,
+                mention: name.clone(),
+                path: path.to_string_lossy().into_owned(),
+            }),
+            UserInput::Mention { name, path } => {
+                let plugin_id = path.strip_prefix("plugin://");
+                let mention = if let Some(plugin_id) = plugin_id {
+                    plugin_id
+                        .split_once('@')
+                        .map(|(plugin_name, _)| plugin_name)
+                        .unwrap_or(plugin_id)
+                        .to_string()
+                } else if path.starts_with("app://") {
+                    codex_connectors::metadata::connector_mention_slug_from_name(name)
+                } else {
+                    name.clone()
+                };
+                let sigil = if plugin_id.is_some()
+                    && mention_start(PLUGIN_TEXT_MENTION_SIGIL, &mention).is_some()
+                {
+                    PLUGIN_TEXT_MENTION_SIGIL
+                } else {
+                    TOOL_MENTION_SIGIL
+                };
+                Some(MentionBinding {
+                    sigil,
+                    mention,
+                    path: path.clone(),
+                })
+            }
+            UserInput::Text { .. }
+            | UserInput::Image { .. }
+            | UserInput::LocalImage { .. }
+            | UserInput::Audio { .. }
+            | UserInput::LocalAudio { .. } => None,
+        })
+        .collect();
+    for item in items {
+        let UserInput::Text {
+            text,
+            text_elements,
+        } = item
+        else {
+            continue;
+        };
+        for element in text_elements {
+            if let Some((mention, path, end)) =
+                crate::task_mentions::parse_task_link(text, element.byte_range.start)
+                && end == element.byte_range.end
+                && element
+                    .placeholder()
+                    .and_then(|placeholder| placeholder.strip_prefix('@'))
+                    == Some(mention.as_str())
+            {
+                mention_bindings.push(MentionBinding {
+                    sigil: '@',
+                    mention,
+                    path,
+                });
+            }
+        }
+    }
+    mention_bindings.sort_by_key(|binding| {
+        let token = if crate::task_mentions::valid_thread_path(&binding.path).is_some() {
+            crate::task_mentions::format_task_link(&binding.mention, &binding.path)
+        } else {
+            format!("{}{}", binding.sigil, binding.mention)
+        };
+        let mut text_offset = 0;
+        items
+            .iter()
+            .find_map(|item| {
+                let UserInput::Text {
+                    text,
+                    text_elements,
+                } = item
+                else {
+                    return None;
+                };
+                let offset = text_offset;
+                text_offset += text.len();
+                text_elements.iter().find_map(|element| {
+                    (text.get(element.byte_range.start..element.byte_range.end)
+                        == Some(token.as_str()))
+                    .then_some(offset + element.byte_range.start)
+                })
+            })
+            .or_else(|| mention_start(binding.sigil, &binding.mention))
+            .unwrap_or(usize::MAX)
+    });
+    mention_bindings
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -557,7 +710,10 @@ impl ChatWidget {
             match item {
                 UserInput::Text { text, .. } => message.push_str(text),
                 UserInput::Image { .. } | UserInput::LocalImage { .. } => image_count += 1,
-                UserInput::Skill { .. } | UserInput::Mention { .. } => {}
+                UserInput::Audio { .. } // TODO: Include audio inputs in pending steer comparison.
+                | UserInput::LocalAudio { .. } // TODO: Include audio inputs in pending steer comparison.
+                | UserInput::Skill { .. }
+                | UserInput::Mention { .. } => {}
             }
         }
 
@@ -567,7 +723,13 @@ impl ChatWidget {
         }
     }
 
-    pub(super) fn user_message_display_from_inputs(items: &[UserInput]) -> UserMessageDisplay {
+    pub(crate) fn user_message_display_from_inputs(items: &[UserInput]) -> UserMessageDisplay {
+        if items
+            .iter()
+            .any(|item| matches!(item, UserInput::Audio { .. } | UserInput::LocalAudio { .. }))
+        {
+            tracing::warn!("audio user inputs are not supported by the TUI and will be omitted");
+        }
         let mut message = String::new();
         let mut remote_image_urls = Vec::new();
         let mut local_images = Vec::new();
@@ -578,6 +740,7 @@ impl ChatWidget {
                 UserInput::Text {
                     text,
                     text_elements: current_text_elements,
+                    ..
                 } => append_text_with_rebased_elements(
                     &mut message,
                     &mut text_elements,
@@ -595,9 +758,14 @@ impl ChatWidget {
                 ),
                 UserInput::Image { url, .. } => remote_image_urls.push(url.clone()),
                 UserInput::LocalImage { path, .. } => local_images.push(path.clone()),
-                UserInput::Skill { .. } | UserInput::Mention { .. } => {}
+                UserInput::Audio { .. } // TODO: Include audio inputs in the user message display.
+                | UserInput::LocalAudio { .. } // TODO: Include audio inputs in the user message display.
+                | UserInput::Skill { .. }
+                | UserInput::Mention { .. } => {}
             }
         }
+
+        (message, text_elements) = crate::task_mentions::decode_task_links(&message, text_elements);
 
         Self::user_message_display_from_parts(
             message,

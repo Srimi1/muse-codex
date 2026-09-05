@@ -4,7 +4,7 @@
 
 `codex-transport` builds against selected crates in the vendored OpenAI Codex
 source at immutable Git revision
-`9474e5cfc4494b0ba319352aa86ce436c59e65c8` (tag `rust-v0.133.0`). OpenAI Codex
+`3d2ee51ca2d5db578f328aa75e20aa22c0197c9a` (tag `rust-v0.153.4`). OpenAI Codex
 is Copyright OpenAI and contributors and is licensed under the Apache License,
 Version 2.0. The upstream source, license, vendor record, and documented
 manifest-only security patch are included under `vendor/openai-codex`.

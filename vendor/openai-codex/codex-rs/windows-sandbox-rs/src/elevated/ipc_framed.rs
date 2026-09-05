@@ -11,6 +11,7 @@ use anyhow::Result;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use codex_protocol::models::PermissionProfile;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -25,7 +26,7 @@ use std::path::PathBuf;
 const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
 
 /// Protocol version shared by the parent process and elevated command runner.
-pub const IPC_PROTOCOL_VERSION: u8 = 2;
+pub const IPC_PROTOCOL_VERSION: u8 = 6;
 
 /// Length-prefixed, JSON-encoded frame.
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -60,16 +61,21 @@ pub struct SpawnRequest {
     pub cwd: PathBuf,
     pub env: HashMap<String, String>,
     pub permission_profile: PermissionProfile,
-    pub permission_profile_cwd: PathBuf,
+    pub workspace_roots: Vec<AbsolutePathBuf>,
     pub codex_home: PathBuf,
     pub real_codex_home: PathBuf,
     pub cap_sids: Vec<String>,
+    /// Optional managed-network identity added only to the child's restricting SID set.
+    #[serde(default)]
+    pub network_proxy_restricting_sid: Option<String>,
     pub timeout_ms: Option<u64>,
     pub tty: bool,
     #[serde(default)]
     pub stdin_open: bool,
     #[serde(default)]
     pub use_private_desktop: bool,
+    /// Private desktop kept alive by the parent across command runners.
+    pub private_desktop_name: Option<String>,
 }
 
 /// Ack from runner after it spawns the child process.
@@ -117,7 +123,17 @@ pub struct ExitPayload {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ErrorPayload {
     pub message: String,
-    pub code: String,
+    pub stage: ErrorStage,
+    pub windows_error_code: Option<u32>,
+}
+
+/// Runner startup stage that produced an error.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorStage {
+    ReadSpawnRequest,
+    SpawnChild,
+    WriteSpawnReady,
 }
 
 /// Empty payload for control messages.
@@ -197,6 +213,10 @@ mod tests {
 
     #[test]
     fn spawn_request_serializes_permission_profile() {
+        let workspace_roots = vec![
+            AbsolutePathBuf::from_absolute_path(PathBuf::from(r"C:\workspace"))
+                .expect("absolute workspace root"),
+        ];
         let msg = FramedMessage {
             version: IPC_PROTOCOL_VERSION,
             message: Message::SpawnRequest {
@@ -205,14 +225,16 @@ mod tests {
                     cwd: PathBuf::from(r"C:\workspace"),
                     env: HashMap::new(),
                     permission_profile: PermissionProfile::read_only(),
-                    permission_profile_cwd: PathBuf::from(r"C:\workspace"),
+                    workspace_roots: workspace_roots.clone(),
                     codex_home: PathBuf::from(r"C:\codex"),
                     real_codex_home: PathBuf::from(r"C:\Users\codex"),
                     cap_sids: vec!["S-1-15-3-1024-1".to_string()],
+                    network_proxy_restricting_sid: Some("S-1-5-21-100-200-300-400".to_string()),
                     timeout_ms: Some(1000),
                     tty: false,
                     stdin_open: false,
-                    use_private_desktop: false,
+                    use_private_desktop: true,
+                    private_desktop_name: Some("CodexSandboxDesktop-1234".to_string()),
                 }),
             },
         };
@@ -222,15 +244,49 @@ mod tests {
         assert_eq!("managed", encoded["payload"]["permission_profile"]["type"]);
         assert_eq!(None, encoded["payload"].get("policy_json_or_preset"));
         assert_eq!(None, encoded["payload"].get("sandbox_policy_cwd"));
+        assert_eq!(None, encoded["payload"].get("permission_profile_cwd"));
 
         let decoded: FramedMessage = serde_json::from_value(encoded).expect("deserialize");
         let Message::SpawnRequest { payload } = decoded.message else {
             panic!("unexpected message");
         };
         assert_eq!(PermissionProfile::read_only(), payload.permission_profile);
+        assert_eq!(workspace_roots, payload.workspace_roots);
         assert_eq!(
-            PathBuf::from(r"C:\workspace"),
-            payload.permission_profile_cwd
+            Some("CodexSandboxDesktop-1234"),
+            payload.private_desktop_name.as_deref()
+        );
+        assert_eq!(
+            Some("S-1-5-21-100-200-300-400"),
+            payload.network_proxy_restricting_sid.as_deref()
+        );
+    }
+
+    #[test]
+    fn error_payload_serializes_stage_and_windows_error_code() {
+        let msg = FramedMessage {
+            version: IPC_PROTOCOL_VERSION,
+            message: Message::Error {
+                payload: ErrorPayload {
+                    message: "CreateProcessAsUserW failed".to_string(),
+                    stage: ErrorStage::SpawnChild,
+                    windows_error_code: Some(1312),
+                },
+            },
+        };
+
+        let encoded = serde_json::to_value(&msg).expect("serialize");
+        assert_eq!(
+            serde_json::json!({
+                "version": IPC_PROTOCOL_VERSION,
+                "type": "error",
+                "payload": {
+                    "message": "CreateProcessAsUserW failed",
+                    "stage": "spawn_child",
+                    "windows_error_code": 1312,
+                }
+            }),
+            encoded
         );
     }
 }

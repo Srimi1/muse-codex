@@ -1,6 +1,7 @@
 """Command-line interface for building Codex package directories."""
 
 import argparse
+import re
 import tempfile
 from pathlib import Path
 
@@ -15,7 +16,32 @@ from .targets import TARGET_SPECS
 from .targets import PackageInputs
 from .targets import default_target
 from .targets import resolve_input_path
+from .zsh import resolve_zsh_bin
 from .version import read_workspace_version
+
+
+# Release pipelines run this builder with system Python, so avoid new dependencies.
+SEMVER_PATTERN = re.compile(
+    r"(?P<major>0|[1-9][0-9]*)\."
+    r"(?P<minor>0|[1-9][0-9]*)\."
+    r"(?P<patch>0|[1-9][0-9]*)"
+    r"(?:-(?P<prerelease>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+)
+
+
+def parse_package_version(value: str) -> str:
+    match = SEMVER_PATTERN.fullmatch(value)
+    if match is not None:
+        components = (match.group(name) for name in ("major", "minor", "patch"))
+        prerelease = match.group("prerelease") or ""
+        if all(int(component) <= 2**64 - 1 for component in components) and all(
+            not (part.isdigit() and len(part) > 1 and part.startswith("0"))
+            for part in prerelease.split(".")
+        ):
+            return value
+
+    raise argparse.ArgumentTypeError(f"invalid semantic version: {value!r}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,12 +65,17 @@ def parse_args() -> argparse.Namespace:
         help="Package variant to build.",
     )
     parser.add_argument(
+        "--package-version",
+        type=parse_package_version,
+        default=read_workspace_version(),
+        help="Semantic version to record in codex-package.json.",
+    )
+    parser.add_argument(
         "--package-dir",
         type=Path,
         default=argparse.SUPPRESS,
         help=(
-            "Output directory to create as the package root. Defaults to a new "
-            "temporary directory."
+            "Output directory to create as the package root. Defaults to a new temporary directory."
         ),
     )
     parser.add_argument(
@@ -71,8 +102,7 @@ def parse_args() -> argparse.Namespace:
         "--cargo-profile",
         default="dev-small",
         help=(
-            "Cargo profile for source-built package artifacts. Use release for "
-            "release packages."
+            "Cargo profile for source-built package artifacts. Use release for release packages."
         ),
     )
     parser.add_argument(
@@ -84,12 +114,34 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--code-mode-host-bin",
+        type=Path,
+        help=(
+            "Optional prebuilt codex-code-mode-host executable. If omitted, "
+            "the host is built with Cargo."
+        ),
+    )
+    parser.add_argument(
         "--bwrap-bin",
         type=Path,
         help=(
             "Optional prebuilt Linux bwrap executable. If omitted for Linux "
             "targets, bwrap is built with Cargo."
         ),
+    )
+    zsh_source = parser.add_mutually_exclusive_group()
+    zsh_source.add_argument(
+        "--zsh-manifest",
+        type=Path,
+        help=(
+            "Optional DotSlash manifest for the patched zsh fork instead of "
+            "scripts/codex_package/codex-zsh."
+        ),
+    )
+    zsh_source.add_argument(
+        "--zsh-bin",
+        type=Path,
+        help="Optional prebuilt zsh executable instead of fetching from a manifest.",
     )
     parser.add_argument(
         "--codex-command-runner-bin",
@@ -114,7 +166,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help=(
             "Optional local ripgrep executable override instead of fetching from "
-            "codex-cli/bin/rg."
+            "scripts/codex_package/rg."
         ),
     )
     return parser.parse_args()
@@ -141,6 +193,11 @@ def main() -> int:
             "prebuilt entrypoint executable",
             "--entrypoint-bin",
         ),
+        code_mode_host_bin=resolve_optional_input_path(
+            args.code_mode_host_bin,
+            "prebuilt code-mode host executable",
+            "--code-mode-host-bin",
+        ),
         bwrap_bin=resolve_optional_input_path(
             args.bwrap_bin,
             "prebuilt Linux bwrap executable",
@@ -157,17 +214,20 @@ def main() -> int:
             "--codex-windows-sandbox-setup-bin",
         ),
     )
-    version = read_workspace_version()
     inputs = PackageInputs(
         entrypoint_bin=source_outputs.entrypoint_bin,
+        code_mode_host_bin=source_outputs.code_mode_host_bin,
         rg_bin=resolve_rg_bin(spec, args.rg_bin),
+        zsh_bin=resolve_zsh_bin(spec, args.zsh_manifest, zsh_bin=args.zsh_bin),
         bwrap_bin=source_outputs.bwrap_bin,
         codex_command_runner_bin=source_outputs.codex_command_runner_bin,
         codex_windows_sandbox_setup_bin=source_outputs.codex_windows_sandbox_setup_bin,
     )
     prepare_package_dir(package_dir, force=args.force)
-    build_package_dir(package_dir, version, variant, spec, inputs)
-    validate_package_dir(package_dir, variant, spec)
+    build_package_dir(package_dir, args.package_version, variant, spec, inputs)
+    validate_package_dir(
+        package_dir, variant, spec, include_zsh=inputs.zsh_bin is not None
+    )
 
     for archive_output in args.archive_output:
         archive_path = archive_output.resolve()

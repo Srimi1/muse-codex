@@ -33,7 +33,7 @@ use crate::sse;
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_UPSTREAM_ERROR_BYTES: usize = 64 * 1024;
-const READY_SCHEMA_VERSION: u8 = 2;
+pub(crate) const READY_SCHEMA_VERSION: u8 = 2;
 const MODEL_CATALOG_STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
 const UPSTREAM_ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const PARENT_WATCH_INTERVAL: Duration = Duration::from_millis(250);
@@ -783,6 +783,10 @@ mod tests {
             default_reasoning_effort: Some("medium".to_string()),
             is_visible: true,
             is_default: true,
+            use_responses_lite: false,
+            tool_mode: None,
+            input_modalities: vec!["text".to_string()],
+            supported_in_api: true,
         }];
         write_ready_file(
             &path,

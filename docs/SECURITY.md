@@ -179,12 +179,19 @@ protected release infrastructure and is never an installer input.
 ### Current behavior
 
 The gateway never executes tools. It normalizes Muse history into the pinned
-Responses item types while forcing `store: false` and streaming mode. For successful Responses streams, it
-forwards known non-metadata SSE frames without rewriting response IDs, item IDs,
-call IDs, tool names, JSON arguments, or sequence numbers. It does not attempt
-to repair malformed JSON. Malformed, unknown, oversized, interrupted, or idle
-streams become a terminal `response.failed` event. Provider error text is
-replaced by fixed diagnostics rather than copied from untrusted response bodies.
+Responses item types while forcing `store: false` and streaming mode. For a
+catalog entry that requires Responses Lite, it changes only the transport wire
+shape: tools and instructions become stable developer input items, direct tools
+are grouped under the `functions` namespace, all-turn reasoning context is
+requested, and parallel calls are disabled. Muse still owns history, tool
+execution, approvals, and the next turn.
+
+For successful Responses streams, the gateway forwards known non-metadata SSE
+frames without rewriting response IDs, item IDs, call IDs, tool names, JSON
+arguments, or sequence numbers. It does not attempt to repair malformed JSON.
+Malformed, unknown, oversized, interrupted, or idle streams become a terminal
+`response.failed` event. Provider error text is replaced by fixed diagnostics
+rather than copied from untrusted response bodies.
 
 The transport permits at most two attempts for retryable send failures or
 upstream 5xx responses before a response body is exposed, and supports the
@@ -236,7 +243,8 @@ digest, together with equivalent metadata for the legal payloads.
 artifact metadata, then verifies artifact sizes and digests after download. It
 refuses non-macOS-arm64 platforms, root execution, non-HTTPS URLs, malformed or
 unexpected filenames, a missing exact-version stock Muse prerequisite, and an
-unsafe curl credential file. The staged gateway runs its self-test; the staged
+unsafe curl credential file. The staged launcher runs a credential-free pair
+self-test covering the gateway protocol contract and stock Muse prerequisite; the staged
 launcher must successfully report the expected stock Muse version. Installation
 stages files on the destination filesystem, installs the gateway first and the
 user-facing launcher last, and retains one previous copy of each for recovery.
@@ -271,7 +279,9 @@ The authenticated model catalog crosses the private readiness file only long
 enough for the launcher to validate it and atomically seed the isolated Muse
 cache. Both files reject symlinks and unsafe ownership or permissions. Missing
 release dates and output limits are stored as `null`; the compatibility layer
-does not invent provider metadata.
+does not invent provider metadata or model entitlement. Subscription turns are
+accepted only for a compatible, picker-visible row returned by that account's
+catalog.
 
 ## Verification status
 

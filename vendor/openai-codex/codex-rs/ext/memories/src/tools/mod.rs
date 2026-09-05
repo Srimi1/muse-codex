@@ -7,6 +7,7 @@ use codex_extension_api::ToolExecutor;
 use codex_extension_api::ToolName;
 use codex_extension_api::ToolSpec;
 use codex_extension_api::parse_tool_input_schema;
+use codex_otel::MetricsClient;
 use codex_tools::ResponsesApiNamespace;
 use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::default_namespace_description;
@@ -19,22 +20,35 @@ use crate::backend::MemoriesBackend;
 use crate::backend::MemoriesBackendError;
 use crate::schema;
 
+mod ad_hoc_note;
 mod list;
 mod read;
 mod search;
 
-pub(crate) fn memory_tools<B>(backend: B) -> Vec<Arc<dyn ToolExecutor<ToolCall>>>
+pub(crate) fn memory_tools<B>(
+    backend: B,
+    metrics_client: Option<MetricsClient>,
+) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>>
 where
     B: MemoriesBackend,
 {
     vec![
+        Arc::new(ad_hoc_note::AddAdHocNoteTool {
+            backend: backend.clone(),
+            metrics_client: metrics_client.clone(),
+        }),
         Arc::new(list::ListTool {
             backend: backend.clone(),
+            metrics_client: metrics_client.clone(),
         }),
         Arc::new(read::ReadTool {
             backend: backend.clone(),
+            metrics_client: metrics_client.clone(),
         }),
-        Arc::new(search::SearchTool { backend }),
+        Arc::new(search::SearchTool {
+            backend,
+            metrics_client,
+        }),
     ]
 }
 
@@ -63,7 +77,7 @@ pub(super) fn memory_function_tool<I: JsonSchema, O: JsonSchema>(
     })
 }
 
-fn parse_args<T: for<'de> Deserialize<'de>>(call: &ToolCall) -> Result<T, FunctionCallError> {
+fn parse_args<T: for<'de> Deserialize<'de>>(call: &ToolCall<'_>) -> Result<T, FunctionCallError> {
     let arguments = call.function_arguments()?;
     let value = if arguments.trim().is_empty() {
         Value::Object(serde_json::Map::new())
@@ -82,12 +96,15 @@ fn backend_error_to_function_call(err: MemoriesBackendError) -> FunctionCallErro
     match err {
         MemoriesBackendError::InvalidPath { .. }
         | MemoriesBackendError::InvalidCursor { .. }
+        | MemoriesBackendError::InvalidFilename { .. }
         | MemoriesBackendError::NotFound { .. }
         | MemoriesBackendError::InvalidLineOffset
         | MemoriesBackendError::InvalidMaxLines
         | MemoriesBackendError::LineOffsetExceedsFileLength
         | MemoriesBackendError::NotFile { .. }
         | MemoriesBackendError::EmptyQuery
+        | MemoriesBackendError::EmptyAdHocNote
+        | MemoriesBackendError::AdHocNoteAlreadyExists { .. }
         | MemoriesBackendError::InvalidMatchWindow => {
             FunctionCallError::RespondToModel(err.to_string())
         }

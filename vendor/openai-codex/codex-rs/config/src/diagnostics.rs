@@ -2,9 +2,9 @@
 //! rendering them in a user-friendly way.
 
 use crate::ConfigLayerEntry;
+use crate::ConfigLayerSource;
 use crate::ConfigLayerStack;
-use crate::ConfigLayerStackOrdering;
-use codex_app_server_protocol::ConfigLayerSource;
+use crate::format_config_layer_source;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
 use serde::de::DeserializeOwned;
 use serde_path_to_error::Path as SerdePath;
@@ -89,7 +89,6 @@ impl std::error::Error for ConfigLoadError {
 #[derive(Clone, Copy)]
 pub(crate) enum ConfigDiagnosticSource<'a> {
     Path(&'a Path),
-    #[cfg(any(target_os = "macos", test))]
     DisplayName(&'a str),
 }
 
@@ -97,7 +96,6 @@ impl ConfigDiagnosticSource<'_> {
     pub(crate) fn to_path_buf(self) -> PathBuf {
         match self {
             ConfigDiagnosticSource::Path(path) => path.to_path_buf(),
-            #[cfg(any(target_os = "macos", test))]
             ConfigDiagnosticSource::DisplayName(name) => PathBuf::from(name),
         }
     }
@@ -176,14 +174,8 @@ pub async fn first_layer_config_error<T: DeserializeOwned>(
     // When the merged config fails schema validation, we surface the first concrete
     // per-file error to point users at a specific file and range rather than an
     // opaque merged-layer failure.
-    first_layer_config_error_for_entries::<T, _>(
-        layers.get_layers(
-            ConfigLayerStackOrdering::LowestPrecedenceFirst,
-            /*include_disabled*/ false,
-        ),
-        config_toml_file,
-    )
-    .await
+    first_layer_config_error_for_entries::<T, _>(layers.layers_low_to_high(), config_toml_file)
+        .await
 }
 
 pub async fn first_layer_config_error_from_entries<T: DeserializeOwned>(
@@ -201,6 +193,30 @@ where
     I: IntoIterator<Item = &'a ConfigLayerEntry>,
 {
     for layer in layers {
+        if layer.is_disabled() {
+            continue;
+        }
+        if let Some(contents) = layer.raw_toml() {
+            let source_name = format_config_layer_source(&layer.name, config_toml_file);
+            let Some(base_dir) = layer.raw_toml_base_dir() else {
+                tracing::debug!(
+                    "Skipping raw TOML diagnostics for {source_name} because it has no base directory"
+                );
+                continue;
+            };
+            // Match the base directory used when the raw non-file layer was
+            // parsed into the runtime layer so diagnostics resolve relative
+            // path fields with the same semantics.
+            let _absolute_path_base = AbsolutePathBufGuard::new(base_dir.as_path());
+            if let Some(error) = config_error_from_typed_toml_for_source::<T>(
+                ConfigDiagnosticSource::DisplayName(&source_name),
+                contents,
+            ) {
+                return Some(error);
+            }
+            continue;
+        }
+
         let Some(path) = config_path_for_layer(layer, config_toml_file) else {
             continue;
         };
@@ -228,6 +244,7 @@ where
 
 fn config_path_for_layer(layer: &ConfigLayerEntry, config_toml_file: &str) -> Option<PathBuf> {
     match &layer.name {
+        ConfigLayerSource::PackagedDefaults { file } => Some(file.to_path_buf()),
         ConfigLayerSource::System { file } => Some(file.to_path_buf()),
         ConfigLayerSource::User { file, .. } => Some(file.to_path_buf()),
         ConfigLayerSource::Project { dot_codex_folder } => {
@@ -235,6 +252,7 @@ fn config_path_for_layer(layer: &ConfigLayerEntry, config_toml_file: &str) -> Op
         }
         ConfigLayerSource::LegacyManagedConfigTomlFromFile { file } => Some(file.to_path_buf()),
         ConfigLayerSource::Mdm { .. }
+        | ConfigLayerSource::EnterpriseManaged { .. }
         | ConfigLayerSource::SessionFlags
         | ConfigLayerSource::LegacyManagedConfigTomlFromMdm => None,
     }

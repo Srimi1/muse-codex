@@ -3,8 +3,11 @@ use std::sync::Arc;
 
 use codex_extension_api::ContextContributor;
 use codex_extension_api::ExtensionData;
+use codex_extension_api::ExtensionRegistryBuilder;
+use codex_extension_api::NoopTurnItemEmitter;
 use codex_extension_api::PromptSlot;
 use codex_extension_api::ToolCall;
+use codex_extension_api::ToolCallSource;
 use codex_extension_api::ToolContributor;
 use codex_extension_api::ToolExecutor;
 use codex_extension_api::ToolName;
@@ -17,19 +20,36 @@ use codex_utils_output_truncation::TruncationPolicy;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
+use crate::backend::ListMemoriesRequest;
+use crate::backend::ListMemoriesResponse;
+use crate::backend::MemoriesBackend;
+use crate::backend::MemoryEntry;
+use crate::backend::MemoryEntryType;
+use crate::backend::SearchMatchMode;
+use crate::backend::SearchMemoriesRequest;
 use crate::extension::MemoriesExtension;
 use crate::extension::MemoriesExtensionConfig;
 use crate::local::LocalMemoriesBackend;
 
 #[test]
+fn memory_tool_namespace_matches_responses_api_identifier() {
+    assert!(!crate::MEMORY_TOOLS_NAMESPACE.is_empty());
+    assert!(
+        crate::MEMORY_TOOLS_NAMESPACE
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    );
+}
+
+#[test]
 fn tools_are_not_contributed_without_thread_config() {
-    let extension = MemoriesExtension;
+    let extension = MemoriesExtension::default();
 
     assert!(
         extension
             .tools(
                 &ExtensionData::new("session"),
-                &ExtensionData::new("thread")
+                &ExtensionData::new("thread"),
             )
             .is_empty()
     );
@@ -37,10 +57,11 @@ fn tools_are_not_contributed_without_thread_config() {
 
 #[test]
 fn tools_are_not_contributed_when_disabled() {
-    let extension = MemoriesExtension;
+    let extension = MemoriesExtension::default();
     let thread_store = ExtensionData::new("thread");
     thread_store.insert(MemoriesExtensionConfig {
         enabled: false,
+        dedicated_tools: true,
         codex_home: test_path_buf("/tmp/codex-home").abs(),
     });
 
@@ -52,11 +73,29 @@ fn tools_are_not_contributed_when_disabled() {
 }
 
 #[test]
-fn tools_are_contributed_when_enabled() {
-    let extension = MemoriesExtension;
+fn tools_are_not_contributed_when_dedicated_tools_disabled() {
+    let extension = MemoriesExtension::default();
     let thread_store = ExtensionData::new("thread");
     thread_store.insert(MemoriesExtensionConfig {
         enabled: true,
+        dedicated_tools: false,
+        codex_home: test_path_buf("/tmp/codex-home").abs(),
+    });
+
+    assert!(
+        extension
+            .tools(&ExtensionData::new("session"), &thread_store)
+            .is_empty()
+    );
+}
+
+#[test]
+fn tools_are_contributed_when_enabled_with_dedicated_tools() {
+    let extension = MemoriesExtension::default();
+    let thread_store = ExtensionData::new("thread");
+    thread_store.insert(MemoriesExtensionConfig {
+        enabled: true,
+        dedicated_tools: true,
         codex_home: test_path_buf("/tmp/codex-home").abs(),
     });
 
@@ -69,10 +108,61 @@ fn tools_are_contributed_when_enabled() {
     assert_eq!(
         tool_names,
         vec![
+            memory_tool_name(crate::ADD_AD_HOC_NOTE_TOOL_NAME),
             memory_tool_name(crate::LIST_TOOL_NAME),
             memory_tool_name(crate::READ_TOOL_NAME),
             memory_tool_name(crate::SEARCH_TOOL_NAME),
         ]
+    );
+}
+
+#[test]
+fn install_registers_dedicated_tool_contributor() {
+    let mut builder = ExtensionRegistryBuilder::<codex_core::config::Config>::new();
+    crate::install(&mut builder, /*metrics_client*/ None);
+    let registry = builder.build();
+    let thread_store = ExtensionData::new("thread");
+    thread_store.insert(MemoriesExtensionConfig {
+        enabled: true,
+        dedicated_tools: true,
+        codex_home: test_path_buf("/tmp/codex-home").abs(),
+    });
+
+    let tool_names = registry
+        .tool_contributors()
+        .iter()
+        .flat_map(|contributor| contributor.tools(&ExtensionData::new("session"), &thread_store))
+        .map(|tool| tool.tool_name())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        tool_names,
+        vec![
+            memory_tool_name(crate::ADD_AD_HOC_NOTE_TOOL_NAME),
+            memory_tool_name(crate::LIST_TOOL_NAME),
+            memory_tool_name(crate::READ_TOOL_NAME),
+            memory_tool_name(crate::SEARCH_TOOL_NAME),
+        ]
+    );
+}
+
+#[test]
+fn ad_hoc_tool_definition_includes_filename_contract() {
+    let tool = memory_tool(
+        Path::new("/tmp/codex-home/memories"),
+        crate::ADD_AD_HOC_NOTE_TOOL_NAME,
+    );
+    let spec = serde_json::to_value(tool.spec()).expect("serialize tool spec");
+
+    let filename = spec
+        .pointer("/tools/0/parameters/properties/filename")
+        .expect("filename parameter should be in tool schema");
+    assert_eq!(filename.pointer("/type"), Some(&json!("string")));
+    assert!(
+        filename
+            .pointer("/description")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|description| description.contains("YYYY-MM-DDTHH-MM-SS-<slug>.md"))
     );
 }
 
@@ -90,15 +180,16 @@ async fn prompt_contribution_uses_memory_summary_when_enabled() {
     .await
     .expect("write memory summary");
 
-    let extension = MemoriesExtension;
+    let extension = MemoriesExtension::default();
     let thread_store = ExtensionData::new("thread");
     thread_store.insert(MemoriesExtensionConfig {
         enabled: true,
+        dedicated_tools: false,
         codex_home: tempdir.path().abs(),
     });
 
     let fragments = extension
-        .contribute(&ExtensionData::new("session"), &thread_store)
+        .contribute_thread_context(&ExtensionData::new("session"), &thread_store)
         .await;
 
     assert_eq!(fragments.len(), 1);
@@ -108,6 +199,89 @@ async fn prompt_contribution_uses_memory_summary_when_enabled() {
             .text()
             .contains("Remember repository-specific implementation preferences.")
     );
+}
+
+#[tokio::test]
+async fn add_ad_hoc_note_tool_creates_note_file() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let memory_root = tempdir.path().join("memories");
+    let tool = memory_tool(&memory_root, crate::ADD_AD_HOC_NOTE_TOOL_NAME);
+    let payload = ToolPayload::Function {
+        arguments: json!({
+            "filename": "2026-05-26T13-42-08-remember-review-style.md",
+            "note": "Remember to keep PR review comments concise.",
+        })
+        .to_string(),
+    };
+
+    let output = tool
+        .handle(ToolCall {
+            turn_id: "turn-1".to_string(),
+            call_id: "call-1".to_string(),
+            tool_name: memory_tool_name(crate::ADD_AD_HOC_NOTE_TOOL_NAME),
+            model: "gpt-test".to_string(),
+            codex_turn_metadata: None,
+            truncation_policy: TruncationPolicy::Bytes(1024),
+            source: ToolCallSource::Direct,
+            conversation_history: codex_extension_api::ConversationHistory::default(),
+            turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+            environments: Vec::new(),
+            payload: payload.clone(),
+        })
+        .await
+        .expect("ad-hoc note should be written");
+
+    assert_eq!(
+        output.post_tool_use_response("call-1", &payload),
+        Some(json!({}))
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(
+            memory_root
+                .join("extensions/ad_hoc/notes")
+                .join("2026-05-26T13-42-08-remember-review-style.md")
+        )
+        .await
+        .expect("read ad-hoc note"),
+        "Remember to keep PR review comments concise."
+    );
+}
+
+#[tokio::test]
+async fn add_ad_hoc_note_tool_rejects_paths_as_filenames() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let memory_root = tempdir.path().join("memories");
+    let tool = memory_tool(&memory_root, crate::ADD_AD_HOC_NOTE_TOOL_NAME);
+    let payload = ToolPayload::Function {
+        arguments: json!({
+            "filename": "../2026-05-26T13-42-08-remember-review-style.md",
+            "note": "Remember to keep PR review comments concise.",
+        })
+        .to_string(),
+    };
+
+    let result = tool
+        .handle(ToolCall {
+            turn_id: "turn-1".to_string(),
+            call_id: "call-1".to_string(),
+            tool_name: memory_tool_name(crate::ADD_AD_HOC_NOTE_TOOL_NAME),
+            model: "gpt-test".to_string(),
+            codex_turn_metadata: None,
+            truncation_policy: TruncationPolicy::Bytes(1024),
+            source: ToolCallSource::Direct,
+            conversation_history: codex_extension_api::ConversationHistory::default(),
+            turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+            environments: Vec::new(),
+            payload,
+        })
+        .await;
+    let err = match result {
+        Ok(_) => panic!("path-like filename should be rejected"),
+        Err(err) => err,
+    };
+
+    assert!(err.to_string().contains("filename"));
+    assert!(err.to_string().contains("YYYY-MM-DDTHH-MM-SS"));
 }
 
 #[tokio::test]
@@ -138,7 +312,13 @@ async fn read_tool_reads_memory_file() {
             turn_id: "turn-1".to_string(),
             call_id: "call-1".to_string(),
             tool_name: memory_tool_name(crate::READ_TOOL_NAME),
+            model: "gpt-test".to_string(),
+            codex_turn_metadata: None,
             truncation_policy: TruncationPolicy::Bytes(1024),
+            source: ToolCallSource::Direct,
+            conversation_history: codex_extension_api::ConversationHistory::default(),
+            turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+            environments: Vec::new(),
             payload: payload.clone(),
         })
         .await
@@ -153,6 +333,73 @@ async fn read_tool_reads_memory_file() {
             "truncated": true
         }))
     );
+}
+
+#[tokio::test]
+async fn local_listing_and_search_ignore_symlinks() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let memory_root = tempdir.path().join("memories");
+    let outside_root = tempdir.path().join("outside");
+    std::fs::create_dir_all(memory_root.join("nested")).expect("create memories directory");
+    std::fs::create_dir_all(&outside_root).expect("create outside directory");
+    for (path, content) in [
+        (memory_root.join("a.md"), "visible needle"),
+        (memory_root.join("nested/z.md"), "nested needle"),
+        (outside_root.join("secret.md"), "outside needle"),
+    ] {
+        std::fs::write(path, content).expect("write memory fixture");
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside_root, memory_root.join("linked-directory"))
+        .expect("create memory fixture symlink");
+
+    let backend = LocalMemoriesBackend::from_memory_root(&memory_root);
+    let listing = backend
+        .list(ListMemoriesRequest {
+            path: None,
+            cursor: None,
+            max_results: 10,
+        })
+        .await
+        .expect("list visible memories");
+    assert_eq!(
+        listing,
+        ListMemoriesResponse {
+            path: None,
+            entries: vec![
+                MemoryEntry {
+                    path: "a.md".to_string(),
+                    entry_type: MemoryEntryType::File,
+                },
+                MemoryEntry {
+                    path: "nested".to_string(),
+                    entry_type: MemoryEntryType::Directory,
+                },
+            ],
+            next_cursor: None,
+            truncated: false,
+        }
+    );
+
+    let response = backend
+        .search(SearchMemoriesRequest {
+            queries: vec!["needle".to_string()],
+            match_mode: SearchMatchMode::Any,
+            path: None,
+            cursor: None,
+            context_lines: 0,
+            case_sensitive: false,
+            normalized: false,
+            max_results: 10,
+        })
+        .await
+        .expect("search visible memories");
+    let paths = response
+        .matches
+        .iter()
+        .map(|matched| matched.path.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(paths, vec!["a.md", "nested/z.md"]);
 }
 
 #[tokio::test]
@@ -182,7 +429,13 @@ async fn search_tool_accepts_multiple_queries() {
             turn_id: "turn-1".to_string(),
             call_id: "call-1".to_string(),
             tool_name: memory_tool_name(crate::SEARCH_TOOL_NAME),
+            model: "gpt-test".to_string(),
+            codex_turn_metadata: None,
             truncation_policy: TruncationPolicy::Bytes(1024),
+            source: ToolCallSource::Direct,
+            conversation_history: codex_extension_api::ConversationHistory::default(),
+            turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+            environments: Vec::new(),
             payload: payload.clone(),
         })
         .await
@@ -252,7 +505,13 @@ async fn search_tool_accepts_windowed_all_match_mode() {
             turn_id: "turn-1".to_string(),
             call_id: "call-1".to_string(),
             tool_name: memory_tool_name(crate::SEARCH_TOOL_NAME),
+            model: "gpt-test".to_string(),
+            codex_turn_metadata: None,
             truncation_policy: TruncationPolicy::Bytes(1024),
+            source: ToolCallSource::Direct,
+            conversation_history: codex_extension_api::ConversationHistory::default(),
+            turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+            environments: Vec::new(),
             payload: payload.clone(),
         })
         .await
@@ -302,7 +561,13 @@ async fn search_tool_rejects_legacy_single_query() {
             turn_id: "turn-1".to_string(),
             call_id: "call-1".to_string(),
             tool_name: memory_tool_name(crate::SEARCH_TOOL_NAME),
+            model: "gpt-test".to_string(),
+            codex_turn_metadata: None,
             truncation_policy: TruncationPolicy::Bytes(1024),
+            source: ToolCallSource::Direct,
+            conversation_history: codex_extension_api::ConversationHistory::default(),
+            turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+            environments: Vec::new(),
             payload,
         })
         .await;
@@ -315,12 +580,18 @@ async fn search_tool_rejects_legacy_single_query() {
     assert!(err.to_string().contains("query"));
 }
 
-fn memory_tool(memory_root: &Path, tool_name: &str) -> Arc<dyn ToolExecutor<ToolCall>> {
+fn memory_tool(
+    memory_root: &Path,
+    tool_name: &str,
+) -> Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>> {
     let expected_tool_name = memory_tool_name(tool_name);
-    crate::tools::memory_tools(LocalMemoriesBackend::from_memory_root(memory_root))
-        .into_iter()
-        .find(|tool| tool.tool_name() == expected_tool_name)
-        .unwrap_or_else(|| panic!("{tool_name} tool should be registered"))
+    crate::tools::memory_tools(
+        LocalMemoriesBackend::from_memory_root(memory_root),
+        /*metrics_client*/ None,
+    )
+    .into_iter()
+    .find(|tool| tool.tool_name() == expected_tool_name)
+    .unwrap_or_else(|| panic!("{tool_name} tool should be registered"))
 }
 
 fn memory_tool_name(tool_name: &str) -> ToolName {

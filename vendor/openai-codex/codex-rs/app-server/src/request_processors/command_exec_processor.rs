@@ -1,4 +1,6 @@
 use super::*;
+use codex_core::exec_env::inject_apply_patch_env;
+use codex_protocol::shell_environment::is_non_inheritable_env_var;
 
 #[derive(Clone)]
 pub(crate) struct CommandExecRequestProcessor {
@@ -163,6 +165,8 @@ impl CommandExecRequestProcessor {
                 }
             }
         }
+        env.retain(|name, _| !is_non_inheritable_env_var(name));
+        inject_apply_patch_env(&mut env, &self.config.features);
         let timeout_ms = match timeout_ms {
             Some(timeout_ms) => match u64::try_from(timeout_ms) {
                 Ok(timeout_ms) => Some(timeout_ms),
@@ -203,6 +207,7 @@ impl CommandExecRequestProcessor {
             network_proxy_spec,
             network_proxy_permission_profile,
             managed_network_requirements_enabled,
+            windows_sandbox_workspace_roots,
         ) = if let Some(permission_profile) = permission_profile {
             let overrides = ConfigOverrides {
                 cwd: Some(cwd.to_path_buf()),
@@ -230,31 +235,19 @@ impl CommandExecRequestProcessor {
                 config.permissions.network.clone(),
                 config.permissions.permission_profile().clone(),
                 config.managed_network_requirements_enabled(),
+                config.effective_workspace_roots(),
             )
         } else if let Some(policy) = sandbox_policy.map(|policy| policy.to_core()) {
-            self.config
-                .permissions
-                .can_set_legacy_sandbox_policy(&policy, &sandbox_cwd)
-                .map_err(|err| invalid_request(format!("invalid sandbox policy: {err}")))?;
-            let file_system_sandbox_policy =
-                codex_protocol::permissions::FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(&policy, &sandbox_cwd);
-            let network_sandbox_policy =
-                codex_protocol::permissions::NetworkSandboxPolicy::from(&policy);
-            let permission_profile =
-                codex_protocol::models::PermissionProfile::from_runtime_permissions_with_enforcement(
-                    codex_protocol::models::SandboxEnforcement::from_legacy_sandbox_policy(&policy),
-                    &file_system_sandbox_policy,
-                    network_sandbox_policy,
-                );
-            self.config
-                .permissions
-                .can_set_permission_profile(&permission_profile)
+            let mut permissions = self.config.permissions.clone();
+            permissions
+                .set_legacy_sandbox_policy(policy, &sandbox_cwd)
                 .map_err(|err| invalid_request(format!("invalid sandbox policy: {err}")))?;
             (
-                permission_profile,
+                permissions.effective_permission_profile(),
                 self.config.permissions.network.clone(),
                 self.config.permissions.permission_profile().clone(),
                 self.config.managed_network_requirements_enabled(),
+                self.config.effective_workspace_roots(),
             )
         } else {
             (
@@ -262,6 +255,7 @@ impl CommandExecRequestProcessor {
                 self.config.permissions.network.clone(),
                 self.config.permissions.permission_profile().clone(),
                 self.config.managed_network_requirements_enabled(),
+                self.config.effective_workspace_roots(),
             )
         };
         let started_network_proxy = match network_proxy_spec.as_ref() {
@@ -293,6 +287,7 @@ impl CommandExecRequestProcessor {
             network: started_network_proxy
                 .as_ref()
                 .map(codex_core::config::StartedNetworkProxy::proxy),
+            network_environment_id: None,
             sandbox_permissions: SandboxPermissions::UseDefault,
             windows_sandbox_level,
             windows_sandbox_private_desktop: self
@@ -318,6 +313,7 @@ impl CommandExecRequestProcessor {
             exec_params,
             &effective_permission_profile,
             &sandbox_cwd,
+            windows_sandbox_workspace_roots.as_slice(),
             &codex_linux_sandbox_exe,
             use_legacy_landlock,
         )

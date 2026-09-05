@@ -2,16 +2,8 @@ use codex_features::Feature;
 use codex_features::Features;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::TUI_VISIBLE_COLLABORATION_MODES;
-use codex_protocol::openai_models::ConfigShellToolType;
-use codex_protocol::openai_models::ModelInfo;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::path::PathBuf;
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum ShellCommandBackendConfig {
-    Classic,
-    ZshFork,
-}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ToolUserShellType {
@@ -33,44 +25,6 @@ pub fn request_user_input_available_modes(features: &Features) -> Vec<ModeKind> 
         .collect()
 }
 
-pub fn shell_command_backend_for_features(features: &Features) -> ShellCommandBackendConfig {
-    if features.enabled(Feature::ShellTool) && features.enabled(Feature::ShellZshFork) {
-        ShellCommandBackendConfig::ZshFork
-    } else {
-        ShellCommandBackendConfig::Classic
-    }
-}
-
-pub fn shell_type_for_model_and_features(
-    model_info: &ModelInfo,
-    features: &Features,
-) -> ConfigShellToolType {
-    let unified_exec_enabled = features.enabled(Feature::UnifiedExec);
-    let model_shell_type = match model_info.shell_type {
-        ConfigShellToolType::UnifiedExec if !unified_exec_enabled => {
-            ConfigShellToolType::ShellCommand
-        }
-        ConfigShellToolType::Default | ConfigShellToolType::Local => {
-            ConfigShellToolType::ShellCommand
-        }
-        other => other,
-    };
-
-    if !features.enabled(Feature::ShellTool) {
-        ConfigShellToolType::Disabled
-    } else if features.enabled(Feature::ShellZshFork) {
-        ConfigShellToolType::ShellCommand
-    } else if unified_exec_enabled {
-        if codex_utils_pty::conpty_supported() {
-            ConfigShellToolType::UnifiedExec
-        } else {
-            ConfigShellToolType::ShellCommand
-        }
-    } else {
-        model_shell_type
-    }
-}
-
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum UnifiedExecShellMode {
     Direct,
@@ -85,13 +39,16 @@ pub struct ZshForkConfig {
 
 impl UnifiedExecShellMode {
     pub fn for_session(
-        shell_command_backend: ShellCommandBackendConfig,
+        features: &Features,
         user_shell_type: ToolUserShellType,
         shell_zsh_path: Option<&PathBuf>,
         main_execve_wrapper_exe: Option<&PathBuf>,
     ) -> Self {
         if cfg!(unix)
-            && shell_command_backend == ShellCommandBackendConfig::ZshFork
+            && features.enabled(Feature::ShellTool)
+            && features.enabled(Feature::UnifiedExec)
+            && features.enabled(Feature::ShellZshFork)
+            && features.enabled(Feature::UnifiedExecZshFork)
             && matches!(user_shell_type, ToolUserShellType::Zsh)
             && let (Some(shell_zsh_path), Some(main_execve_wrapper_exe)) =
                 (shell_zsh_path, main_execve_wrapper_exe)

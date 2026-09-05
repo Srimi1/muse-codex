@@ -7,9 +7,9 @@ harness. It is an external compatibility layer, not a Muse fork. This boundary
 is necessary because Meta publishes the Muse Session Protocol SDK and schema,
 but not the Rust host that implements the terminal agent.
 
-The supported Muse baseline is `1.0.3-R2198.1`. The Codex client is pinned by the
-workspace dependency graph; dependency upgrades and Muse upgrades are separate
-compatibility events.
+The supported Muse baseline is `1.0.3-R2198.1`. The Codex client and wire
+compatibility version are pinned to `rust-v0.153.4`; dependency upgrades and
+Muse upgrades are separate compatibility events.
 
 This document describes current behavior in the present tense. Statements
 labelled as release requirements or planned gates describe work that must be
@@ -105,17 +105,34 @@ they are never replaced with fabricated limits or dates. Authenticated
 reasoning-effort choices are retained in upstream order; Muse's cache has no
 provider-default effort field, so no default effort is invented.
 
+The catalog parser honors each model's minimum client version, picker
+visibility, input modalities, reasoning-effort list, Responses Lite flag, and
+tool mode. It understands the current entries for GPT-6 Astra and GPT-5.6 Sol,
+Terra, and Luna, but exposes them only when the authenticated endpoint returns
+them. A model requiring a newer wire version, an unknown tool mode, non-text
+input only, or no recognized effort is hidden rather than guessed into
+compatibility.
+
 Catalog discovery has a 90-second startup deadline, while the launcher allows
 100 seconds for the complete readiness handshake. This keeps slow credential
 refresh and network startup bounded without racing the catalog request.
 
 For Responses requests, the gateway enforces streaming and sets `store` to
-`false`. Valid, known non-metadata SSE frames are forwarded without rewriting
-their response IDs, item IDs, call IDs, tool names, JSON arguments, or ordering.
-The validator supports fragmented text and function-argument events. It drops
-known transport metadata events and converts malformed, oversized, idle,
-interrupted, or unknown event streams into a terminal `response.failed` event
-instead of reinterpreting them as text or exposing a retryable bare EOF.
+`false`. When the selected catalog entry requests Responses Lite, the adapter
+adds the internal Lite capability header, moves tool definitions into a stable
+`additional_tools` developer item, moves base instructions into a developer
+message, requests all-turn reasoning context, and disables parallel tool calls
+as required by that wire contract. Direct Muse function/custom tools are
+grouped into the Lite `functions` namespace. Muse still supplies complete
+history and remains the sole owner of the agent and tool-execution loop.
+
+Valid, known non-metadata SSE frames are forwarded without rewriting their
+response IDs, item IDs, call IDs, tool names, JSON arguments, or ordering. The
+validator supports fragmented text and function-argument events, recognizes
+`response.cancelled` as terminal, and drops `codex.response.metadata` alongside
+other known transport metadata. Malformed, oversized, idle, interrupted, or
+unknown event streams become a terminal `response.failed` event instead of
+being reinterpreted as text or exposed as a retryable bare EOF.
 
 The gateway does not execute model-requested tools. Muse receives the function
 call, performs its normal approval and sandbox flow, executes the tool, and
@@ -180,8 +197,10 @@ receives only the random loopback credential.
 4. Muse retains the seeded catalog after the gateway answers its conditional
    catalog request with `304`, then sends a Responses request with the selected
    model.
-5. The gateway authenticates upstream, maps the request, and streams typed
-   events back with backpressure.
+5. The gateway validates that a subscription model and reasoning effort are
+   present in that authenticated catalog, applies the catalog-selected standard
+   Responses or Responses Lite mapping, and streams typed events back with
+   backpressure.
 6. Muse renders output or performs its ordinary tool approval/execution loop.
 7. When Muse drops a response stream, the associated upstream stream is
    dropped. End-to-end cancellation behavior remains a release gate; the
@@ -263,10 +282,10 @@ state.
 
 The ChatGPT backend is a private, evolving service interface. The Codex Rust
 crates used here are open-source and vendored from commit
-`9474e5cfc4494b0ba319352aa86ce436c59e65c8`, but their library APIs are not a
-stable compatibility contract for this project. A repin requires the complete
-auth, transport, error, cancellation, and compatibility suite; semver
-compatibility must not be assumed.
+`3d2ee51ca2d5db578f328aa75e20aa22c0197c9a` (`rust-v0.153.4`), but their library
+APIs are not a stable compatibility contract for this project. A repin requires
+the complete auth, transport, error, cancellation, and compatibility suite;
+semver compatibility must not be assumed.
 
 ## Release boundary
 

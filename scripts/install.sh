@@ -130,16 +130,13 @@ chmod 0755 "$work_dir/muse-codex" "$work_dir/muse-codex-gateway"
 "$script_dir/verify-release-manifest.sh" \
   "$manifest" "$signature" "$public_key" "$work_dir" >/dev/null
 
-# Exercise both downloaded executables before changing the installation. The
-# launcher version probe also proves that the staged binary can locate and
-# validate the separately installed stock Muse prerequisite.
-"$work_dir/muse-codex-gateway" self-test >/dev/null
-launcher_version=$(
-  MUSE_CODEX_MUSE_BIN="$stock_muse" \
-    "$work_dir/muse-codex" --version 2>/dev/null || true
-)
-[ "$launcher_version" = "$stock_version" ] || \
-  die "downloaded muse-codex failed its stock Muse compatibility self-test"
+# Exercise the downloaded pair before changing the installation. This checks
+# the gateway's credential-free internals, launcher/readiness wire contract,
+# and separately installed stock Muse compatibility in one probe.
+MUSE_CODEX_MUSE_BIN="$stock_muse" \
+MUSE_CODEX_GATEWAY_BIN="$work_dir/muse-codex-gateway" \
+  "$work_dir/muse-codex" self-test >/dev/null || \
+  die "downloaded muse-codex pair failed its compatibility self-test"
 
 mkdir -p -- "$install_dir"
 for existing in \

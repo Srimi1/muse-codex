@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use codex_transport::{
-    AuthConfig, AuthStatus, LoginMode, LoginPrompt, login, login_with_prompt_handler, logout,
-    set_api_key_from_reader, status,
+    AuthConfig, AuthStatus, CODEX_WIRE_COMPATIBILITY_VERSION, LoginMode, LoginPrompt, login,
+    login_with_prompt_handler, logout, set_api_key_from_reader, status,
 };
 use secrecy::SecretString;
 use url::Url;
@@ -262,7 +262,14 @@ fn self_test() -> Result<()> {
     {
         bail!("secure token generator self-test failed");
     }
-    println!("muse-codex-gateway self-test: ok");
+    println!(
+        "{}",
+        serde_json::json!({
+            "status": "ok",
+            "ready_schema_version": server::READY_SCHEMA_VERSION,
+            "wire_compatibility_version": CODEX_WIRE_COMPATIBILITY_VERSION,
+        })
+    );
     Ok(())
 }
 

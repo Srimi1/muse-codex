@@ -1,4 +1,7 @@
+use super::multi_agents_common::MAX_SPAWN_AGENT_MODEL_OVERRIDES;
+use super::multi_agents_common::model_supports_multi_agent_backend;
 use codex_protocol::openai_models::ModelPreset;
+use codex_protocol::protocol::MultiAgentVersion;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiNamespace;
 use codex_tools::ResponsesApiNamespaceTool;
@@ -12,18 +15,34 @@ pub const MULTI_AGENT_V1_NAMESPACE: &str = "multi_agent_v1";
 const MULTI_AGENT_V1_NAMESPACE_DESCRIPTION: &str = "Tools for spawning and managing sub-agents.";
 
 const SPAWN_AGENT_INHERITED_MODEL_GUIDANCE: &str = "Spawned agents inherit your current model by default. Omit `model` to use that preferred default; set `model` only when an explicit override is needed.";
-const SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION: &str = "Optional model override for the new agent. Leave unset to inherit the same model as the parent, which is the preferred default. Only set this when the user explicitly asks for a different model or the task clearly requires one.";
-const SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION: &str = "Optional service tier override for the new agent. Leave unset unless the user explicitly asks for one.";
-const MAX_MODEL_OVERRIDES_IN_SPAWN_AGENT_DESCRIPTION: usize = 5;
+const SPAWN_AGENT_TYPE_OVERRIDE_DESCRIPTION_V1: &str = "Agent type override for the new agent. Omit to inherit the parent agent type with a full-history fork; otherwise, `default` is used.";
+const SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION: &str =
+    "Model override for the new agent. Omit unless an explicit override is needed.";
+const MAX_REASONING_EFFORT_CHARS_IN_SPAWN_AGENT_DESCRIPTION: usize = 64;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SpawnAgentToolOptions {
     pub available_models: Vec<ModelPreset>,
     pub agent_type_description: String,
+    pub expose_agent_type: bool,
     pub hide_agent_type_model_reasoning: bool,
-    pub include_usage_hint: bool,
+    pub expose_spawn_agent_model_overrides: bool,
+    pub multi_agent_version: MultiAgentVersion,
     pub usage_hint_text: Option<String>,
-    pub max_concurrent_threads_per_session: Option<usize>,
+}
+
+impl Default for SpawnAgentToolOptions {
+    fn default() -> Self {
+        Self {
+            available_models: Vec::new(),
+            agent_type_description: String::new(),
+            expose_agent_type: true,
+            hide_agent_type_model_reasoning: false,
+            expose_spawn_agent_model_overrides: false,
+            multi_agent_version: MultiAgentVersion::Disabled,
+            usage_hint_text: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,11 +63,17 @@ impl Default for WaitAgentTimeoutOptions {
 }
 
 pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions) -> ToolSpec {
-    let available_models_description = (!options.hide_agent_type_model_reasoning)
-        .then(|| spawn_agent_models_description(&options.available_models));
+    let available_models_description = (!options.hide_agent_type_model_reasoning).then(|| {
+        spawn_agent_models_description(&options.available_models, options.multi_agent_version)
+    });
+    let inherited_model_guidance =
+        (!options.hide_agent_type_model_reasoning).then_some(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE);
     let return_value_description =
         "Returns the spawned agent id plus the user-facing nickname when available.";
     let mut properties = spawn_agent_common_properties_v1(&options.agent_type_description);
+    if !options.expose_agent_type {
+        properties.remove("agent_type");
+    }
     if options.hide_agent_type_model_reasoning {
         hide_spawn_agent_metadata_options(&mut properties);
     }
@@ -60,8 +85,8 @@ pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions) -> ToolSpec {
             name: "spawn_agent".to_string(),
             description: spawn_agent_tool_description(
                 available_models_description.as_deref(),
+                inherited_model_guidance,
                 return_value_description,
-                options.include_usage_hint,
                 options.usage_hint_text,
             ),
             strict: false,
@@ -73,11 +98,19 @@ pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions) -> ToolSpec {
 }
 
 pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
-    let available_models_description = (!options.hide_agent_type_model_reasoning)
-        .then(|| spawn_agent_models_description(&options.available_models));
+    let available_models_description = options.expose_spawn_agent_model_overrides.then(|| {
+        spawn_agent_models_description(&options.available_models, options.multi_agent_version)
+    });
+    let inherited_model_guidance = (options.expose_spawn_agent_model_overrides
+        && !options.hide_agent_type_model_reasoning)
+        .then_some(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE);
     let mut properties = spawn_agent_common_properties_v2(&options.agent_type_description);
-    if options.hide_agent_type_model_reasoning {
-        hide_spawn_agent_metadata_options(&mut properties);
+    if !options.expose_agent_type {
+        properties.remove("agent_type");
+    }
+    if !options.expose_spawn_agent_model_overrides {
+        properties.remove("model");
+        properties.remove("reasoning_effort");
     }
     properties.insert(
         "task_name".to_string(),
@@ -91,9 +124,8 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
         name: "spawn_agent".to_string(),
         description: spawn_agent_tool_description_v2(
             available_models_description.as_deref(),
-            options.include_usage_hint,
+            inherited_model_guidance,
             options.usage_hint_text,
-            options.max_concurrent_threads_per_session,
         ),
         strict: false,
         defer_loading: None,
@@ -125,7 +157,7 @@ pub fn create_send_input_tool_v1() -> ToolSpec {
         (
             "interrupt".to_string(),
             JsonSchema::boolean(Some(
-                "When true, stop the agent's current task and handle this immediately. When false (default), queue this message."
+                "True interrupts the current task and handles this message immediately; false or omitted queues it."
                     .to_string(),
             )),
         ),
@@ -158,7 +190,8 @@ pub fn create_send_message_tool() -> ToolSpec {
             "message".to_string(),
             JsonSchema::string(Some(
                 "Message text to queue on the target agent.".to_string(),
-            )),
+            ))
+            .with_encrypted(),
         ),
     ]);
 
@@ -182,20 +215,22 @@ pub fn create_followup_task_tool() -> ToolSpec {
         (
             "target".to_string(),
             JsonSchema::string(Some(
-                "Agent id or canonical task name to message (from spawn_agent).".to_string(),
+                "Agent id or canonical task name to send a follow-up task to (from spawn_agent)."
+                    .to_string(),
             )),
         ),
         (
             "message".to_string(),
             JsonSchema::string(Some(
                 "Message text to send to the target agent.".to_string(),
-            )),
+            ))
+            .with_encrypted(),
         ),
     ]);
 
     ToolSpec::Function(ResponsesApiTool {
         name: "followup_task".to_string(),
-        description: "Send a message to an existing non-root target agent and trigger a turn in that target. If the target is currently mid-turn, the message is queued and will be used to start the target's next turn, after the current turn completes."
+        description: "Send a follow-up task to an existing non-root target agent and trigger a turn if it is idle. If the target is already running, deliver the task promptly at message boundaries while sampling, or after the pending tool call completes."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -245,7 +280,7 @@ pub fn create_wait_agent_tool_v1(options: WaitAgentTimeoutOptions) -> ToolSpec {
 pub fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "wait_agent".to_string(),
-        description: "Wait for a mailbox update from any live agent, including queued messages and final-status notifications. Does not return the content; returns either a summary of which agents have updates (if any), or a timeout summary if no mailbox update arrives before the deadline."
+        description: "Wait for a mailbox update from any live agent, including queued messages and final-status notifications. The wait also ends early when new user input is steered into the active turn. Does not return the content; returns either a summary of which agents have updates (if any), an interruption summary for steered input, or a timeout summary if no activity arrives before the deadline."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -258,7 +293,7 @@ pub fn create_list_agents_tool() -> ToolSpec {
     let properties = BTreeMap::from([(
         "path_prefix".to_string(),
         JsonSchema::string(Some(
-            "Optional task-path prefix (not ending with trailing slash). Accepts the same relative or absolute task-path syntax."
+            "Task-path prefix filter without a trailing slash. Omit to list all live agents."
                 .to_string(),
         )),
     )]);
@@ -286,30 +321,34 @@ pub fn create_close_agent_tool_v1() -> ToolSpec {
         description: MULTI_AGENT_V1_NAMESPACE_DESCRIPTION.to_string(),
         tools: vec![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
             name: "close_agent".to_string(),
-            description: "Close an agent and any open descendants when they are no longer needed, and return the target agent's previous status before shutdown was requested. Don't keep agents open for too long if they are not needed anymore.".to_string(),
+            description: "Close an agent and any open descendants when they are no longer needed, and return the target agent's previous status before shutdown was requested. Completed agents remain open and count toward the concurrency limit until closed. Don't keep agents open for too long if they are not needed anymore.".to_string(),
             strict: false,
             defer_loading: None,
             parameters: JsonSchema::object(properties, Some(vec!["target".to_string()]), Some(false.into())),
-            output_schema: Some(close_agent_output_schema()),
+            output_schema: Some(agent_previous_status_output_schema(
+                "The agent status observed before shutdown was requested.",
+            )),
         })],
     })
 }
 
-pub fn create_close_agent_tool_v2() -> ToolSpec {
+pub fn create_interrupt_agent_tool_v2() -> ToolSpec {
     let properties = BTreeMap::from([(
         "target".to_string(),
         JsonSchema::string(Some(
-            "Agent id or canonical task name to close (from spawn_agent).".to_string(),
+            "Agent id or canonical task name to interrupt (from spawn_agent).".to_string(),
         )),
     )]);
 
     ToolSpec::Function(ResponsesApiTool {
-        name: "close_agent".to_string(),
-        description: "Close an agent and any open descendants when they are no longer needed, and return the target agent's previous status before shutdown was requested. Don't keep agents open for too long if they are not needed anymore.".to_string(),
+        name: "interrupt_agent".to_string(),
+        description: "Interrupt an agent's current turn, if any, and return its previous status. The agent remains available for messages and follow-up tasks.".to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(properties, Some(vec!["target".to_string()]), Some(false.into())),
-        output_schema: Some(close_agent_output_schema()),
+        output_schema: Some(agent_previous_status_output_schema(
+            "The agent status observed before the interrupt request was handled.",
+        )),
     })
 }
 
@@ -424,13 +463,9 @@ fn list_agents_output_schema() -> Value {
                         "agent_status": {
                             "description": "Last known status of the agent.",
                             "allOf": [agent_status_output_schema()]
-                        },
-                        "last_task_message": {
-                            "type": ["string", "null"],
-                            "description": "Most recent user or inter-agent instruction received by the agent, when available."
                         }
                     },
-                    "required": ["agent_name", "agent_status", "last_task_message"],
+                    "required": ["agent_name", "agent_status"],
                     "additionalProperties": false
                 },
                 "description": "Live agents visible in the current root thread tree."
@@ -477,7 +512,7 @@ fn wait_output_schema_v2() -> Value {
         "properties": {
             "message": {
                 "type": "string",
-                "description": "Brief wait summary without the agent's final content."
+                "description": "Brief wait summary without the agent's final content, including any timeout adjustment."
             },
             "timed_out": {
                 "type": "boolean",
@@ -489,12 +524,12 @@ fn wait_output_schema_v2() -> Value {
     })
 }
 
-fn close_agent_output_schema() -> Value {
+fn agent_previous_status_output_schema(previous_status_description: &str) -> Value {
     json!({
         "type": "object",
         "properties": {
             "previous_status": {
-                "description": "The agent status observed before shutdown was requested.",
+                "description": previous_status_description,
                 "allOf": [agent_status_output_schema()]
             }
         },
@@ -508,7 +543,8 @@ fn create_collab_input_items_schema() -> JsonSchema {
         (
             "type".to_string(),
             JsonSchema::string(Some(
-                "Input item type: text, image, local_image, skill, or mention.".to_string(),
+                "Input item type: text, image, local_image, audio, local_audio, skill, or mention."
+                    .to_string(),
             )),
         ),
         (
@@ -520,9 +556,13 @@ fn create_collab_input_items_schema() -> JsonSchema {
             JsonSchema::string(Some("Image URL when type is image.".to_string())),
         ),
         (
+            "audio_url".to_string(),
+            JsonSchema::string(Some("Audio data URL when type is audio.".to_string())),
+        ),
+        (
             "path".to_string(),
             JsonSchema::string(Some(
-                "Path when type is local_image/skill, or structured mention target such as app://<connector-id> or plugin://<plugin-name>@<marketplace-name> when type is mention."
+                "Path when type is local_image/local_audio/skill, or structured mention target such as app://<connector-id> or plugin://<plugin-name>@<marketplace-name> when type is mention."
                     .to_string(),
             )),
         ),
@@ -550,12 +590,14 @@ fn spawn_agent_common_properties_v1(agent_type_description: &str) -> BTreeMap<St
         ("items".to_string(), create_collab_input_items_schema()),
         (
             "agent_type".to_string(),
-            JsonSchema::string(Some(agent_type_description.to_string())),
+            JsonSchema::string(Some(format!(
+                "{SPAWN_AGENT_TYPE_OVERRIDE_DESCRIPTION_V1}\n{agent_type_description}"
+            ))),
         ),
         (
             "fork_context".to_string(),
             JsonSchema::boolean(Some(
-                "When true, fork the current thread history into the new agent before sending the initial prompt. This must be used when you want the new agent to have exactly the same context as you."
+                "True forks the current thread history into the new agent; false or omitted starts with only the initial prompt."
                     .to_string(),
             )),
         ),
@@ -568,14 +610,8 @@ fn spawn_agent_common_properties_v1(agent_type_description: &str) -> BTreeMap<St
         (
             "reasoning_effort".to_string(),
             JsonSchema::string(Some(
-                "Optional reasoning effort override for the new agent. Replaces the inherited reasoning effort."
+                "Reasoning effort override for the new agent. Omit to inherit the parent effort."
                     .to_string(),
-            )),
-        ),
-        (
-            "service_tier".to_string(),
-            JsonSchema::string(Some(
-                SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION.to_string(),
             )),
         ),
     ])
@@ -585,11 +621,16 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
     BTreeMap::from([
         (
             "message".to_string(),
-            JsonSchema::string(Some("Initial plain-text task for the new agent.".to_string())),
+            JsonSchema::string(Some(
+                "Initial plain-text task for the new agent.".to_string(),
+            ))
+            .with_encrypted(),
         ),
         (
             "agent_type".to_string(),
-            JsonSchema::string(Some(agent_type_description.to_string())),
+            JsonSchema::string(Some(format!(
+                "Agent type override for the new agent. Omit unless explicitly asked. The selected role applies regardless of how much parent history is inherited.\n{agent_type_description}"
+            ))),
         ),
         (
             "fork_turns".to_string(),
@@ -607,14 +648,8 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
         (
             "reasoning_effort".to_string(),
             JsonSchema::string(Some(
-                "Optional reasoning effort override for the new agent. Replaces the inherited reasoning effort."
+                "Reasoning effort override for the new agent. Omit to inherit the parent effort."
                     .to_string(),
-            )),
-        ),
-        (
-            "service_tier".to_string(),
-            JsonSchema::string(Some(
-                SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION.to_string(),
             )),
         ),
     ])
@@ -624,26 +659,23 @@ fn hide_spawn_agent_metadata_options(properties: &mut BTreeMap<String, JsonSchem
     properties.remove("agent_type");
     properties.remove("model");
     properties.remove("reasoning_effort");
-    properties.remove("service_tier");
 }
 
 fn spawn_agent_tool_description(
     available_models_description: Option<&str>,
+    inherited_model_guidance: Option<&str>,
     return_value_description: &str,
-    include_usage_hint: bool,
     usage_hint_text: Option<String>,
 ) -> String {
     let agent_role_guidance = available_models_description.unwrap_or_default();
+    let inherited_model_guidance = inherited_model_guidance.unwrap_or_default();
 
     let tool_description = format!(
         r#"
         {agent_role_guidance}
-        Spawn a sub-agent for a well-scoped task. {return_value_description} {SPAWN_AGENT_INHERITED_MODEL_GUIDANCE}"#
+        Spawn a sub-agent for a well-scoped task. {return_value_description} {inherited_model_guidance}"#
     );
 
-    if !include_usage_hint {
-        return tool_description;
-    }
     if let Some(usage_hint_text) = usage_hint_text {
         return format!(
             r#"
@@ -659,9 +691,9 @@ fn spawn_agent_tool_description(
     format!(
         r#"
         {tool_description}
-This spawn_agent tool provides you access to sub-agents that inherit your current model by default. Do not set the `model` field unless the user explicitly asks for a different model or there is a clear task-specific reason. You should follow the rules and guidelines below to use this tool.
+This spawn_agent tool provides you access to sub-agents that inherit your current model by default. Do not set the `model` field unless the user explicitly asks for a different model. You should follow the rules and guidelines below to use this tool.
 
-Only use `spawn_agent` if and only if the user explicitly asks for sub-agents, delegation, or parallel agent work.
+Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.
 Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do not count as permission to spawn.
 {agent_role_usage_hint}
 
@@ -698,18 +730,11 @@ Requests for depth, thoroughness, research, investigation, or detailed codebase 
 
 fn spawn_agent_tool_description_v2(
     available_models_description: Option<&str>,
-    include_usage_hint: bool,
+    inherited_model_guidance: Option<&str>,
     usage_hint_text: Option<String>,
-    max_concurrent_threads_per_session: Option<usize>,
 ) -> String {
     let agent_role_guidance = available_models_description.unwrap_or_default();
-    let concurrency_guidance = max_concurrent_threads_per_session
-        .map(|limit| {
-            format!(
-                "This session is configured with `max_concurrent_threads_per_session = {limit}` for concurrently open agent threads."
-            )
-        })
-        .unwrap_or_default();
+    let inherited_model_guidance = inherited_model_guidance.unwrap_or_default();
 
     let tool_description = format!(
         r#"
@@ -717,15 +742,14 @@ fn spawn_agent_tool_description_v2(
         Spawns an agent to work on the specified task. If your current task is `/root/task1` and you spawn_agent with task_name "task_3" the agent will have canonical task name `/root/task1/task_3`.
 You are then able to refer to this agent as `task_3` or `/root/task1/task_3` interchangeably. However an agent `/root/task2/task_3` would only be able to communicate with this agent via its canonical name `/root/task1/task_3`.
 The spawned agent will have the same tools as you and the ability to spawn its own subagents.
-{SPAWN_AGENT_INHERITED_MODEL_GUIDANCE}
+{inherited_model_guidance}
+Only call this tool for a concrete, bounded subtask that can run independently alongside useful local work; otherwise continue locally.
 It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
 The new agent's canonical task name will be provided to it along with the message.
-{concurrency_guidance}"#
+
+Note that passing `fork_turns="none"` will not pass any surrounding context to the spawned subagent, which may cause the agent to lack the context it needs to complete its task, whereas `fork_turns="all"` will provide the subagent with all surrounding context."#
     );
 
-    if !include_usage_hint {
-        return tool_description;
-    }
     if let Some(usage_hint_text) = usage_hint_text {
         return format!(
             r#"
@@ -736,11 +760,15 @@ The new agent's canonical task name will be provided to it along with the messag
     tool_description
 }
 
-fn spawn_agent_models_description(models: &[ModelPreset]) -> String {
+fn spawn_agent_models_description(
+    models: &[ModelPreset],
+    multi_agent_version: MultiAgentVersion,
+) -> String {
     let visible_models: Vec<&ModelPreset> = models
         .iter()
         .filter(|model| model.show_in_picker)
-        .take(MAX_MODEL_OVERRIDES_IN_SPAWN_AGENT_DESCRIPTION)
+        .filter(|model| model_supports_multi_agent_backend(model, multi_agent_version))
+        .take(MAX_SPAWN_AGENT_MODEL_OVERRIDES)
         .collect();
     if visible_models.is_empty() {
         return "No picker-visible model overrides are currently loaded.".to_string();
@@ -749,13 +777,20 @@ fn spawn_agent_models_description(models: &[ModelPreset]) -> String {
     let model_descriptions = visible_models
         .into_iter()
         .map(|model| {
-            let default_reasoning_effort = model.default_reasoning_effort;
+            let default_reasoning_effort = &model.default_reasoning_effort;
             let efforts = model
                 .supported_reasoning_efforts
                 .iter()
                 .map(|preset| {
-                    let effort = preset.effort;
-                    if effort == default_reasoning_effort {
+                    let effort = preset.effort.as_str();
+                    let effort = match effort
+                        .char_indices()
+                        .nth(MAX_REASONING_EFFORT_CHARS_IN_SPAWN_AGENT_DESCRIPTION)
+                    {
+                        Some((index, _)) => &effort[..index],
+                        None => effort,
+                    };
+                    if &preset.effort == default_reasoning_effort {
                         format!("{effort} (default)")
                     } else {
                         effort.to_string()
@@ -807,7 +842,7 @@ fn wait_agent_tool_parameters_v1(options: WaitAgentTimeoutOptions) -> JsonSchema
         (
             "timeout_ms".to_string(),
             JsonSchema::number(Some(format!(
-                "Optional timeout in milliseconds. Defaults to {}, min {}, max {}. Prefer longer waits (minutes) to avoid busy polling.",
+                "Timeout in milliseconds. Defaults to {}, min {}, max {}. Prefer longer waits (minutes) to avoid busy polling.",
                 options.default_timeout_ms, options.min_timeout_ms, options.max_timeout_ms,
             ))),
         ),
@@ -824,7 +859,7 @@ fn wait_agent_tool_parameters_v2(options: WaitAgentTimeoutOptions) -> JsonSchema
     let properties = BTreeMap::from([(
         "timeout_ms".to_string(),
         JsonSchema::number(Some(format!(
-            "Optional timeout in milliseconds. Defaults to {}, min {}, max {}.",
+            "Timeout in milliseconds. Defaults to {}, min {}, max {}.",
             options.default_timeout_ms, options.min_timeout_ms, options.max_timeout_ms,
         ))),
     )]);

@@ -13,31 +13,39 @@
 //!
 //! Some UI is time-based rather than input-based, such as the transient "press again to quit"
 //! hint. The pane schedules redraws so those hints can expire even when the UI is otherwise idle.
+//! Inline banners sit above the composer. Number shortcuts apply only to an empty, idle composer;
+//! drafts, paste bursts, and active dialogs keep their normal input routing.
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use crate::app::app_server_requests::ResolvedAppServerRequest;
 use crate::app_event::AppEvent;
 use crate::app_event::ConnectorsSnapshot;
+use crate::app_event::HistoryLookupResponse;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::pending_input_preview::PendingInputPreview;
 use crate::bottom_pane::pending_thread_approvals::PendingThreadApprovals;
 use crate::bottom_pane::unified_exec_footer::UnifiedExecFooter;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
+use crate::key_hint::KeyBindingListExt;
+use crate::keymap::KeymapContext;
+use crate::keymap::KeymapContextSet;
 use crate::keymap::RuntimeKeymap;
 use crate::render::renderable::FlexRenderable;
 use crate::render::renderable::Renderable;
 use crate::render::renderable::RenderableItem;
+use crate::terminal_palette::effective_stdout_color_level;
 use crate::tui::FrameRequester;
 pub(crate) use bottom_pane_view::BottomPaneView;
 pub(crate) use bottom_pane_view::ViewCompletion;
+use codex_app_server_protocol::SkillMetadata;
 use codex_app_server_protocol::ToolRequestUserInputParams;
-use codex_core_skills::model::SkillMetadata;
 use codex_features::Features;
 use codex_file_search::FileMatch;
 use codex_plugin::PluginCapabilitySummary;
 use codex_protocol::ThreadId;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::user_input::TextElement;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -49,8 +57,11 @@ use std::time::Duration;
 use std::time::Instant;
 
 mod action_required_title;
+mod actionable_banner;
 mod app_link_view;
+mod apply_patch_header;
 mod approval_overlay;
+mod hook_status;
 mod mcp_server_elicitation;
 mod multi_select_picker;
 mod request_user_input;
@@ -60,18 +71,25 @@ mod status_surface_preview;
 mod title_setup;
 pub(crate) use action_required_title::ACTION_REQUIRED_PREVIEW_PREFIX;
 pub(crate) use action_required_title::build_action_required_title_text;
+pub(crate) use actionable_banner::ActionableBanner;
+pub(crate) use actionable_banner::BannerDismissal;
 pub(crate) use app_link_view::AppLinkElicitationTarget;
 pub(crate) use app_link_view::AppLinkSuggestionType;
 pub(crate) use app_link_view::AppLinkView;
 pub(crate) use app_link_view::AppLinkViewParams;
+pub(crate) use approval_overlay::ApplyPatchApprovalRequest;
 pub(crate) use approval_overlay::ApprovalOverlay;
 pub(crate) use approval_overlay::ApprovalRequest;
+pub(crate) use approval_overlay::ExecApprovalRequest;
+pub(crate) use approval_overlay::McpElicitationApprovalRequest;
+pub(crate) use approval_overlay::PermissionsApprovalRequest;
 pub(crate) use approval_overlay::format_requested_permissions_rule;
 pub(crate) use mcp_server_elicitation::McpServerElicitationFormRequest;
 pub(crate) use mcp_server_elicitation::McpServerElicitationOverlay;
 pub(crate) use request_user_input::RequestUserInputOverlay;
 pub(crate) use status_line_style::status_line_from_segments;
 mod bottom_pane_view;
+mod effort_ignition;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LocalImageAttachment {
@@ -81,7 +99,9 @@ pub(crate) struct LocalImageAttachment {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MentionBinding {
-    /// Mention token text without the leading `$`.
+    /// Visible mention sigil (`$` or `@`).
+    pub(crate) sigil: char,
+    /// Mention token text without the leading sigil (`$` or `@`).
     pub(crate) mention: String,
     /// Canonical mention target (for example `app://...` or absolute SKILL.md path).
     pub(crate) path: String,
@@ -90,6 +110,7 @@ mod chat_composer;
 mod chat_composer_history;
 mod command_popup;
 pub(crate) mod custom_prompt_view;
+mod effort_status_line;
 mod experimental_features_view;
 mod file_search_popup;
 mod footer;
@@ -107,6 +128,7 @@ pub(crate) use footer::goal_status_indicator_line;
 pub(crate) use list_selection_view::ColumnWidthMode;
 pub(crate) use list_selection_view::ListSelectionView;
 pub(crate) use list_selection_view::OnSelectionChangedCallback;
+pub(crate) use list_selection_view::SelectionDescriptionLayout;
 pub(crate) use list_selection_view::SelectionRowDisplay;
 pub(crate) use list_selection_view::SelectionToggle;
 pub(crate) use list_selection_view::SelectionViewParams;
@@ -139,7 +161,9 @@ mod pending_thread_approvals;
 pub(crate) mod popup_consts;
 mod scroll_state;
 mod selection_popup_common;
+mod selection_row_layout;
 mod selection_tabs;
+mod startup;
 mod textarea;
 mod unified_exec_footer;
 pub(crate) use feedback_view::FeedbackNoteView;
@@ -178,13 +202,17 @@ pub(crate) enum CancellationEvent {
 use crate::bottom_pane::prompt_args::parse_slash_name;
 pub(crate) use chat_composer::ChatComposer;
 pub(crate) use chat_composer::ChatComposerConfig;
+pub(crate) use chat_composer::ComposerDraftSnapshot;
 pub(crate) use chat_composer::InputResult;
 pub(crate) use chat_composer::QueuedInputAction;
+pub(crate) use chat_composer_history::HistoryEntry;
 
 use crate::status_indicator_widget::StatusDetailsCapitalization;
 use crate::status_indicator_widget::StatusIndicatorWidget;
 pub(crate) use experimental_features_view::ExperimentalFeatureItem;
 pub(crate) use experimental_features_view::ExperimentalFeaturesView;
+pub(crate) use list_selection_view::SELECTION_TOGGLE_BLOCKED_PREFIX;
+pub(crate) use list_selection_view::SELECTION_TOGGLE_UNAVAILABLE_PREFIX;
 pub(crate) use list_selection_view::SelectionAction;
 pub(crate) use list_selection_view::SelectionItem;
 
@@ -221,6 +249,11 @@ pub(crate) struct BottomPane {
 
     /// Inline status indicator shown above the composer while a task is running.
     status: Option<StatusIndicatorWidget>,
+    /// Running-hook summary supplied by the lifecycle owner after its reveal delay.
+    hook_status_message: Option<String>,
+    inline_banner: Option<actionable_banner::InlineBanner>,
+    /// Streaming may drop the row without losing its elapsed time or modal pause.
+    status_timer: crate::status_indicator_widget::StatusTimer,
     /// Unified exec session summary source.
     ///
     /// When a status row exists, this summary is mirrored inline in that row;
@@ -248,6 +281,14 @@ pub(crate) struct BottomPaneParams {
 
 impl BottomPane {
     pub fn new(params: BottomPaneParams) -> Self {
+        Self::new_with_composer_config(params, ChatComposerConfig::default())
+    }
+
+    /// Construct a bottom pane with explicitly restricted composer behavior.
+    pub(crate) fn new_with_composer_config(
+        params: BottomPaneParams,
+        composer_config: ChatComposerConfig,
+    ) -> Self {
         let BottomPaneParams {
             app_event_tx,
             frame_requester,
@@ -258,12 +299,13 @@ impl BottomPane {
             animations_enabled,
             skills,
         } = params;
-        let mut composer = ChatComposer::new(
+        let mut composer = ChatComposer::new_with_config(
             has_input_focus,
             app_event_tx.clone(),
             enhanced_keys_supported,
             placeholder_text,
             disable_paste_burst,
+            composer_config,
         );
         composer.set_frame_requester(frame_requester.clone());
         let keymap = RuntimeKeymap::defaults();
@@ -282,6 +324,9 @@ impl BottomPane {
             disable_paste_burst,
             is_task_running: false,
             status: None,
+            hook_status_message: None,
+            inline_banner: None,
+            status_timer: crate::status_indicator_widget::StatusTimer::default(),
             unified_exec_footer: UnifiedExecFooter::new(),
             pending_input_preview: PendingInputPreview::new(),
             pending_thread_approvals: PendingThreadApprovals::new(),
@@ -306,6 +351,29 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    /// Mirrors the effective reasoning effort into the composer so its next
+    /// visible frame can play a one-shot Max/Ultra effect.
+    pub(crate) fn set_active_reasoning_effort(&mut self, effort: Option<&ReasoningEffort>) {
+        let animations_enabled = effort_ignition::effort_animation_enabled(
+            self.animations_enabled,
+            effective_stdout_color_level(),
+        );
+        if self
+            .composer
+            .set_active_reasoning_effort(effort, animations_enabled)
+        {
+            self.request_redraw();
+        }
+    }
+
+    /// Establishes a restored thread's effort without replaying its one-shot animation.
+    pub(crate) fn set_active_reasoning_effort_baseline(
+        &mut self,
+        effort: Option<&ReasoningEffort>,
+    ) {
+        self.composer.set_active_reasoning_effort_baseline(effort);
+    }
+
     pub fn set_connectors_snapshot(&mut self, snapshot: Option<ConnectorsSnapshot>) {
         self.composer.set_connector_mentions(snapshot);
         self.request_redraw();
@@ -316,8 +384,36 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    pub(crate) fn set_agents_navigation_enabled(&mut self, enabled: bool) {
+        self.composer.set_agents_navigation_enabled(enabled);
+        self.request_redraw();
+    }
+
+    pub(crate) fn set_task_mentions_enabled(&mut self, enabled: bool) {
+        self.composer.set_task_mentions_enabled(enabled);
+        self.request_redraw();
+    }
+
+    pub(crate) fn task_mentions_enabled(&self) -> bool {
+        self.composer.task_mentions_enabled()
+    }
+
+    pub(crate) fn on_task_search_result(
+        &mut self,
+        query: &str,
+        matches: Vec<crate::task_mentions::TaskMention>,
+    ) {
+        self.composer.on_task_search_result(query, matches);
+        self.request_redraw();
+    }
+
     pub fn set_plugins_command_enabled(&mut self, enabled: bool) {
         self.composer.set_plugins_command_enabled(enabled);
+        self.request_redraw();
+    }
+
+    pub fn set_token_activity_command_enabled(&mut self, enabled: bool) {
+        self.composer.set_token_activity_command_enabled(enabled);
         self.request_redraw();
     }
 
@@ -352,6 +448,12 @@ impl BottomPane {
     pub fn set_keymap_bindings(&mut self, keymap: &RuntimeKeymap) {
         self.keymap = keymap.clone();
         self.composer.set_keymap_bindings(keymap);
+        let interrupt_binding = keymap.primary_hint(KeymapContext::Chat, "interrupt_turn");
+        self.pending_input_preview
+            .set_interrupt_binding(interrupt_binding);
+        if let Some(status) = self.status.as_mut() {
+            status.set_interrupt_binding(interrupt_binding);
+        }
         self.request_redraw();
     }
 
@@ -416,16 +518,6 @@ impl BottomPane {
         self.request_redraw();
     }
 
-    pub fn set_realtime_conversation_enabled(&mut self, enabled: bool) {
-        self.composer.set_realtime_conversation_enabled(enabled);
-        self.request_redraw();
-    }
-
-    pub fn set_audio_device_selection_enabled(&mut self, enabled: bool) {
-        self.composer.set_audio_device_selection_enabled(enabled);
-        self.request_redraw();
-    }
-
     pub(crate) fn set_side_conversation_active(&mut self, active: bool) {
         self.composer.set_side_conversation_active(active);
         self.request_redraw();
@@ -436,9 +528,17 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    pub(crate) fn set_parent_owned_thread(&mut self) {
+        self.composer.set_parent_owned_thread();
+        self.request_redraw();
+    }
+
     /// Update the key hint shown next to queued messages so it matches the
     /// binding that `ChatWidget` actually listens for.
-    pub(crate) fn set_queued_message_edit_binding(&mut self, binding: Option<KeyBinding>) {
+    pub(crate) fn set_queued_message_edit_binding(
+        &mut self,
+        binding: Option<crate::key_hint::ShortcutHint>,
+    ) {
         self.pending_input_preview.set_edit_binding(binding);
         self.request_redraw();
     }
@@ -456,6 +556,15 @@ impl BottomPane {
 
     pub fn status_widget(&self) -> Option<&StatusIndicatorWidget> {
         self.status.as_ref()
+    }
+
+    pub(crate) fn status_elapsed(&self) -> Option<Duration> {
+        self.is_task_running
+            .then(|| self.status_timer.elapsed_at(Instant::now()))
+    }
+
+    pub(crate) fn reset_status_timer(&mut self, elapsed: Duration) {
+        self.status_timer.reset(elapsed);
     }
 
     pub fn skills(&self) -> Option<&Vec<SkillMetadata>> {
@@ -526,7 +635,7 @@ impl BottomPane {
 
     fn record_composer_activity_at(&mut self, now: Instant) {
         self.last_composer_activity_at = Some(now);
-        if !self.delayed_approval_requests.is_empty()
+        if self.has_pending_approval()
             && let Some(delay) = self.approval_prompt_delay_remaining(now)
         {
             self.request_redraw_in(delay);
@@ -534,7 +643,7 @@ impl BottomPane {
     }
 
     fn maybe_show_delayed_approval_requests_at(&mut self, now: Instant) {
-        if self.delayed_approval_requests.is_empty() || !self.view_stack.is_empty() {
+        if !self.has_pending_approval() || !self.view_stack.is_empty() {
             return;
         }
         if let Some(delay) = self.approval_prompt_delay_remaining(now) {
@@ -560,6 +669,16 @@ impl BottomPane {
         }
         self.pause_status_timer_for_modal();
         self.push_view(Box::new(modal));
+    }
+
+    /// Edit the draft without invoking popups, submissions, or remote actions.
+    pub(crate) fn handle_disconnected_key(&mut self, key: KeyEvent) {
+        self.view_stack.clear();
+        self.delayed_approval_requests.clear();
+        self.composer
+            .set_input_enabled(/*enabled*/ true, /*placeholder*/ None);
+        self.composer.handle_disconnected_key(key);
+        self.request_redraw();
     }
 
     /// Forward a key event to the active view or the composer.
@@ -610,22 +729,13 @@ impl BottomPane {
             self.request_redraw();
             InputResult::None
         } else {
-            let is_agent_command = self
-                .composer_text()
-                .lines()
-                .next()
-                .and_then(parse_slash_name)
-                .is_some_and(|(name, _, _)| name == "agent");
-
-            // If a task is running and a status line is visible, allow Esc to
-            // send an interrupt even while the composer has focus.
+            if self.handle_inline_banner_key(key_event) {
+                return InputResult::None;
+            }
+            // If a task is running and a status line is visible, allow the
+            // configured action to interrupt even while the composer has focus.
             // When a popup is active, prefer dismissing it over interrupting the task.
-            if key_event.code == KeyCode::Esc
-                && matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-                && self.is_task_running
-                && !is_agent_command
-                && !self.composer.popup_active()
-                && !self.composer_should_handle_vim_insert_escape(key_event)
+            if self.should_interrupt_running_task(key_event)
                 && let Some(status) = &self.status
             {
                 // Send Op::Interrupt
@@ -658,6 +768,15 @@ impl BottomPane {
         }
     }
 
+    /// Return the contexts whose ordinary handlers can consume the next key.
+    pub(crate) fn keymap_contexts(&self) -> KeymapContextSet {
+        if let Some(view) = self.view_stack.last() {
+            view.keymap_contexts()
+        } else {
+            self.composer.keymap_contexts()
+        }
+    }
+
     /// Handles a Ctrl+C press within the bottom pane.
     ///
     /// An active modal view is given the first chance to consume the key (typically to dismiss
@@ -680,7 +799,7 @@ impl BottomPane {
                 self.request_redraw();
             }
             event
-        } else if self.composer.cancel_history_search() {
+        } else if self.composer.cancel_vim_search() || self.composer.cancel_history_search() {
             self.request_redraw();
             CancellationEvent::Handled
         } else if self.composer_is_empty() {
@@ -729,7 +848,23 @@ impl BottomPane {
     fn pre_draw_tick_at(&mut self, now: Instant) {
         self.composer.sync_popups();
         self.maybe_show_delayed_approval_requests_at(now);
+        self.tick_active_view(now);
         self.schedule_active_view_frame();
+    }
+
+    fn tick_active_view(&mut self, now: Instant) {
+        let Some(view) = self.view_stack.last_mut() else {
+            return;
+        };
+        let needs_redraw = view.pre_draw_tick(now);
+        let view_complete = view.is_complete();
+        if view_complete {
+            self.view_stack.clear();
+            self.on_active_view_complete();
+        }
+        if needs_redraw || view_complete {
+            self.request_redraw();
+        }
     }
 
     fn schedule_active_view_frame(&self) {
@@ -776,6 +911,7 @@ impl BottomPane {
             local_image_paths,
             mention_bindings,
         );
+        self.composer.move_cursor_to_end();
         self.request_redraw();
     }
 
@@ -814,8 +950,9 @@ impl BottomPane {
         self.composer.current_text()
     }
 
-    pub(crate) fn composer_draft_snapshot(&self) -> chat_composer::ComposerDraftSnapshot {
-        self.composer.draft_snapshot()
+    #[cfg(test)]
+    pub(crate) fn composer_cursor(&self) -> usize {
+        self.composer.cursor()
     }
 
     #[cfg(test)]
@@ -823,7 +960,6 @@ impl BottomPane {
         self.composer.text_elements()
     }
 
-    #[cfg(test)]
     pub(crate) fn composer_local_images(&self) -> Vec<LocalImageAttachment> {
         self.composer.local_images()
     }
@@ -856,24 +992,11 @@ impl BottomPane {
         self.request_redraw();
     }
 
-    /// Applies the externally decided Plan-mode nudge visibility to the footer presentation.
-    pub(crate) fn set_plan_mode_nudge_visible(&mut self, visible: bool) {
-        if self.composer.set_plan_mode_nudge_visible(visible) {
-            self.request_redraw();
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn plan_mode_nudge_visible(&self) -> bool {
-        self.composer.plan_mode_nudge_visible()
-    }
-
     pub(crate) fn set_remote_image_urls(&mut self, urls: Vec<String>) {
         self.composer.set_remote_image_urls(urls);
         self.request_redraw();
     }
 
-    #[cfg(test)]
     pub(crate) fn remote_image_urls(&self) -> Vec<String> {
         self.composer.remote_image_urls()
     }
@@ -891,19 +1014,22 @@ impl BottomPane {
 
     /// Update the status indicator header (defaults to "Working") and details below it.
     ///
-    /// Passing `None` clears any existing details. No-ops if the status indicator is not active.
+    /// Passing `None` clears any existing details. Returns whether the active status indicator
+    /// was updated and requested a redraw.
     pub(crate) fn update_status(
         &mut self,
         header: String,
         details: Option<String>,
         details_capitalization: StatusDetailsCapitalization,
         details_max_lines: usize,
-    ) {
+    ) -> bool {
         if let Some(status) = self.status.as_mut() {
             status.update_header(header);
             status.update_details(details, details_capitalization, details_max_lines.max(1));
             self.request_redraw();
+            return true;
         }
+        false
     }
 
     /// Show the transient "press again to quit" hint for `key`.
@@ -949,7 +1075,7 @@ impl BottomPane {
 
     #[cfg(test)]
     pub(crate) fn status_indicator_visible(&self) -> bool {
-        self.status.is_some()
+        self.status_widget().is_some()
     }
 
     #[cfg(test)]
@@ -980,6 +1106,7 @@ impl BottomPane {
 
         if running {
             if !was_running {
+                self.status_timer.reset(Duration::ZERO);
                 if self.status.is_none() {
                     self.status = Some(StatusIndicatorWidget::new(
                         self.app_event_tx.clone(),
@@ -989,6 +1116,10 @@ impl BottomPane {
                 }
                 if let Some(status) = self.status.as_mut() {
                     status.set_interrupt_hint_visible(/*visible*/ true);
+                    status.set_interrupt_binding(
+                        self.keymap
+                            .primary_hint(KeymapContext::Chat, "interrupt_turn"),
+                    );
                 }
                 self.sync_status_inline_message();
                 self.request_redraw();
@@ -1012,11 +1143,19 @@ impl BottomPane {
 
     pub(crate) fn ensure_status_indicator(&mut self) {
         if self.status.is_none() {
-            self.status = Some(StatusIndicatorWidget::new(
-                self.app_event_tx.clone(),
-                self.frame_requester.clone(),
-                self.animations_enabled,
-            ));
+            self.status.get_or_insert_with(|| {
+                StatusIndicatorWidget::new(
+                    self.app_event_tx.clone(),
+                    self.frame_requester.clone(),
+                    self.animations_enabled,
+                )
+            });
+            if let Some(status) = self.status.as_mut() {
+                status.set_interrupt_binding(
+                    self.keymap
+                        .primary_hint(KeymapContext::Chat, "interrupt_turn"),
+                );
+            }
             self.sync_status_inline_message();
             self.request_redraw();
         }
@@ -1042,6 +1181,11 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    pub(crate) fn set_context_window_pending(&mut self, pending: bool) {
+        self.composer.set_context_window_pending(pending);
+        self.request_redraw();
+    }
+
     /// Show a generic list selection view with the provided items.
     pub(crate) fn show_selection_view(
         &mut self,
@@ -1057,6 +1201,14 @@ impl BottomPane {
     }
 
     fn apply_standard_popup_hint(&self, params: &mut list_selection_view::SelectionViewParams) {
+        if !params.allow_cancel {
+            if params.footer_hint.is_none()
+                || params.footer_hint.as_ref() == Some(&popup_consts::standard_popup_hint_line())
+            {
+                params.footer_hint = None;
+            }
+            return;
+        }
         if params.footer_hint.is_none()
             || params.footer_hint.as_ref() == Some(&popup_consts::standard_popup_hint_line())
         {
@@ -1089,8 +1241,54 @@ impl BottomPane {
         true
     }
 
+    /// Replace the newest matching selection view without disturbing views stacked above it.
+    /// Preserve pending parent cleanup when an already-open child is accepted.
+    pub(crate) fn replace_selection_view_if_present(
+        &mut self,
+        view_id: &'static str,
+        mut params: list_selection_view::SelectionViewParams,
+    ) -> bool {
+        let Some(index) = self
+            .view_stack
+            .iter()
+            .rposition(|view| view.view_id() == Some(view_id))
+        else {
+            return false;
+        };
+
+        let replaces_active_view = index + 1 == self.view_stack.len();
+        self.apply_standard_popup_hint(&mut params);
+        let mut view = list_selection_view::ListSelectionView::new(
+            params,
+            self.app_event_tx.clone(),
+            self.keymap.list.clone(),
+        );
+        view.dismiss_after_child_accept = self.view_stack[index].dismiss_after_child_accept();
+        self.view_stack[index] = Box::new(view);
+        if replaces_active_view {
+            self.schedule_active_view_frame();
+        }
+        self.request_redraw();
+        true
+    }
+
     pub(crate) fn standard_popup_hint_line(&self) -> Line<'static> {
         popup_consts::standard_popup_hint_line_for_keymap(&self.keymap.list)
+    }
+
+    pub(crate) fn replace_view_if_present(
+        &mut self,
+        view_id: &'static str,
+        view: Box<dyn BottomPaneView>,
+    ) {
+        if let Some(index) = self
+            .view_stack
+            .iter()
+            .rposition(|existing| existing.view_id() == Some(view_id))
+        {
+            self.view_stack[index] = view;
+            self.request_redraw();
+        }
     }
 
     pub(crate) fn list_keymap(&self) -> crate::keymap::ListKeymap {
@@ -1138,11 +1336,37 @@ impl BottomPane {
             .and_then(|view| view.selected_index())
     }
 
+    pub(crate) fn selected_index_for_present_view(&self, view_id: &'static str) -> Option<usize> {
+        self.view_stack
+            .iter()
+            .rfind(|view| view.view_id() == Some(view_id))
+            .and_then(|view| view.selected_index())
+    }
+
     pub(crate) fn active_tab_id_for_active_view(&self, view_id: &'static str) -> Option<&str> {
         self.view_stack
             .last()
             .filter(|view| view.view_id() == Some(view_id))
             .and_then(|view| view.active_tab_id())
+    }
+
+    /// Forward a suggestion to its matching prompt, even beneath another view.
+    pub(crate) fn apply_text_suggestion(
+        &mut self,
+        request_id: uuid::Uuid,
+        suggestion: Option<&str>,
+    ) -> bool {
+        let changed = self
+            .view_stack
+            .iter_mut()
+            .rev()
+            .any(|view| view.apply_text_suggestion(request_id, suggestion));
+
+        if changed {
+            self.request_redraw();
+        }
+
+        changed
     }
 
     pub(crate) fn dismiss_active_view_if_id(&mut self, view_id: &'static str) -> bool {
@@ -1155,6 +1379,25 @@ impl BottomPane {
         }
 
         self.view_stack.pop();
+        self.request_redraw();
+        true
+    }
+
+    /// Dismiss the newest matching view without disturbing views stacked above it.
+    pub(crate) fn dismiss_view_by_id(&mut self, view_id: &'static str) -> bool {
+        let Some(index) = self
+            .view_stack
+            .iter()
+            .rposition(|view| view.view_id() == Some(view_id))
+        else {
+            return false;
+        };
+
+        let removed_active_view = index + 1 == self.view_stack.len();
+        self.view_stack.remove(index);
+        if removed_active_view {
+            self.schedule_active_view_frame();
+        }
         self.request_redraw();
         true
     }
@@ -1195,13 +1438,29 @@ impl BottomPane {
         }
     }
 
-    /// Copy unified-exec summary text into the active status row, if any.
+    /// Update hook activity after the lifecycle reveal delay, even outside a turn.
+    pub(crate) fn set_hook_status_message(&mut self, message: Option<String>) {
+        if self.hook_status_message == message {
+            return;
+        }
+
+        self.hook_status_message = message;
+        if self.hook_status_message.is_some() && self.status.is_none() && self.is_task_running() {
+            self.ensure_status_indicator();
+        } else {
+            self.sync_status_inline_message();
+            self.request_redraw();
+        }
+    }
+
+    /// Copy background activity and hook text into the active status row, if any.
     ///
     /// This keeps status-line inline text synchronized without forcing the
     /// standalone unified-exec footer row to be visible.
     fn sync_status_inline_message(&mut self) {
         if let Some(status) = self.status.as_mut() {
             status.update_inline_message(self.unified_exec_footer.summary_text());
+            status.update_hook_status_message(self.hook_status_message.clone());
         }
     }
 
@@ -1209,7 +1468,6 @@ impl BottomPane {
         self.composer.is_empty()
     }
 
-    #[cfg(test)]
     pub(crate) fn composer_is_vim_enabled(&self) -> bool {
         self.composer.is_vim_enabled()
     }
@@ -1222,6 +1480,22 @@ impl BottomPane {
         self.is_task_running
     }
 
+    pub(crate) fn should_interrupt_running_task(&self, key_event: KeyEvent) -> bool {
+        let is_agent_command = self
+            .composer_text()
+            .lines()
+            .next()
+            .and_then(parse_slash_name)
+            .is_some_and(|(name, _, _)| matches!(name, "agents" | "subagents"));
+
+        self.keymap.chat.interrupt_turn.is_pressed(key_event)
+            && self.is_task_running
+            && !(is_agent_command && key_event.code == KeyCode::Esc)
+            && self.no_modal_or_popup_active()
+            && !self.composer_should_handle_vim_insert_escape(key_event)
+            && self.status_widget().is_some()
+    }
+
     pub(crate) fn terminal_title_requires_action(&self) -> bool {
         self.active_view()
             .is_some_and(bottom_pane_view::BottomPaneView::terminal_title_requires_action)
@@ -1229,6 +1503,13 @@ impl BottomPane {
 
     pub(crate) fn has_active_view(&self) -> bool {
         !self.view_stack.is_empty()
+    }
+
+    pub(crate) fn active_view_will_interrupt_turn_on_key_event(&self, key_event: KeyEvent) -> bool {
+        self.is_task_running
+            && self
+                .active_view()
+                .is_some_and(|view| view.will_interrupt_turn_on_key_event(key_event))
     }
 
     #[cfg(test)]
@@ -1240,7 +1521,10 @@ impl BottomPane {
     /// overlays or popups and not running a task. This is the safe context to
     /// use Esc-Esc for backtracking from the main view.
     pub(crate) fn is_normal_backtrack_mode(&self) -> bool {
-        !self.is_task_running && self.view_stack.is_empty() && !self.composer.popup_active()
+        !self.is_task_running
+            && self.view_stack.is_empty()
+            && !self.composer.popup_active()
+            && !self.inline_banner_accepts_dismissal()
     }
 
     /// Return true when no popups or modal views are active, regardless of task state.
@@ -1259,6 +1543,15 @@ impl BottomPane {
 
     pub(crate) fn show_view(&mut self, view: Box<dyn BottomPaneView>) {
         self.push_view(view);
+    }
+
+    /// Show a text prompt with the composer's current editing preferences.
+    pub(crate) fn show_text_prompt(&mut self, mut view: custom_prompt_view::CustomPromptView) {
+        view.set_keymap_bindings(&self.keymap);
+        if self.composer_is_vim_enabled() {
+            view.enable_vim_in_insert_mode();
+        }
+        self.push_view(Box::new(view));
     }
 
     /// Called when the agent requests user approval.
@@ -1406,7 +1699,7 @@ impl BottomPane {
             self.has_input_focus,
             self.enhanced_keys_supported,
             self.disable_paste_burst,
-            self.keymap.list.clone(),
+            self.keymap.clone(),
         );
         self.pause_status_timer_for_modal();
         self.set_composer_input_enabled(
@@ -1461,15 +1754,12 @@ impl BottomPane {
     }
 
     fn pause_status_timer_for_modal(&mut self) {
-        if let Some(status) = self.status.as_mut() {
-            status.pause_timer();
-        }
+        self.status_timer.pause_at(Instant::now());
     }
 
     fn resume_status_timer_after_modal(&mut self) {
-        if let Some(status) = self.status.as_mut() {
-            status.resume_timer();
-        }
+        self.status_timer.resume_at(Instant::now());
+        self.request_redraw();
     }
 
     /// Height (terminal rows) required by the current bottom pane.
@@ -1514,20 +1804,36 @@ impl BottomPane {
             || self.composer.is_in_paste_burst()
     }
 
-    pub(crate) fn on_history_entry_response(
-        &mut self,
-        log_id: u64,
-        offset: usize,
-        entry: Option<String>,
-    ) {
-        let updated = self
-            .composer
-            .on_history_entry_response(log_id, offset, entry);
-
+    pub(crate) fn on_history_lookup_response(&mut self, response: HistoryLookupResponse) {
+        let updated = match response {
+            HistoryLookupResponse::Entry {
+                offset,
+                log_id,
+                entry,
+            } => self
+                .composer
+                .on_history_entry_response(log_id, offset, entry),
+            HistoryLookupResponse::Batch {
+                cursor,
+                log_id,
+                entries,
+                next_older_cursor,
+            } => {
+                self.composer
+                    .on_history_batch_response(log_id, cursor, entries, next_older_cursor)
+            }
+            HistoryLookupResponse::BatchError { cursor, log_id } => {
+                self.composer.on_history_batch_error(log_id, cursor)
+            }
+        };
         if updated {
             self.composer.sync_popups();
             self.request_redraw();
         }
+    }
+
+    pub(crate) fn record_replayed_user_message_history(&mut self, entry: HistoryEntry) {
+        self.composer.record_replayed_user_message_history(entry);
     }
 
     pub(crate) fn on_file_search_result(&mut self, query: String, matches: Vec<FileMatch>) {
@@ -1565,20 +1871,46 @@ impl BottomPane {
         self.as_renderable_with_composer_right_reserve(/*composer_right_reserve*/ 0)
     }
 
-    fn as_renderable_with_composer_right_reserve(
+    pub(crate) fn as_renderable_with_composer_right_reserve(
         &'_ self,
         composer_right_reserve: u16,
     ) -> RenderableItem<'_> {
+        if (self.is_task_running || !self.view_stack.is_empty())
+            && let Some(banner) = &self.inline_banner
+        {
+            banner.visible.set(false);
+        }
         if let Some(view) = self.active_view() {
             RenderableItem::Borrowed(view)
         } else {
             let mut flex = FlexRenderable::new();
-            if let Some(status) = &self.status {
-                flex.push(/*flex*/ 0, RenderableItem::Borrowed(status));
+            if let Some(banner) = self
+                .inline_banner
+                .as_ref()
+                .filter(|_| !self.is_task_running)
+            {
+                flex.push(/*flex*/ 0, RenderableItem::Borrowed(banner));
+            }
+            if let Some(status) = self.status_widget() {
+                flex.push(
+                    /*flex*/ 0,
+                    RenderableItem::Owned(Box::new(status.with_timer(&self.status_timer))),
+                );
+            }
+            if self.status.is_none()
+                && let Some(message) = &self.hook_status_message
+            {
+                flex.push(
+                    /*flex*/ 0,
+                    RenderableItem::Owned(Box::new(hook_status::HookStatus {
+                        message,
+                        animations_enabled: self.animations_enabled,
+                    })),
+                );
             }
             // Avoid double-surfacing the same summary and avoid adding an extra
             // row while the status line is already visible.
-            if self.status.is_none() && !self.unified_exec_footer.is_empty() {
+            if self.status_widget().is_none() && !self.unified_exec_footer.is_empty() {
                 flex.push(
                     /*flex*/ 0,
                     RenderableItem::Borrowed(&self.unified_exec_footer),
@@ -1588,8 +1920,9 @@ impl BottomPane {
             let has_pending_input = !self.pending_input_preview.queued_messages.is_empty()
                 || !self.pending_input_preview.pending_steers.is_empty()
                 || !self.pending_input_preview.rejected_steers.is_empty();
-            let has_status_or_footer =
-                self.status.is_some() || !self.unified_exec_footer.is_empty();
+            let has_status_or_footer = self.status_widget().is_some()
+                || self.hook_status_message.is_some()
+                || !self.unified_exec_footer.is_empty();
             let has_inline_previews = has_pending_thread_approvals || has_pending_input;
             if has_inline_previews && has_status_or_footer {
                 flex.push(/*flex*/ 0, RenderableItem::Owned("".into()));
@@ -1621,43 +1954,6 @@ impl BottomPane {
             flex2.push(/*flex*/ 0, composer);
             RenderableItem::Owned(Box::new(flex2))
         }
-    }
-
-    pub(crate) fn render_with_composer_right_reserve(
-        &self,
-        area: Rect,
-        buf: &mut Buffer,
-        composer_right_reserve: u16,
-    ) {
-        self.as_renderable_with_composer_right_reserve(composer_right_reserve)
-            .render(area, buf);
-    }
-
-    pub(crate) fn desired_height_with_composer_right_reserve(
-        &self,
-        width: u16,
-        composer_right_reserve: u16,
-    ) -> u16 {
-        self.as_renderable_with_composer_right_reserve(composer_right_reserve)
-            .desired_height(width)
-    }
-
-    pub(crate) fn cursor_pos_with_composer_right_reserve(
-        &self,
-        area: Rect,
-        composer_right_reserve: u16,
-    ) -> Option<(u16, u16)> {
-        self.as_renderable_with_composer_right_reserve(composer_right_reserve)
-            .cursor_pos(area)
-    }
-
-    pub(crate) fn cursor_style_with_composer_right_reserve(
-        &self,
-        area: Rect,
-        composer_right_reserve: u16,
-    ) -> crossterm::cursor::SetCursorStyle {
-        self.as_renderable_with_composer_right_reserve(composer_right_reserve)
-            .cursor_style(area)
     }
 
     pub(crate) fn set_status_line(&mut self, status_line: Option<Line<'static>>) {
@@ -1725,31 +2021,6 @@ impl Renderable for ChatComposerRightReserveRenderable<'_> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-impl BottomPane {
-    pub(crate) fn insert_recording_meter_placeholder(&mut self, text: &str) -> String {
-        let id = self.composer.insert_recording_meter_placeholder(text);
-        self.composer.sync_popups();
-        self.request_redraw();
-        id
-    }
-
-    pub(crate) fn update_recording_meter_in_place(&mut self, id: &str, text: &str) -> bool {
-        let updated = self.composer.update_recording_meter_in_place(id, text);
-        if updated {
-            self.composer.sync_popups();
-            self.request_redraw();
-        }
-        updated
-    }
-
-    pub(crate) fn remove_recording_meter_placeholder(&mut self, id: &str) {
-        self.composer.remove_recording_meter_placeholder(id);
-        self.composer.sync_popups();
-        self.request_redraw();
-    }
-}
-
 impl Renderable for BottomPane {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         self.as_renderable().render(area, buf);
@@ -1768,6 +2039,9 @@ impl Renderable for BottomPane {
 
 #[cfg(test)]
 mod tests {
+    #[path = "actionable_banner_tests.rs"]
+    mod actionable_banner_tests;
+
     use super::*;
     use crate::app::app_server_requests::ResolvedAppServerRequest;
     use crate::app_command::AppCommand as Op;
@@ -1829,10 +2103,12 @@ mod tests {
     }
 
     fn exec_request() -> ApprovalRequest {
-        ApprovalRequest::Exec {
+        ApprovalRequest::Exec(ExecApprovalRequest {
+            kind: Default::default(),
             thread_id: codex_protocol::ThreadId::new(),
             thread_label: None,
             id: "1".to_string(),
+            environment_id: None,
             command: vec!["echo".into(), "ok".into()],
             reason: None,
             available_decisions: vec![
@@ -1841,6 +2117,93 @@ mod tests {
             ],
             network_approval_context: None,
             additional_permissions: None,
+        })
+    }
+
+    #[test]
+    fn inline_banner_snapshot() {
+        let (tx, _rx) = unbounded_channel();
+        let mut pane = test_pane(AppEventSender::new(tx));
+        pane.set_inline_banner(Some(ActionableBanner {
+            title: "Choose how to continue working".to_string(),
+            description: "A long description wraps to fit the available terminal width.\n"
+                .repeat(/*n*/ 8),
+            actions: vec![
+                SelectionItem {
+                    name: "Open usage settings".to_string(),
+                    ..Default::default()
+                },
+                SelectionItem {
+                    name: "Notify owner".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }));
+        let width = 44;
+        let area = Rect::new(
+            /*x*/ 0,
+            /*y*/ 0,
+            width,
+            pane.desired_height(width),
+        );
+        assert_snapshot!(
+            "inline_banner_wrapped_and_truncated",
+            render_snapshot(&pane, area)
+        );
+        assert!(!pane.is_normal_backtrack_mode());
+        pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(pane.is_normal_backtrack_mode());
+    }
+
+    #[test]
+    fn backend_banner_snapshots_and_numbered_actions() {
+        for (kind, action, label) in [
+            ("personal_limit", "view_usage", "View usage"),
+            ("workspace_member_credits", "notify_owner", "Notify owner"),
+        ] {
+            let banner = crate::backend_banners::BackendBanner::parse(&serde_json::json!({
+                "banner_type": kind,
+                "presentation": "dismissible",
+                "title": "Usage limit\u{7} reached",
+                "description": "Your included usage is depleted.\nChoose an action to continue.",
+                "ctas": [
+                    {"action": "unsupported", "label": "Hidden action"},
+                    {"action": "view_usage", "label": "Open usage settings"},
+                    {"action": action, "label": label},
+                    {"action": "view_usage", "label": "Extra action"}
+                ]
+            }))
+            .expect("valid optional banner");
+            let (tx, mut rx) = unbounded_channel();
+            let mut pane = test_pane(AppEventSender::new(tx));
+            pane.set_inline_banner(Some(banner.actionable_banner()));
+            let width = 44;
+            let area = Rect::new(
+                /*x*/ 0,
+                /*y*/ 0,
+                width,
+                pane.desired_height(width),
+            );
+            assert_snapshot!(
+                format!("backend_banner_{kind}"),
+                render_snapshot(&pane, area)
+            );
+            pane.handle_key_event(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+            let selected = match rx.try_recv().expect("numbered CTA dispatch") {
+                AppEvent::OpenUrlInBrowser { url } => url,
+                AppEvent::SendAddCreditsNudgeEmail { credit_type } => format!("{credit_type:?}"),
+                other => panic!("unexpected banner action: {other:?}"),
+            };
+            assert_eq!(
+                selected,
+                if action == "view_usage" {
+                    "https://chatgpt.com/codex/settings/usage"
+                } else {
+                    "Credits"
+                }
+            );
+            assert!(pane.inline_banner.is_some());
         }
     }
 
@@ -1869,7 +2232,7 @@ mod tests {
         }
 
         fn dismiss_app_server_request(&mut self, request: &ResolvedAppServerRequest) -> bool {
-            let ResolvedAppServerRequest::ExecApproval { id } = request else {
+            let ResolvedAppServerRequest::ExecApproval { id, .. } = request else {
                 return false;
             };
             if self.dismiss_exec_id != Some(id.as_str()) {
@@ -1955,6 +2318,11 @@ mod tests {
         assert_eq!(pane.composer_text(), "draft");
         assert!(!pane.composer.popup_active());
         assert!(!pane.quit_shortcut_hint_visible());
+        pane.composer.set_vim_enabled(/*enabled*/ true);
+        pane.handle_key_event(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert_eq!(CancellationEvent::Handled, pane.on_ctrl_c());
+        assert_eq!(pane.composer_text(), "draft");
+        assert!(!pane.composer.popup_active());
     }
 
     // live ring removed; related tests deleted.
@@ -2068,6 +2436,11 @@ mod tests {
         assert_eq!(pane.composer_text(), "ya");
         assert!(pane.view_stack.is_empty());
         assert_eq!(pane.delayed_approval_requests.len(), 1);
+        pane.handle_disconnected_key(KeyEvent::new(KeyCode::Null, KeyModifiers::NONE));
+        pane.pre_draw_tick_at(Instant::now() + APPROVAL_PROMPT_TYPING_IDLE_DELAY);
+        pane.handle_paste(" kept".into());
+        assert_eq!(pane.composer_text(), "ya kept");
+        assert!(pane.view_stack.is_empty());
         while let Ok(event) = rx.try_recv() {
             assert!(
                 !matches!(event, AppEvent::SubmitThreadOp { .. }),
@@ -2113,10 +2486,13 @@ mod tests {
         let mut pane = test_pane(tx);
         let now = Instant::now();
         pane.last_composer_activity_at = Some(now);
-        pane.push_approval_request(exec_request(), &features);
+        let request = exec_request();
+        let thread_id = request.thread_id();
+        pane.push_approval_request(request, &features);
 
         assert!(
             pane.dismiss_app_server_request(&ResolvedAppServerRequest::ExecApproval {
+                thread_id: thread_id.to_string(),
                 id: "1".to_string(),
             })
         );
@@ -2145,6 +2521,7 @@ mod tests {
 
         assert!(
             pane.dismiss_app_server_request(&ResolvedAppServerRequest::ExecApproval {
+                thread_id: "thread-1".to_string(),
                 id: "request-1".to_string(),
             })
         );
@@ -2153,6 +2530,41 @@ mod tests {
             pane.view_stack.last().and_then(|view| view.view_id()),
             Some("top")
         );
+    }
+
+    #[test]
+    fn apply_text_suggestion_updates_matching_prompt_beneath_an_overlay() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut pane = test_pane(tx);
+        let request_id = uuid::Uuid::new_v4();
+        let prompt = custom_prompt_view::CustomPromptView::new(
+            "Rename thread".to_string(),
+            "Type a name".to_string(),
+            /*initial_text*/ String::new(),
+            /*context_label*/ None,
+            Box::new(|_| {}),
+        )
+        .with_text_suggestion(request_id, "Loading".to_string(), "Ready".to_string());
+        pane.show_text_prompt(prompt);
+        pane.push_view(Box::new(CompletingView {
+            id: Some("overlay"),
+            complete: false,
+        }));
+
+        assert!(pane.apply_text_suggestion(request_id, Some("Fix login timeout")));
+
+        pane.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let rendered = render_snapshot(
+            &pane,
+            Rect::new(
+                /*x*/ 0, /*y*/ 0, /*width*/ 80, /*height*/ 8,
+            ),
+        );
+
+        assert!(rendered.contains("Fix login timeout"));
+        assert!(rendered.contains("Ready"));
+        assert!(!rendered.contains("Loading"));
     }
 
     #[test]
@@ -2174,6 +2586,7 @@ mod tests {
 
         assert!(
             !pane.dismiss_app_server_request(&ResolvedAppServerRequest::ExecApproval {
+                thread_id: "thread-1".to_string(),
                 id: "request-1".to_string(),
             })
         );
@@ -2302,6 +2715,53 @@ mod tests {
 
         let bufs = snapshot_buffer(&buf);
         assert!(bufs.contains("• Working"), "expected Working header");
+
+        pane.reset_status_timer(Duration::from_secs(/*secs*/ 42));
+        pane.hide_status_indicator();
+        pane.pause_status_timer_for_modal();
+        let paused = pane.status_timer.elapsed_at(Instant::now());
+        pane.ensure_status_indicator();
+        assert_snapshot!(
+            "status_timer_survives_hidden_row",
+            render_snapshot(&pane, area)
+        );
+        assert_eq!(
+            pane.status_timer
+                .elapsed_at(Instant::now() + Duration::from_secs(/*secs*/ 10)),
+            paused
+        );
+        pane.resume_status_timer_after_modal();
+        assert!(
+            pane.status_timer
+                .elapsed_at(Instant::now() + Duration::from_secs(/*secs*/ 10))
+                >= paused + Duration::from_secs(/*secs*/ 10)
+        );
+        pane.set_task_running(/*running*/ false);
+        pane.set_task_running(/*running*/ true);
+        assert!(pane.status_timer.elapsed_at(Instant::now()) < paused);
+    }
+
+    #[test]
+    fn turn_start_keeps_an_outstanding_approval_paused() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let mut pane = test_pane(AppEventSender::new(tx));
+        // MCP startup can already own the running row when an agent turn starts.
+        pane.set_task_running(/*running*/ true);
+        pane.push_approval_request(exec_request(), &Features::default());
+        pane.hide_status_indicator();
+        pane.set_task_running(/*running*/ true);
+        pane.reset_status_timer(Duration::ZERO);
+        pane.ensure_status_indicator();
+        let later = Instant::now() + Duration::from_secs(/*secs*/ 120);
+        assert_eq!(pane.status_timer.elapsed_at(later), Duration::ZERO);
+
+        pane.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(pane.no_modal_or_popup_active());
+        assert!(
+            pane.status_timer
+                .elapsed_at(Instant::now() + Duration::from_secs(/*secs*/ 10))
+                >= Duration::from_secs(/*secs*/ 10)
+        );
     }
 
     #[test]
@@ -2557,9 +3017,9 @@ mod tests {
                 short_description: None,
                 interface: None,
                 dependencies: None,
-                policy: None,
-                path_to_skills_md: test_path_buf("/tmp/test-skill/SKILL.md").abs(),
+                path: test_path_buf("/tmp/test-skill/SKILL.md").abs(),
                 scope: crate::test_support::skill_scope_user(),
+                enabled: true,
                 plugin_id: None,
             }]),
         });
@@ -2588,7 +3048,7 @@ mod tests {
     }
 
     #[test]
-    fn esc_with_slash_command_popup_does_not_interrupt_task() {
+    fn esc_dismisses_slash_command_popup_without_interrupting_task() {
         let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
         let mut pane = BottomPane::new(BottomPaneParams {
@@ -2604,11 +3064,12 @@ mod tests {
 
         pane.set_task_running(/*running*/ true);
 
-        // Repro: a running task + slash-command popup + Esc should not interrupt the task.
-        pane.insert_str("/");
+        // Repro: a running task + slash-command popup + Esc should dismiss the popup without
+        // interrupting the task.
+        pane.insert_str("/rev");
         assert!(
             pane.composer.popup_active(),
-            "expected command popup after typing `/`"
+            "expected command popup after typing `/rev`"
         );
 
         pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -2619,7 +3080,18 @@ mod tests {
                 "expected Esc to not send Op::Interrupt while command popup is active"
             );
         }
-        assert_eq!(pane.composer_text(), "/");
+        assert!(!pane.composer.popup_active());
+        assert_eq!(pane.composer_text(), "/rev");
+
+        let width = 60;
+        let area = Rect::new(0, 0, width, pane.desired_height(width));
+        assert_snapshot!(
+            "slash_command_popup_dismissed",
+            render_snapshot(&pane, area)
+        );
+
+        pane.insert_str("i");
+        assert!(pane.composer.popup_active());
     }
 
     #[test]
@@ -2639,12 +3111,12 @@ mod tests {
 
         pane.set_task_running(/*running*/ true);
 
-        // Repro: `/agent ` hides the popup (cursor past command name). Esc should
+        // Repro: `/subagents ` hides the popup (cursor past command name). Esc should
         // keep editing command text instead of interrupting the running task.
-        pane.insert_str("/agent ");
+        pane.insert_str("/subagents ");
         assert!(
             !pane.composer.popup_active(),
-            "expected command popup to be hidden after entering `/agent `"
+            "expected command popup to be hidden after entering `/subagents `"
         );
 
         pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -2652,10 +3124,10 @@ mod tests {
         while let Ok(ev) = rx.try_recv() {
             assert!(
                 !matches!(ev, AppEvent::CodexOp(Op::Interrupt)),
-                "expected Esc to not send Op::Interrupt while typing `/agent`"
+                "expected Esc to not send Op::Interrupt while typing `/subagents`"
             );
         }
-        assert_eq!(pane.composer_text(), "/agent ");
+        assert_eq!(pane.composer_text(), "/subagents ");
     }
 
     #[test]
@@ -2728,6 +3200,30 @@ mod tests {
         assert!(
             matches!(rx.try_recv(), Ok(AppEvent::CodexOp(Op::Interrupt))),
             "expected Esc to send Op::Interrupt while a task is running"
+        );
+    }
+
+    #[test]
+    fn remapped_interrupt_turn_uses_configured_key_including_agent_drafts() {
+        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut pane = test_pane(tx);
+        let mut keymap = RuntimeKeymap::defaults();
+        keymap.chat.interrupt_turn = vec![crate::key_hint::plain(KeyCode::F(12))];
+        pane.set_keymap_bindings(&keymap);
+        pane.set_task_running(/*running*/ true);
+        pane.insert_str("/subagents ");
+
+        pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            rx.try_recv().is_err(),
+            "expected Esc to remain local after remapping interruption"
+        );
+
+        pane.handle_key_event(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE));
+        assert!(
+            matches!(rx.try_recv(), Ok(AppEvent::CodexOp(Op::Interrupt))),
+            "expected configured key to interrupt while `/subagents` is being edited"
         );
     }
 
