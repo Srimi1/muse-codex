@@ -47,7 +47,7 @@ def model_info() -> dict[str, Any]:
         "description": "Deterministic local parity fixture",
         "context_window": 100_000,
         "max_output_tokens": 4_096,
-        "supported_reasoning_efforts": ["low", "high"],
+        "supported_reasoning_efforts": ["low", "high", "xhigh", "max", "ultra"],
         "default_reasoning_effort": "low",
         "is_visible": True,
         "is_default": True,
@@ -218,6 +218,9 @@ class FixtureState:
             self.requests.append(body)
             sequence = len(self.requests)
             if self.request_log is not None:
+                request = json.loads(body)
+                reasoning = request.get("reasoning")
+                effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
                 descriptor = os.open(
                     self.request_log,
                     os.O_WRONLY | os.O_CREAT | os.O_APPEND,
@@ -227,7 +230,11 @@ class FixtureState:
                     output.write(
                         (
                             json.dumps(
-                                {"sequence": sequence, "monotonic_ns": time.monotonic_ns()},
+                                {
+                                    "sequence": sequence,
+                                    "monotonic_ns": time.monotonic_ns(),
+                                    "reasoning_effort": effort,
+                                },
                                 separators=(",", ":"),
                             )
                             + "\n"
@@ -675,14 +682,68 @@ def assert_exec_json(
             raise AssertionError("fixture response was not streamed")
 
 
-def gateway_request_count(profile: pathlib.Path) -> int:
+def gateway_request_records(profile: pathlib.Path) -> list[dict[str, Any]]:
     path = profile / "gateway-requests.jsonl"
     if not path.exists():
-        return 0
+        return []
     records = [json.loads(line) for line in path.read_bytes().splitlines() if line]
     if [record.get("sequence") for record in records] != list(range(1, len(records) + 1)):
         raise AssertionError("fixture gateway request log is not sequential")
-    return len(records)
+    return records
+
+
+def gateway_request_count(profile: pathlib.Path) -> int:
+    return len(gateway_request_records(profile))
+
+
+def assert_ultra_effort(
+    stock: pathlib.Path,
+    wrapper: pathlib.Path,
+    script: pathlib.Path,
+    root: pathlib.Path,
+) -> None:
+    def run_effort(effort: str) -> tuple[subprocess.CompletedProcess[bytes], dict[str, Any]]:
+        profile, environment_base = prepare_profile(root, f"wrapped-effort-{effort}")
+        environment = wrapped_environment(profile, environment_base, stock, script)
+        # A caller-controlled false value must not close the compatibility gate.
+        environment["MUSE_EXPERIMENTAL_ULTRA_REASONING_EFFORT"] = "0"
+        result = run_checked(
+            [
+                str(wrapper),
+                "--provider",
+                "codex",
+                "--model",
+                MODEL_ID,
+                "--reasoning-effort",
+                effort,
+                "exec",
+                "--json",
+                "--no-session-log",
+                "--disable-web-tools",
+                "--approval-mode",
+                "never",
+                "--max-model-steps",
+                "1",
+                "PARITY_TEXT EFFORT",
+            ],
+            cwd=profile / "work",
+            env=environment,
+        )
+        requests = gateway_request_records(profile)
+        if len(requests) != 1:
+            raise AssertionError(f"{effort} produced {len(requests)} fixture requests")
+        return result, requests[0]
+
+    ultra_result, ultra_request = run_effort("ultra")
+    xhigh_result, xhigh_request = run_effort("xhigh")
+    if b"gate ultra_reasoning_effort is closed" in ultra_result.stderr:
+        raise AssertionError("Muse Codex left the stock Ultra compatibility gate closed")
+    if ultra_request.get("reasoning_effort") != "xhigh":
+        raise AssertionError("Ultra did not use the pinned model's xhigh wire effort")
+    if xhigh_request.get("reasoning_effort") != "xhigh":
+        raise AssertionError("xhigh did not preserve its wire effort")
+    if b"gate ultra_reasoning_effort is closed" in xhigh_result.stderr:
+        raise AssertionError("xhigh unexpectedly emitted an Ultra gate warning")
 
 
 def gateway_start_count(profile: pathlib.Path) -> int:
@@ -1177,6 +1238,7 @@ def main() -> int:
     try:
         assert_information_compatibility(stock, wrapper, script, root)
         assert_exec_json(stock, wrapper, script, root)
+        assert_ultra_effort(stock, wrapper, script, root)
         assert_exec_tool_loop(stock, wrapper, script, root)
         assert_failure_retry_bounds(stock, wrapper, script, root)
         assert_msp(stock, wrapper, script, root)

@@ -13,6 +13,8 @@ All notable project changes will be documented here. The format follows
 - Deterministic model, streaming, error, cancellation, and launcher fixtures.
 - Authenticated catalog fixtures for GPT-6 Astra and GPT-5.6 Sol, Terra, and
   Luna, without granting or fabricating model entitlements.
+- Ultra reasoning selection through `--reasoning-effort ultra` and the TUI
+  `/effort` picker for catalog-supported models.
 - Signed private-release manifest and installer tooling.
 - Project branding, community standards, support policy, and GitHub templates.
 
@@ -58,6 +60,8 @@ All notable project changes will be documented here. The format follows
   startup handshake and provide actionable authentication guidance on failure.
 - Treat `response.cancelled` as terminal, drop known
   `codex.response.metadata`, and continue to reject unknown non-metadata events.
+- Open Muse's isolated Ultra feature gate so a requested Ultra session no
+  longer silently falls back to ordinary `xhigh` mode.
 
 ### Security
 

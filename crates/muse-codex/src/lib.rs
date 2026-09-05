@@ -27,6 +27,7 @@ pub const SUPPORTED_CODEX_WIRE_VERSION: &str = "0.153.4";
 const MAX_GATEWAY_READY_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_GATEWAY_MODELS: usize = 4096;
 const STOCK_MODEL_CATALOG_FILE: &str = "6d657461__p746268.json";
+const ULTRA_REASONING_GATE: &str = "MUSE_EXPERIMENTAL_ULTRA_REASONING_EFFORT";
 
 const SECRET_ENVIRONMENT: &[&str] = &[
     "OPENAI_API_KEY",
@@ -1565,6 +1566,13 @@ fn scrub_secret_environment(command: &mut Command) {
     command.env("TBH_DISABLE_TELEMETRY", "1");
 }
 
+/// Opens Muse 1.0.3's built-in Ultra mode for the isolated Codex runtime.
+/// Muse keeps ownership of proactive workflow delegation and maps the model
+/// request to its catalog-defined underlying reasoning effort.
+fn enable_ultra_reasoning(command: &mut Command) {
+    command.env(ULTRA_REASONING_GATE, "1");
+}
+
 fn configure_hidden_gateway(command: &mut Command) {
     #[cfg(unix)]
     {
@@ -1719,6 +1727,7 @@ fn run_stock_muse(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     scrub_secret_environment(&mut command);
+    enable_ultra_reasoning(&mut command);
     if api_key_stdin {
         command.stdin(Stdio::null());
     }
@@ -1935,7 +1944,14 @@ mod tests {
                 description: Some("Authenticated default".into()),
                 context_window: Some(272_000),
                 max_output_tokens: None,
-                supported_reasoning_efforts: vec!["low".into(), "medium".into(), "high".into()],
+                supported_reasoning_efforts: vec![
+                    "low".into(),
+                    "medium".into(),
+                    "high".into(),
+                    "xhigh".into(),
+                    "max".into(),
+                    "ultra".into(),
+                ],
                 default_reasoning_effort: Some("high".into()),
                 is_visible: true,
                 is_default: true,
@@ -2501,7 +2517,10 @@ mod tests {
             json!([
                 {"tier": "low", "description": null},
                 {"tier": "medium", "description": null},
-                {"tier": "high", "description": null}
+                {"tier": "high", "description": null},
+                {"tier": "xhigh", "description": null},
+                {"tier": "max", "description": null},
+                {"tier": "ultra", "description": null}
             ])
         );
         assert_eq!(value["rows"][1]["display_label"], "codex-hidden");
@@ -2625,5 +2644,18 @@ mod tests {
                 "{variable} not removed"
             );
         }
+    }
+
+    #[test]
+    fn stock_runtime_forces_the_ultra_reasoning_gate_open() {
+        let mut command = Command::new("unused");
+        command.env(ULTRA_REASONING_GATE, "0");
+        enable_ultra_reasoning(&mut command);
+
+        let value = command
+            .get_envs()
+            .find_map(|(name, value)| (name == ULTRA_REASONING_GATE).then_some(value))
+            .flatten();
+        assert_eq!(value, Some(OsStr::new("1")));
     }
 }

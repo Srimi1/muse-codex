@@ -172,7 +172,16 @@ explicitly:
 ```sh
 muse-codex --model gpt-6-astra
 muse-codex exec --model gpt-6-astra "Review this repository"
+muse-codex --model gpt-6-astra --reasoning-effort ultra
 ```
+
+For a model whose authenticated catalog offers it, `ultra` is also available
+from the TUI's `/effort` picker. Ultra is distinct from `max`: `max` requests
+the model's maximum single-agent reasoning level, while Ultra enables Muse's
+proactive workflow and subagent delegation mode and can consume tokens more
+quickly. Following the pinned Codex client contract, the underlying model
+request uses the catalog-defined multi-agent effort (`xhigh` for GPT-6 Astra);
+Ultra's additional behavior lives in the Muse agent harness.
 
 Arguments unrelated to provider routing pass through to Muse. The public
 provider is either omitted or explicitly `--provider codex`; other provider

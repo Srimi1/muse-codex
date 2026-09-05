@@ -105,6 +105,14 @@ they are never replaced with fabricated limits or dates. Authenticated
 reasoning-effort choices are retained in upstream order; Muse's cache has no
 provider-default effort field, so no default effort is invented.
 
+The launcher opens Muse 1.0.3's built-in Ultra feature gate only for the
+isolated stock-Muse runtime. Muse therefore owns Ultra's proactive workflow and
+subagent delegation behavior. Consistent with the pinned Codex client, Ultra
+uses the model catalog's multi-agent wire effort (`xhigh` for GPT-6 Astra)
+instead of forwarding a literal `ultra` API value. This preserves the
+provider-only boundary: orchestration stays in Muse and transport stays in the
+gateway.
+
 The catalog parser honors each model's minimum client version, picker
 visibility, input modalities, reasoning-effort list, Responses Lite flag, and
 tool mode. It understands the current entries for GPT-6 Astra and GPT-5.6 Sol,

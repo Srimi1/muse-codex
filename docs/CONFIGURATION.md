@@ -78,6 +78,14 @@ fabricated, while authenticated reasoning-effort choices retain upstream order.
 The gateway then translates the selected model's Responses stream, selecting
 the Responses Lite wire form when the catalog says that model requires it.
 
+Models that advertise Ultra expose it through both `--reasoning-effort ultra`
+and the TUI `/effort` picker. Ultra is not an alias for `max`: it activates
+Muse's proactive workflow/subagent delegation mode. The model request itself
+uses the pinned catalog's multi-agent reasoning effort (`xhigh` for GPT-6
+Astra), matching the pinned Codex client rather than inventing an unsupported
+literal API effort. Models whose authenticated catalog omits Ultra do not show
+the choice.
+
 The current pinned client understands catalog entries for GPT-6 Astra and
 GPT-5.6 Sol, Terra, and Luna. This is protocol support, not an entitlement: a
 subscription model is usable only when the active account's catalog returns it
