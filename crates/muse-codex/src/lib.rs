@@ -22,7 +22,7 @@ pub const STOCK_MUSE_BASENAME: &str = "muse-bin-1.0.3-R2198.1";
 pub const STOCK_MUSE_COMMAND: &str = "muse";
 pub const GATEWAY_BASENAME: &str = "muse-codex-gateway";
 pub const DEFAULT_GATEWAY_READY_TIMEOUT: Duration = Duration::from_secs(100);
-pub const GATEWAY_READY_SCHEMA_VERSION: u32 = 2;
+pub const GATEWAY_READY_SCHEMA_VERSION: u32 = 3;
 pub const SUPPORTED_CODEX_WIRE_VERSION: &str = "0.153.4";
 const MAX_GATEWAY_READY_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_GATEWAY_MODELS: usize = 4096;
@@ -275,6 +275,34 @@ fn take_exec_api_key_stdin(args: &[OsString]) -> (bool, Vec<OsString>) {
             break;
         }
         if argument == "--api-key-stdin" {
+            selected = true;
+            index += 1;
+            continue;
+        }
+        let count = if option_takes_value(argument) && index + 1 < args.len() {
+            2
+        } else {
+            1
+        };
+        remaining.extend(args[index..index + count].iter().cloned());
+        index += count;
+    }
+    (selected, remaining)
+}
+
+/// Removes the provider-owned Fast selector before invoking stock Muse. Fast
+/// is intentionally a launch-scoped transport setting: Muse 1.0.3 has no
+/// service-tier field in its CLI, session format, or MSP schema.
+fn take_fast_mode(args: &[OsString]) -> (bool, Vec<OsString>) {
+    let mut remaining = Vec::with_capacity(args.len());
+    let mut selected = false;
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" {
+            remaining.extend(args[index..].iter().cloned());
+            break;
+        }
+        if argument == "--fast" {
             selected = true;
             index += 1;
             continue;
@@ -1309,6 +1337,7 @@ impl GatewayProcess {
         executable: &Path,
         upstream_base_url: Option<&OsStr>,
         api_key: Option<&SecretInput>,
+        fast_mode: bool,
     ) -> Result<Self> {
         let temporary_directory = create_gateway_temporary_directory()?;
         let ready_file = temporary_directory.path().join("ready.json");
@@ -1326,6 +1355,9 @@ impl GatewayProcess {
             .stderr(Stdio::null());
         if let Some(upstream_base_url) = upstream_base_url {
             command.arg("--upstream-base-url").arg(upstream_base_url);
+        }
+        if fast_mode {
+            command.arg("--fast");
         }
         if api_key.is_some() {
             command.arg("--api-key-stdin").stdin(Stdio::piped());
@@ -1687,6 +1719,7 @@ fn run_stock_muse(
 ) -> Result<i32> {
     validate_msp_options(arguments)?;
     let (api_key_stdin, arguments) = take_exec_api_key_stdin(arguments);
+    let (fast_mode, arguments) = take_fast_mode(&arguments);
     let upstream_base_url =
         resolve_upstream_base_url(&arguments, env::var_os("OPENAI_BASE_URL").as_deref())?;
     let api_key = if api_key_stdin {
@@ -1698,6 +1731,7 @@ fn run_stock_muse(
         gateway_executable,
         upstream_base_url.as_deref(),
         api_key.as_ref(),
+        fast_mode,
     )?;
     drop(api_key);
 
@@ -1716,6 +1750,9 @@ fn run_stock_muse(
         .is_some_and(|argument| argument == "serve");
 
     let mut command = Command::new(stock_muse);
+    if fast_mode {
+        eprintln!("muse-codex: Fast mode requested (priority processing; increased usage)");
+    }
     command
         .args(&rewritten)
         .env("MUSE_NO_AUTO_UPDATE", "1")
@@ -1765,7 +1802,7 @@ fn run_stock_muse(
 }
 
 fn run_stock_information(stock_muse: &Path, arguments: &[OsString]) -> Result<i32> {
-    let mut arguments = arguments.to_vec();
+    let (_, mut arguments) = take_fast_mode(arguments);
     if let Some(index) = stock_subcommand_index(&arguments) {
         let command = arguments.remove(index);
         arguments.insert(0, command);
@@ -1821,6 +1858,18 @@ fn rewrite_provider_help(bytes: &[u8]) -> Vec<u8> {
             "Model id from the authenticated Codex catalog",
         )
         .replace("Meta reasoning effort:", "Model reasoning effort:")
+        .replace(
+            "          (default: high)\n",
+            "          (default: high)\n      --fast\n          Use OpenAI Fast mode (priority processing; increased usage)\n",
+        )
+        .replace(
+            "Options:\n  -h, --help\n          Print this help\n      --no-session-log",
+            "Options:\n      --fast\n          Use OpenAI Fast mode for every MSP session in this host\n  -h, --help\n          Print this help\n      --no-session-log",
+        )
+        .replace(
+            "Options:\n      --last\n          Resume the most recent session in this workspace",
+            "Options:\n      --fast\n          Resume this session with OpenAI Fast mode\n      --last\n          Resume the most recent session in this workspace",
+        )
         .replace(
             "Override the Meta provider base URL",
             "Override the OpenAI API base URL (API-key auth only)",
@@ -2264,6 +2313,48 @@ mod tests {
         assert!(SecretInput::parse(vec![0xff]).is_err());
     }
 
+    #[test]
+    fn fast_mode_is_launch_scoped_and_never_consumes_prompt_content() {
+        assert_eq!(
+            take_fast_mode(&args(&["--fast", "exec", "hello"])),
+            (true, args(&["exec", "hello"]))
+        );
+        assert_eq!(
+            take_fast_mode(&args(&["exec", "--fast", "hello"])),
+            (true, args(&["exec", "hello"]))
+        );
+        assert_eq!(
+            take_fast_mode(&args(&["exec", "--fast", "--fast", "hello"])),
+            (true, args(&["exec", "hello"]))
+        );
+        for original in [
+            args(&["exec", "--", "--fast"]),
+            args(&["exec", "--prompt-file", "--fast"]),
+            args(&["--model", "--fast", "exec", "hello"]),
+        ] {
+            assert_eq!(take_fast_mode(&original), (false, original));
+        }
+    }
+
+    #[test]
+    fn rewritten_help_documents_fast_without_changing_stock_usage() {
+        let help = b"      --reasoning-effort <EFFORT>\n          Meta reasoning effort: low|high\n          (default: high)\n      --base-url <URL>\n";
+        let rewritten = String::from_utf8(rewrite_provider_help(help)).unwrap();
+        assert!(rewritten.contains("      --fast\n"));
+        assert!(rewritten.contains("priority processing; increased usage"));
+        assert!(rewritten.contains("Model reasoning effort:"));
+
+        let serve_help =
+            b"Options:\n  -h, --help\n          Print this help\n      --no-session-log\n";
+        let rewritten = String::from_utf8(rewrite_provider_help(serve_help)).unwrap();
+        assert!(rewritten.contains("every MSP session in this host"));
+
+        let resume_help =
+            b"Options:\n      --last\n          Resume the most recent session in this workspace\n";
+        let rewritten = String::from_utf8(rewrite_provider_help(resume_help)).unwrap();
+        assert!(rewritten.contains("Resume this session with OpenAI Fast mode"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn readiness_open_rejects_links_and_nonprivate_files() {
@@ -2406,7 +2497,10 @@ mod tests {
         .unwrap();
         fs::write(
             &wrong,
-            "#!/bin/sh\nprintf '%s\\n' '{\"status\":\"ok\",\"ready_schema_version\":999,\"wire_compatibility_version\":\"future\"}'\n",
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{{\"status\":\"ok\",\"ready_schema_version\":2,\"wire_compatibility_version\":\"{}\"}}'\n",
+                SUPPORTED_CODEX_WIRE_VERSION
+            ),
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;

@@ -330,7 +330,7 @@ def fixture_server(catalog_status: int = 200) -> Iterator[tuple[str, FixtureStat
 
 def atomic_ready(path: pathlib.Path, base_url: str) -> None:
     ready = {
-        "schema_version": 2,
+        "schema_version": 3,
         "base_url": base_url,
         "token": TOKEN,
         "default_model": MODEL_ID,
@@ -355,6 +355,7 @@ def fixture_gateway(argv: list[str]) -> int:
     parser.add_argument("--parent-pid", required=True, type=int)
     parser.add_argument("--upstream-base-url")
     parser.add_argument("--api-key-stdin", action="store_true")
+    parser.add_argument("--fast", action="store_true")
     args = parser.parse_args(argv)
     if args.command != "serve":
         return 2
@@ -363,7 +364,12 @@ def fixture_gateway(argv: list[str]) -> int:
         descriptor = os.open(start_log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(descriptor, "ab") as output:
             output.write(
-                (json.dumps({"monotonic_ns": time.monotonic_ns()}) + "\n").encode()
+                (
+                    json.dumps(
+                        {"monotonic_ns": time.monotonic_ns(), "fast": args.fast}
+                    )
+                    + "\n"
+                ).encode()
             )
     if args.api_key_stdin:
         # Consume the dummy invocation key without retaining or logging it.
@@ -751,6 +757,45 @@ def gateway_start_count(profile: pathlib.Path) -> int:
     if not path.exists():
         return 0
     return sum(1 for line in path.read_bytes().splitlines() if line)
+
+
+def gateway_start_records(profile: pathlib.Path) -> list[dict[str, Any]]:
+    path = profile / "gateway-starts.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line]
+
+
+def assert_fast_mode(
+    stock: pathlib.Path,
+    wrapper: pathlib.Path,
+    script: pathlib.Path,
+    root: pathlib.Path,
+) -> None:
+    profile, environment_base = prepare_profile(root, "wrapped-fast")
+    environment = wrapped_environment(profile, environment_base, stock, script)
+
+    fast_command = exec_command(wrapper, "PARITY_TEXT FAST", provider="codex")
+    fast_command.insert(1, "--fast")
+    fast_result = run_checked(
+        fast_command,
+        cwd=profile / "work",
+        env=environment,
+    )
+    if b"Fast mode requested (priority processing; increased usage)" not in fast_result.stderr:
+        raise AssertionError("Fast launch did not report priority processing")
+
+    standard_result = run_checked(
+        exec_command(wrapper, "PARITY_TEXT STANDARD", provider="codex"),
+        cwd=profile / "work",
+        env=environment,
+    )
+    if b"Fast mode requested" in standard_result.stderr:
+        raise AssertionError("standard launch unexpectedly reported Fast mode")
+
+    starts = gateway_start_records(profile)
+    if [record.get("fast") for record in starts] != [True, False]:
+        raise AssertionError(f"Fast selector was not isolated to its gateway: {starts!r}")
 
 
 def exec_command(
@@ -1170,6 +1215,8 @@ def assert_information_compatibility(
     ).stdout.decode(errors="replace")
     if "Startup provider: codex (default: codex)" not in root_help:
         raise AssertionError("root help does not advertise the Codex provider")
+    if "--fast" not in root_help or "priority processing; increased usage" not in root_help:
+        raise AssertionError("root help does not advertise OpenAI Fast mode")
     for provider_text in ("echo or meta", "Meta provider", "echo provider only"):
         if provider_text in root_help:
             raise AssertionError(f"root help leaked stock provider wording: {provider_text!r}")
@@ -1181,8 +1228,17 @@ def assert_information_compatibility(
     ).stdout.decode(errors="replace")
     if "Unavailable for MSP turns with the pinned Muse 1.0.3 host" not in serve_help:
         raise AssertionError("serve help does not explain the session-log compatibility limit")
+    if "--fast" not in serve_help or "every MSP session in this host" not in serve_help:
+        raise AssertionError("serve help does not advertise host-wide Fast mode")
     if "Use memory-only sessions" in serve_help:
         raise AssertionError("serve help still advertises the broken memory-only MSP mode")
+    resume_help = run_checked(
+        [str(wrapper), "resume", "--fast", "--help"],
+        cwd=profile / "work",
+        env=environment,
+    ).stdout.decode(errors="replace")
+    if "Resume this session with OpenAI Fast mode" not in resume_help:
+        raise AssertionError("resume help does not advertise Fast mode")
     if gateway_start_count(profile) != 0:
         raise AssertionError("auth-free help unexpectedly started the provider gateway")
 
@@ -1239,6 +1295,7 @@ def main() -> int:
         assert_information_compatibility(stock, wrapper, script, root)
         assert_exec_json(stock, wrapper, script, root)
         assert_ultra_effort(stock, wrapper, script, root)
+        assert_fast_mode(stock, wrapper, script, root)
         assert_exec_tool_loop(stock, wrapper, script, root)
         assert_failure_retry_bounds(stock, wrapper, script, root)
         assert_msp(stock, wrapper, script, root)

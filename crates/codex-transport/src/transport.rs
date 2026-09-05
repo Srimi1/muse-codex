@@ -10,6 +10,7 @@ use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::UnauthorizedRecovery;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::models::ResponseItem;
 use futures::Stream;
 use futures::StreamExt;
@@ -54,6 +55,7 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(2);
 const CREDENTIAL_REFRESH_LOCK_NAME: &str = ".credential-refresh.lock";
 const MUSE_CODEX_USER_AGENT: &str = concat!("muse-codex/", env!("CARGO_PKG_VERSION"));
 const RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
+const CODEX_ROUTING_HINT_HEADER: &str = "x-codex-routing-hint";
 const BUNDLED_MODEL_CATALOG: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../vendor/openai-codex/codex-rs/models-manager/models.json"
@@ -62,6 +64,13 @@ static BROWSER_OPEN_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static RESPONSES_LITE_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub type RawBody = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send + 'static>>;
+
+#[derive(Clone, Copy)]
+struct JsonRequestOptions<'a> {
+    accept: &'static str,
+    use_responses_lite: bool,
+    routing_hint: Option<&'a HeaderValue>,
+}
 
 /// An upstream response whose bytes have not been interpreted by this crate.
 ///
@@ -127,6 +136,10 @@ pub struct ModelInfo {
     /// readiness schema intentionally omits this provider-only selector.
     #[serde(skip)]
     pub supported_in_api: bool,
+    /// Whether the authenticated model catalog permits OpenAI Fast mode.
+    /// This provider-only capability never enters Muse's stable model schema.
+    #[serde(skip)]
+    pub supports_fast_mode: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -136,6 +149,7 @@ struct ModelCapabilities {
     tool_mode: Option<String>,
     input_modalities: Vec<String>,
     supported_reasoning_efforts: Vec<String>,
+    supports_fast_mode: bool,
 }
 
 /// Muse's compact search request. It is mapped to Codex's pinned
@@ -175,6 +189,7 @@ pub struct Transport {
     auth_manager: Option<Arc<AuthManager>>,
     client: reqwest::Client,
     model_capabilities: Arc<RwLock<BTreeMap<String, ModelCapabilities>>>,
+    fast_mode: bool,
 }
 
 impl fmt::Debug for Transport {
@@ -184,6 +199,7 @@ impl fmt::Debug for Transport {
             .field("auth_home", &"<redacted>")
             .field("has_api_key_override", &self.api_key_override.is_some())
             .field("has_custom_base_url", &self.api_key_base_url.is_some())
+            .field("fast_mode", &self.fast_mode)
             .finish_non_exhaustive()
     }
 }
@@ -195,6 +211,7 @@ impl Transport {
         config: AuthConfig,
         api_key_override: Option<SecretString>,
         api_key_base_url: Option<Url>,
+        fast_mode: bool,
     ) -> Result<Self> {
         if let Some(api_key) = api_key_override.as_ref() {
             validate_api_key(api_key.expose_secret())?;
@@ -215,6 +232,7 @@ impl Transport {
             auth_manager,
             client: build_http_client()?,
             model_capabilities: Arc::new(RwLock::new(BTreeMap::new())),
+            fast_mode,
         };
 
         // Fail during construction rather than after the gateway begins
@@ -251,6 +269,7 @@ impl Transport {
                         tool_mode: model.tool_mode.clone(),
                         input_modalities: model.input_modalities.clone(),
                         supported_reasoning_efforts: model.supported_reasoning_efforts.clone(),
+                        supports_fast_mode: model.supports_fast_mode,
                     },
                 )
             })
@@ -271,17 +290,30 @@ impl Transport {
         extra_headers: HeaderMap,
     ) -> Result<RawResponse> {
         let api_key_auth = self.resolve_auth().await?.is_api_key_auth();
-        let use_responses_lite = self
-            .validate_model_request(&body, api_key_auth)?
+        let capabilities = self.validate_model_request(&body, api_key_auth)?;
+        validate_fast_mode_availability(
+            self.fast_mode,
+            self.api_key_base_url.is_some(),
+            capabilities.as_ref(),
+        )?;
+        let use_responses_lite = capabilities
+            .as_ref()
             .is_some_and(|capabilities| capabilities.use_responses_lite);
         let lite_request_namespace =
             use_responses_lite.then(|| responses_lite_request_namespace(&extra_headers));
+        let mut body = body;
+        apply_fast_service_tier(&mut body, self.fast_mode)?;
         let body = normalize_responses_request(
             body,
             api_key_auth,
             use_responses_lite,
             lite_request_namespace.as_deref(),
         )?;
+        let routing_hint = if api_key_auth {
+            None
+        } else {
+            Some(subscription_routing_hint(&body)?)
+        };
         let response = self
             .execute_with_401_recovery(|| async {
                 self.send_json_once(
@@ -289,8 +321,11 @@ impl Transport {
                     "responses",
                     &body,
                     &extra_headers,
-                    "text/event-stream",
-                    use_responses_lite,
+                    JsonRequestOptions {
+                        accept: "text/event-stream",
+                        use_responses_lite,
+                        routing_hint: routing_hint.as_ref(),
+                    },
                 )
                 .await
             })
@@ -380,8 +415,11 @@ impl Transport {
                     "alpha/search",
                     &body,
                     &extra_headers,
-                    "application/json",
-                    false,
+                    JsonRequestOptions {
+                        accept: "application/json",
+                        use_responses_lite: false,
+                        routing_hint: None,
+                    },
                 )
                 .await
             })
@@ -458,8 +496,11 @@ impl Transport {
                     "alpha/search",
                     &body,
                     &extra_headers,
-                    "application/json",
-                    false,
+                    JsonRequestOptions {
+                        accept: "application/json",
+                        use_responses_lite: false,
+                        routing_hint: None,
+                    },
                 )
                 .await
             })
@@ -487,11 +528,13 @@ impl Transport {
         path: &str,
         body: &Value,
         extra_headers: &HeaderMap,
-        accept: &'static str,
-        use_responses_lite: bool,
+        options: JsonRequestOptions<'_>,
     ) -> Result<reqwest::Response> {
-        let (url, mut headers) = self.prepare_request(path, extra_headers, accept).await?;
-        set_internal_responses_lite_header(&mut headers, use_responses_lite);
+        let (url, mut headers) = self
+            .prepare_request(path, extra_headers, options.accept)
+            .await?;
+        set_internal_responses_lite_header(&mut headers, options.use_responses_lite);
+        set_internal_routing_hint_header(&mut headers, options.routing_hint);
         self.client
             .request(method, url)
             .headers(headers)
@@ -616,6 +659,52 @@ fn build_http_client() -> Result<reqwest::Client> {
     let builder = codex_http_client::with_chatgpt_cloudflare_cookie_store(builder);
     codex_http_client::build_reqwest_client_with_custom_ca(builder)
         .map_err(|error| Error::HttpClient(error.to_string()))
+}
+
+fn validate_fast_mode_availability(
+    enabled: bool,
+    custom_base_url: bool,
+    capabilities: Option<&ModelCapabilities>,
+) -> Result<()> {
+    if !enabled || custom_base_url || capabilities.is_none() {
+        return Ok(());
+    }
+    if capabilities.is_some_and(|capabilities| capabilities.supports_fast_mode) {
+        return Ok(());
+    }
+    Err(Error::FastModeUnavailable)
+}
+
+/// The launcher owns the service-tier selection. Always remove any value that
+/// arrived from stock Muse, then add the pinned Codex request spelling only
+/// when Fast was explicitly selected for this process.
+fn apply_fast_service_tier(body: &mut Value, enabled: bool) -> Result<()> {
+    let object = body
+        .as_object_mut()
+        .ok_or_else(|| Error::InvalidRequest("request body must be an object".to_string()))?;
+    object.remove("service_tier");
+    if enabled {
+        object.insert(
+            "service_tier".to_string(),
+            Value::String(ServiceTier::Fast.request_value().to_string()),
+        );
+    }
+    Ok(())
+}
+
+/// ChatGPT's Codex backend uses this non-secret hint alongside the canonical
+/// Responses body. API-key requests intentionally omit it, matching upstream.
+fn subscription_routing_hint(body: &Value) -> Result<HeaderValue> {
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::InvalidRequest("model must be a string".to_string()))?;
+    let hint = match body.get("service_tier").and_then(Value::as_str) {
+        Some(tier) => format!("model={model};tier={tier}"),
+        None => format!("model={model}"),
+    };
+    HeaderValue::from_str(&hint)
+        .map_err(|_| Error::InvalidHeader("generated Codex routing hint".to_string()))
 }
 
 /// Converts Muse's provider-neutral Responses body into the stateless request
@@ -1380,6 +1469,17 @@ fn set_internal_responses_lite_header(headers: &mut HeaderMap, enabled: bool) {
     }
 }
 
+fn set_internal_routing_hint_header(headers: &mut HeaderMap, value: Option<&HeaderValue>) {
+    if let Some(value) = value {
+        headers.insert(
+            HeaderName::from_static(CODEX_ROUTING_HINT_HEADER),
+            value.clone(),
+        );
+    } else {
+        headers.remove(CODEX_ROUTING_HINT_HEADER);
+    }
+}
+
 fn is_forbidden_forwarded_header(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
@@ -1405,6 +1505,7 @@ fn is_forbidden_forwarded_header(name: &HeaderName) -> bool {
             | "user-agent"
             | "version"
             | RESPONSES_LITE_HEADER
+            | CODEX_ROUTING_HINT_HEADER
     )
 }
 
@@ -1698,6 +1799,15 @@ struct UpstreamModel {
     input_modalities: Vec<String>,
     #[serde(default = "default_true")]
     supported_in_api: bool,
+    #[serde(default)]
+    service_tiers: Vec<UpstreamServiceTier>,
+    #[serde(default)]
+    additional_speed_tiers: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpstreamServiceTier {
+    id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1794,6 +1904,14 @@ fn normalize_models(bytes: &[u8]) -> Result<Vec<ModelInfo>> {
                     .any(|supported| supported == default)
             });
             let input_modalities = normalize_input_modalities(model.input_modalities)?;
+            let supports_fast_mode = model
+                .service_tiers
+                .iter()
+                .any(|tier| tier.id == ServiceTier::Fast.request_value())
+                || model
+                    .additional_speed_tiers
+                    .iter()
+                    .any(|tier| tier == "fast");
             if !input_modalities.is_empty()
                 && !input_modalities.iter().any(|modality| modality == "text")
             {
@@ -1813,6 +1931,7 @@ fn normalize_models(bytes: &[u8]) -> Result<Vec<ModelInfo>> {
                 tool_mode: model.tool_mode,
                 input_modalities,
                 supported_in_api: model.supported_in_api,
+                supports_fast_mode,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2012,6 +2131,57 @@ mod tests {
         assert_eq!(input[5]["call_id"], "call_fixture");
         assert_eq!(input[5]["output"], "fixture output");
         assert_eq!(normalized["tools"][0]["type"], "namespace");
+    }
+
+    #[test]
+    fn fast_mode_uses_priority_and_standard_mode_clears_untrusted_tiers() {
+        let mut request = serde_json::json!({
+            "model": "gpt-fixture",
+            "input": "hello",
+            "service_tier": "attacker-controlled"
+        });
+        apply_fast_service_tier(&mut request, false).expect("standard tier");
+        assert!(request.get("service_tier").is_none());
+
+        apply_fast_service_tier(&mut request, true).expect("Fast tier");
+        assert_eq!(request["service_tier"], ServiceTier::Fast.request_value());
+        assert_eq!(request["service_tier"], "priority");
+    }
+
+    #[test]
+    fn subscription_routing_hint_tracks_model_and_canonical_tier() {
+        let standard = subscription_routing_hint(&serde_json::json!({
+            "model": "gpt-fixture"
+        }))
+        .expect("standard routing hint");
+        assert_eq!(standard, "model=gpt-fixture");
+
+        let fast = subscription_routing_hint(&serde_json::json!({
+            "model": "gpt-fixture",
+            "service_tier": "priority"
+        }))
+        .expect("Fast routing hint");
+        assert_eq!(fast, "model=gpt-fixture;tier=priority");
+    }
+
+    #[test]
+    fn fast_mode_requires_catalog_support_except_for_custom_api_endpoints() {
+        let mut capabilities = ModelCapabilities {
+            is_visible: true,
+            use_responses_lite: false,
+            tool_mode: None,
+            input_modalities: vec!["text".to_string()],
+            supported_reasoning_efforts: Vec::new(),
+            supports_fast_mode: false,
+        };
+        assert!(validate_fast_mode_availability(false, false, Some(&capabilities)).is_ok());
+        assert!(matches!(
+            validate_fast_mode_availability(true, false, Some(&capabilities)),
+            Err(Error::FastModeUnavailable)
+        ));
+        assert!(validate_fast_mode_availability(true, true, Some(&capabilities)).is_ok());
+        capabilities.supports_fast_mode = true;
+        assert!(validate_fast_mode_availability(true, false, Some(&capabilities)).is_ok());
     }
 
     #[test]
@@ -2235,6 +2405,7 @@ mod tests {
         assert!(models[0].is_default);
         assert_eq!(models[0].context_window, Some(200_000));
         assert_eq!(models[0].max_output_tokens, None);
+        assert!(!models[0].supports_fast_mode);
         assert_eq!(models[0].supported_reasoning_efforts, ["low", "high"]);
         assert!(models[0].is_visible);
         assert!(!models[1].is_default);
@@ -2251,6 +2422,7 @@ mod tests {
         assert_eq!(models[0].input_modalities, ["text", "image"]);
         assert_eq!(models[0].context_window, Some(272_000));
         assert_eq!(models[0].max_output_tokens, None);
+        assert!(models[0].supports_fast_mode);
 
         for id in [
             "gpt-6-astra",
@@ -2300,6 +2472,7 @@ mod tests {
                 .find(|model| model.id == id)
                 .expect("latest model in bundled catalog");
             assert!(model.is_visible);
+            assert!(model.supports_fast_mode);
             assert!(model.supported_in_api);
             assert!(model.use_responses_lite);
             assert_eq!(model.tool_mode.as_deref(), Some("code_mode_only"));
@@ -2560,6 +2733,21 @@ mod tests {
     }
 
     #[test]
+    fn fast_catalog_gating_uses_priority_or_the_pinned_legacy_marker() {
+        let models = normalize_models(
+            br#"{"models":[
+                {"slug":"priority-model","service_tiers":[{"id":"priority"}]},
+                {"slug":"request-alias-only","service_tiers":[{"id":"fast"}]},
+                {"slug":"legacy-model","additional_speed_tiers":["fast"]}
+            ]}"#,
+        )
+        .expect("Fast capability catalog");
+        assert!(models[0].supports_fast_mode);
+        assert!(!models[1].supports_fast_mode);
+        assert!(models[2].supports_fast_mode);
+    }
+
+    #[test]
     fn custom_base_url_requires_https() {
         assert!(validate_base_url(&Url::parse("http://example.com/v1").unwrap()).is_err());
         assert!(validate_base_url(&Url::parse("https://example.com/v1").unwrap()).is_ok());
@@ -2605,17 +2793,121 @@ mod tests {
             HeaderName::from_static(RESPONSES_LITE_HEADER),
             HeaderValue::from_static("spoofed"),
         );
+        source.insert(
+            HeaderName::from_static(CODEX_ROUTING_HINT_HEADER),
+            HeaderValue::from_static("model=stolen;tier=priority"),
+        );
         merge_safe_request_headers(&mut destination, &source);
         assert!(!destination.contains_key(AUTHORIZATION));
         assert!(!destination.contains_key("chatgpt-account-id"));
         assert!(!destination.contains_key("x-api-key"));
         assert!(!destination.contains_key(RESPONSES_LITE_HEADER));
+        assert!(!destination.contains_key(CODEX_ROUTING_HINT_HEADER));
         assert_eq!(destination["x-muse-session"], "preserved");
 
         set_internal_responses_lite_header(&mut destination, true);
         assert_eq!(destination[RESPONSES_LITE_HEADER], "true");
         set_internal_responses_lite_header(&mut destination, false);
         assert!(!destination.contains_key(RESPONSES_LITE_HEADER));
+
+        let trusted_hint = HeaderValue::from_static("model=gpt-fixture;tier=priority");
+        set_internal_routing_hint_header(&mut destination, Some(&trusted_hint));
+        assert_eq!(destination[CODEX_ROUTING_HINT_HEADER], trusted_hint);
+        set_internal_routing_hint_header(&mut destination, None);
+        assert!(!destination.contains_key(CODEX_ROUTING_HINT_HEADER));
+    }
+
+    #[tokio::test]
+    async fn fast_api_request_emits_priority_body_without_subscription_hint() {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Fast request capture listener");
+        let address = listener.local_addr().expect("capture listener address");
+        let capture_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept captured request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 2048];
+            let header_end = loop {
+                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break index + 4;
+                }
+                let read = socket
+                    .read(&mut buffer)
+                    .await
+                    .expect("read captured request headers");
+                assert_ne!(read, 0, "request ended before its headers were complete");
+                request.extend_from_slice(&buffer[..read]);
+            };
+            let headers = std::str::from_utf8(&request[..header_end])
+                .expect("captured headers are UTF-8")
+                .to_string();
+            let content_length = headers
+                .split("\r\n")
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                .expect("captured content length");
+            while request.len() < header_end + content_length {
+                let read = socket
+                    .read(&mut buffer)
+                    .await
+                    .expect("read captured request body");
+                assert_ne!(read, 0, "request ended before its body was complete");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let body: Value =
+                serde_json::from_slice(&request[header_end..header_end + content_length])
+                    .expect("captured request body is JSON");
+
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write capture response");
+            (headers, body)
+        });
+
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = AuthConfig::with_home(temporary.path().join("muse-codex"))
+            .expect("private auth directory");
+        let transport = Transport::new(
+            config,
+            Some(SecretString::from("sk-fixture".to_string())),
+            Some(Url::parse(&format!("http://{address}/v1")).expect("capture base URL")),
+            true,
+        )
+        .await
+        .expect("local Fast transport");
+        let mut caller_headers = HeaderMap::new();
+        caller_headers.insert(
+            HeaderName::from_static(CODEX_ROUTING_HINT_HEADER),
+            HeaderValue::from_static("model=stolen;tier=priority"),
+        );
+        let response = transport
+            .stream_responses(
+                serde_json::json!({
+                    "model": "gpt-fixture",
+                    "input": "hello",
+                    "service_tier": "stolen"
+                }),
+                caller_headers,
+            )
+            .await
+            .expect("captured Fast response");
+        assert_eq!(response.status, StatusCode::OK);
+
+        let (headers, body) = capture_task.await.expect("Fast request capture task");
+        assert_eq!(body["service_tier"], "priority");
+        assert!(
+            !headers
+                .to_ascii_lowercase()
+                .contains(CODEX_ROUTING_HINT_HEADER)
+        );
+        assert!(!headers.contains("stolen"));
     }
 
     #[tokio::test]
@@ -2654,6 +2946,7 @@ mod tests {
             config,
             Some(SecretString::from("sk-fixture".to_string())),
             Some(Url::parse(&format!("http://{address}/v1")).expect("capture base URL")),
+            false,
         )
         .await
         .expect("local test transport");
@@ -2673,8 +2966,11 @@ mod tests {
                 "responses",
                 &serde_json::json!({"model":"gpt-fixture","input":[]}),
                 &caller_headers,
-                "text/event-stream",
-                true,
+                JsonRequestOptions {
+                    accept: "text/event-stream",
+                    use_responses_lite: true,
+                    routing_hint: None,
+                },
             )
             .await
             .expect("captured response");
@@ -2754,11 +3050,13 @@ mod tests {
             auth_manager: None,
             client: build_http_client().expect("HTTP client"),
             model_capabilities: Arc::new(RwLock::new(BTreeMap::new())),
+            fast_mode: true,
         };
 
         let debug = format!("{transport:?}");
         assert!(debug.contains("has_api_key_override: true"));
         assert!(debug.contains("has_custom_base_url: true"));
+        assert!(debug.contains("fast_mode: true"));
         assert!(!debug.contains(&private_path));
         assert!(!debug.contains("private-api.example"));
         assert!(!debug.contains("sk-super-secret"));

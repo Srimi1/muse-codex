@@ -16,6 +16,8 @@
       "default_reasoning_level": "low",
       "priority": 1,
       "visibility": "list",
+      "service_tiers": [{ "id": "priority" }],
+      "additional_speed_tiers": ["fast"],
       "use_responses_lite": true,
       "tool_mode": "code_mode_only",
       "input_modalities": ["text", "image"]
@@ -32,6 +34,8 @@
       "default_reasoning_level": "low",
       "priority": 6,
       "visibility": "list",
+      "service_tiers": [{ "id": "priority" }],
+      "additional_speed_tiers": ["fast", "ultrafast"],
       "use_responses_lite": true,
       "tool_mode": "code_mode_only",
       "input_modalities": ["text", "image"]
@@ -48,6 +52,8 @@
       "default_reasoning_level": "medium",
       "priority": 7,
       "visibility": "list",
+      "service_tiers": [{ "id": "priority" }],
+      "additional_speed_tiers": ["fast"],
       "use_responses_lite": true,
       "tool_mode": "code_mode_only",
       "input_modalities": ["text", "image"]
@@ -64,6 +70,8 @@
       "default_reasoning_level": "medium",
       "priority": 8,
       "visibility": "list",
+      "service_tiers": [{ "id": "priority" }],
+      "additional_speed_tiers": ["fast"],
       "use_responses_lite": true,
       "tool_mode": "code_mode_only",
       "input_modalities": ["text", "image"]

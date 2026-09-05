@@ -15,6 +15,10 @@ All notable project changes will be documented here. The format follows
   Luna, without granting or fabricating model entitlements.
 - Ultra reasoning selection through `--reasoning-effort ultra` and the TUI
   `/effort` picker for catalog-supported models.
+- Launch-scoped `--fast` mode for TUI, `exec`, `resume`, and `serve`, with
+  catalog-gated priority routing that remains independent of reasoning effort.
+- Gateway readiness contract v3 so launchers cannot pair Fast mode with an
+  older gateway that lacks the private selector.
 - Signed private-release manifest and installer tooling.
 - Project branding, community standards, support policy, and GitHub templates.
 

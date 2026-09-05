@@ -45,6 +45,9 @@ pub enum Error {
     #[error("Muse produced an invalid Responses request: {0}")]
     InvalidRequest(String),
 
+    #[error("Fast mode is not available for the selected model")]
+    FastModeUnavailable,
+
     #[error("invalid request header: {0}")]
     InvalidHeader(String),
 

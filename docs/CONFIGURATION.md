@@ -47,6 +47,7 @@ and data directories. It is not stock Muse's normal profile.
   wrapper boundary.
 - `--base-url HTTPS_URL` is an API-key-only upstream override. Muse still sees
   the private loopback URL.
+- `--fast` requests OpenAI Fast mode for every model turn in that process.
 - Other arguments pass through to the stock Muse parser.
 
 Use `muse-codex exec --json "prompt"` for headless JSONL output and
@@ -54,6 +55,20 @@ Use `muse-codex exec --json "prompt"` for headless JSONL output and
 before its startup flags; the launcher places provider flags in the correct
 scope. The `serve` command gets its endpoint from isolated settings because
 its parser does not accept provider flags.
+
+Fast mode is wrapper-owned and launch-scoped because Muse 1.0.3 has no service
+tier in its CLI, session format, or MSP schema and provides no `/fast` toggle.
+It therefore applies to the whole TUI, `exec`, `resume`, or `serve` process;
+restart with or without `--fast` to change it. For ChatGPT, the selected model
+must advertise the `priority` tier or the pinned client's legacy `fast`
+capability. The gateway then sends the canonical Responses field
+`service_tier: "priority"` and the trusted routing hint. Custom API-key
+endpoints receive the priority request without catalog gating and are
+responsible for accepting or rejecting it. Standard launches strip and omit any
+incoming service tier. The startup message deliberately says Fast was
+*requested*: upstream routing can report a downgraded effective tier. Fast
+increases usage or cost and is independent of reasoning effort, so
+`--fast --reasoning-effort ultra` is valid for a model that supports both.
 
 Use durable sessions for MSP: `serve --no-session-log` is rejected because the
 pinned Muse host cannot deliver turn events in that mode. Normal `serve` keeps

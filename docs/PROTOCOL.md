@@ -52,6 +52,19 @@ handles are rejected because they would introduce a second history source.
 API-key requests retain supported public API parameters; subscription requests
 omit parameters unsupported by the pinned ChatGPT backend.
 
+The wrapper-owned `--fast` option applies to every request for the launched
+TUI, `exec`, `resume`, or `serve` process. Stock Muse 1.0.3 has no service-tier
+field or `/fast` command, so this setting is intentionally absent from MSP and
+session records. For ChatGPT, the selected catalog model must advertise the
+priority tier or the pinned legacy `fast` capability; the gateway sends
+`service_tier: "priority"` plus the trusted routing hint. Explicit custom
+API-key endpoints receive the priority request without catalog gating. A
+standard launch removes any inbound
+`service_tier` instead of trusting it. Fast is independent of reasoning effort
+and may be combined with Ultra. It increases usage or cost, and the startup
+banner says it was requested because upstream may report a downgraded effective
+tier.
+
 The authenticated subscription catalog determines both model visibility and
 the request dialect. Catalog entries marked `use_responses_lite` receive the
 Responses Lite header and wire shape used by current Codex clients: tools and

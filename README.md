@@ -173,6 +173,8 @@ explicitly:
 muse-codex --model gpt-6-astra
 muse-codex exec --model gpt-6-astra "Review this repository"
 muse-codex --model gpt-6-astra --reasoning-effort ultra
+muse-codex --fast --model gpt-6-astra
+muse-codex --fast --model gpt-6-astra --reasoning-effort ultra
 ```
 
 For a model whose authenticated catalog offers it, `ultra` is also available
@@ -182,6 +184,19 @@ proactive workflow and subagent delegation mode and can consume tokens more
 quickly. Following the pinned Codex client contract, the underlying model
 request uses the catalog-defined multi-agent effort (`xhigh` for GPT-6 Astra);
 Ultra's additional behavior lives in the Muse agent harness.
+
+`--fast` requests OpenAI Fast mode for the entire TUI, `exec`, `resume`, or
+`serve` process. It is a service tier, not a reasoning effort, so it can be
+combined with Ultra as shown above. Fast uses priority processing with
+increased usage or cost. Stock Muse 1.0.3 has no service-tier field or `/fast`
+command, so changing the selection requires starting a new process with or
+without `--fast`. For ChatGPT, the gateway requires the selected model to
+advertise the `priority` tier (or the pinned client's legacy `fast` capability),
+then sends `service_tier: "priority"` and the trusted routing hint. A custom
+API-key endpoint receives the priority tier without catalog gating and
+determines whether it supports it. Without `--fast`, the gateway strips and
+omits any service tier. The startup banner says Fast was *requested* because
+the service can report a downgraded tier.
 
 Arguments unrelated to provider routing pass through to Muse. The public
 provider is either omitted or explicitly `--provider codex`; other provider

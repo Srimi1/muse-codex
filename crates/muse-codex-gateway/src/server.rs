@@ -33,7 +33,7 @@ use crate::sse;
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_UPSTREAM_ERROR_BYTES: usize = 64 * 1024;
-pub(crate) const READY_SCHEMA_VERSION: u8 = 2;
+pub(crate) const READY_SCHEMA_VERSION: u8 = 3;
 const MODEL_CATALOG_STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
 const UPSTREAM_ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const PARENT_WATCH_INTERVAL: Duration = Duration::from_millis(250);
@@ -188,6 +188,15 @@ async fn responses(
             &upstream.headers,
             upstream.body,
             request_model.as_deref(),
+        ),
+        Err(codex_transport::Error::FastModeUnavailable) => terminal_sse_response(
+            &HeaderMap::new(),
+            sse::gateway_failure_frame(
+                request_model.as_deref(),
+                "invalid_request",
+                "Fast mode is unavailable for the selected model. Choose a Fast-capable model or restart without --fast; the session is resumable.",
+                None,
+            ),
         ),
         Err(_) => terminal_sse_response(
             &HeaderMap::new(),
@@ -787,6 +796,7 @@ mod tests {
             tool_mode: None,
             input_modalities: vec!["text".to_string()],
             supported_in_api: true,
+            supports_fast_mode: true,
         }];
         write_ready_file(
             &path,

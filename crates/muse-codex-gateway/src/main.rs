@@ -46,6 +46,9 @@ struct ServeArgs {
     /// Override the OpenAI API endpoint. Accepted only with API-key authentication.
     #[arg(long)]
     upstream_base_url: Option<Url>,
+    /// Request OpenAI Fast mode for every Responses turn in this Muse session.
+    #[arg(long)]
+    fast: bool,
 }
 
 #[derive(Debug, Args)]
@@ -140,6 +143,7 @@ fn classify_startup_error(error: &anyhow::Error) -> server::StartupErrorCode {
             }
             TransportError::InvalidUpstreamResponse(_) => StartupErrorCode::CatalogInvalid,
             TransportError::InvalidRequest(_)
+            | TransportError::FastModeUnavailable
             | TransportError::InvalidHeader(_)
             | TransportError::Provider(_)
             | TransportError::HttpClient(_) => StartupErrorCode::GatewayStartFailed,
@@ -168,9 +172,10 @@ async fn serve(args: ServeArgs) -> Result<()> {
         None
     };
     let auth = AuthConfig::for_muse_codex()?;
-    let transport = codex_transport::Transport::new(auth, invocation_key, args.upstream_base_url)
-        .await
-        .context("initialize Codex transport")?;
+    let transport =
+        codex_transport::Transport::new(auth, invocation_key, args.upstream_base_url, args.fast)
+            .await
+            .context("initialize Codex transport")?;
     server::run(args.bind, args.ready_file, args.parent_pid, transport).await
 }
 

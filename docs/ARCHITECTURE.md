@@ -42,6 +42,8 @@ The launcher owns only process and provider concerns:
 - intercept the `auth` command family;
 - locate and validate a separately installed stock `muse` executable;
 - load one explicit OpenAI authentication mode;
+- remove the wrapper-owned, launch-scoped `--fast` selector before stock Muse
+  parses its arguments;
 - bind the gateway to an ephemeral `127.0.0.1` port;
 - mint a per-run bearer token for the Muse-to-gateway hop;
 - seed Muse's isolated normalized model cache from the authenticated catalog;
@@ -104,6 +106,19 @@ release date or output limit is unknown. Unknown values remain JSON `null`;
 they are never replaced with fabricated limits or dates. Authenticated
 reasoning-effort choices are retained in upstream order; Muse's cache has no
 provider-default effort field, so no default effort is invented.
+
+Fast mode is a provider setting owned by the launcher and gateway. When
+`--fast` is selected, it applies to every Responses turn for that TUI, `exec`,
+`resume`, or `serve` process; stock Muse 1.0.3 has no service-tier field or
+`/fast` command. For ChatGPT, the transport accepts Fast only when the selected
+catalog model advertises the `priority` tier or the pinned legacy `fast`
+capability, emits the canonical `service_tier: "priority"` field, and supplies
+the trusted routing hint. A custom API-key endpoint receives that tier without
+first-party catalog gating.
+Standard launches remove any inbound tier and omit the field. Fast remains
+orthogonal to Ultra or any other reasoning effort. The launcher reports it as
+requested rather than guaranteed because upstream can downgrade the effective
+service tier; priority processing also increases usage or cost.
 
 The launcher opens Muse 1.0.3's built-in Ultra feature gate only for the
 isolated stock-Muse runtime. Muse therefore owns Ultra's proactive workflow and
@@ -189,7 +204,7 @@ receives only the random loopback credential.
 | `muse-codex logout` | launcher/auth | Remove only `muse-codex` credentials |
 | auth help or invalid auth forms | launcher | Show Codex auth help or a usage error without touching Meta auth |
 | local commands and help/version | stock Muse parser | Run offline in the isolated profile; provider help labels describe Codex |
-| `muse-codex [Muse arguments]` | launcher then stock Muse | Start gateway and pass through |
+| `muse-codex [--fast] [Muse arguments]` | launcher then stock Muse | Start gateway and pass through; optionally request Fast for the whole process |
 | provider other than `codex` | launcher | Reject; `meta` is internal only |
 | base-URL override | launcher/gateway | Treat as API-key-only upstream; Muse still receives loopback |
 
@@ -206,9 +221,10 @@ receives only the random loopback credential.
    catalog request with `304`, then sends a Responses request with the selected
    model.
 5. The gateway validates that a subscription model and reasoning effort are
-   present in that authenticated catalog, applies the catalog-selected standard
-   Responses or Responses Lite mapping, and streams typed events back with
-   backpressure.
+   present in that authenticated catalog and, when requested, that the model
+   advertises the priority tier. It applies Fast and the catalog-selected
+   standard Responses or Responses Lite mapping, then streams typed events
+   back with backpressure.
 6. Muse renders output or performs its ordinary tool approval/execution loop.
 7. When Muse drops a response stream, the associated upstream stream is
    dropped. End-to-end cancellation behavior remains a release gate; the
