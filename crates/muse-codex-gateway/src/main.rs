@@ -70,7 +70,7 @@ struct AuthArgs {
     #[command(subcommand)]
     command: AuthCommand,
     /// Credential record to operate on.
-    #[arg(long, value_enum, default_value_t = GatewayProvider::Codex)]
+    #[arg(long, value_enum, default_value_t = GatewayProvider::Codex, global = true)]
     provider: GatewayProvider,
 }
 
@@ -387,6 +387,34 @@ mod tests {
     fn empty_secret_is_rejected() {
         let mut input = Cursor::new(b"\n");
         assert!(read_secret_line(&mut input).is_err());
+    }
+
+    #[test]
+    fn auth_provider_flag_is_accepted_before_and_after_the_action() {
+        // The launcher emits the credential selector before the action; the
+        // trailing spelling stays accepted so pair skew fails nowhere.
+        for argv in [
+            vec!["muse-codex-gateway", "auth", "--provider", "zai", "status"],
+            vec!["muse-codex-gateway", "auth", "status", "--provider", "zai"],
+            vec![
+                "muse-codex-gateway",
+                "auth",
+                "--provider",
+                "codex",
+                "login",
+                "--device-auth",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(argv).expect("auth argv parses");
+            let Command::Auth(args) = cli.command else {
+                panic!("expected auth command");
+            };
+            if matches!(args.command, AuthCommand::Status) {
+                assert_eq!(args.provider, GatewayProvider::Zai);
+            } else {
+                assert_eq!(args.provider, GatewayProvider::Codex);
+            }
+        }
     }
 
     #[test]

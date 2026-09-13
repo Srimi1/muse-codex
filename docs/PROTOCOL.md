@@ -1,8 +1,9 @@
 # CLI and protocol compatibility
 
-The supported host is exactly Muse Code `1.0.3-R2198.1`. Muse Codex adapts
-provider concerns at the process, HTTP, and MSP boundaries. The stock binary
-continues to execute tools, enforce approvals, and own sessions.
+The supported hosts are exactly Muse Code `1.0.3-R2198.1` and `1.2.1-R2847.1`.
+Muse Codex adapts provider concerns at the process, HTTP, and MSP boundaries.
+The stock binary continues to execute tools, enforce approvals, and own
+sessions.
 
 ## Command dispatch
 
@@ -104,7 +105,7 @@ API-key requests retain supported public API parameters; subscription requests
 omit parameters unsupported by the pinned ChatGPT backend.
 
 The wrapper-owned `--fast` option applies to every request for the launched
-TUI, `exec`, `resume`, or `serve` process. Stock Muse 1.0.3 has no service-tier
+TUI, `exec`, `resume`, or `serve` process. Stock Muse has no service-tier
 field or `/fast` command, so this setting is intentionally absent from MSP and
 session records. For ChatGPT, the selected catalog model must advertise the
 priority tier or the pinned legacy `fast` capability; the gateway sends

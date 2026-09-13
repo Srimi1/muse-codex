@@ -2,7 +2,7 @@
 
 ## Constraint
 
-Meta does not publish the Muse 1.0.3 host source. This repository therefore
+Meta does not publish the stock Muse host source. This repository therefore
 implements the provider swap at the runtime seam: a `muse-codex` launcher starts
 a private loopback gateway and runs the stock Muse binary against it. Muse
 continues to own its TUI, sessions, prompts, tools, approvals, sandbox,
@@ -37,6 +37,6 @@ extensions, and orchestration.
 
 ## Upstream pins
 
-- Muse behavior baseline: `1.0.3-R2198.1`.
+- Muse behavior baselines: `1.0.3-R2198.1` and `1.2.1-R2847.1`.
 - OpenAI Codex client: `rust-v0.153.4`, commit
   `3d2ee51ca2d5db578f328aa75e20aa22c0197c9a`.

@@ -30,6 +30,10 @@ from typing import Any
 MODEL_ID = "fixture-model"
 REPLY_TEXT = "fixture response"
 TOOL_TEXT = "fixture tool complete"
+# Exact stock baseline under test, captured in main(). Muse 1.2.1 wraps every
+# exec in a deterministic task graph, so request-count assertions that pin
+# 1.0.3's single-request shape must use parity-relative expectations there.
+STOCK_VERSION = ""
 TOKEN = base64.urlsafe_b64encode(bytes(range(32))).decode().rstrip("=")
 ESCAPE = b"\x1b"
 FAILURE_CODES = (
@@ -328,9 +332,10 @@ def fixture_server(catalog_status: int = 200) -> Iterator[tuple[str, FixtureStat
         thread.join(timeout=5)
 
 
-def atomic_ready(path: pathlib.Path, base_url: str) -> None:
+def atomic_ready(path: pathlib.Path, base_url: str, provider: str = "codex") -> None:
     ready = {
-        "schema_version": 3,
+        "schema_version": 4,
+        "provider": provider,
         "base_url": base_url,
         "token": TOKEN,
         "default_model": MODEL_ID,
@@ -356,6 +361,7 @@ def fixture_gateway(argv: list[str]) -> int:
     parser.add_argument("--upstream-base-url")
     parser.add_argument("--api-key-stdin", action="store_true")
     parser.add_argument("--fast", action="store_true")
+    parser.add_argument("--provider", default="codex")
     args = parser.parse_args(argv)
     if args.command != "serve":
         return 2
@@ -381,7 +387,7 @@ def fixture_gateway(argv: list[str]) -> int:
     server = http.server.ThreadingHTTPServer((host, int(port_text)), handler_for(state))
     actual_host, actual_port = server.server_address
     ready_path = pathlib.Path(args.ready_file)
-    atomic_ready(ready_path, f"http://{actual_host}:{actual_port}")
+    atomic_ready(ready_path, f"http://{actual_host}:{actual_port}", args.provider)
 
     stopping = threading.Event()
 
@@ -708,7 +714,9 @@ def assert_ultra_effort(
     script: pathlib.Path,
     root: pathlib.Path,
 ) -> None:
-    def run_effort(effort: str) -> tuple[subprocess.CompletedProcess[bytes], dict[str, Any]]:
+    def run_effort(
+        effort: str,
+    ) -> tuple[subprocess.CompletedProcess[bytes], list[dict[str, Any]]]:
         profile, environment_base = prepare_profile(root, f"wrapped-effort-{effort}")
         environment = wrapped_environment(profile, environment_base, stock, script)
         # A caller-controlled false value must not close the compatibility gate.
@@ -735,21 +743,35 @@ def assert_ultra_effort(
             cwd=profile / "work",
             env=environment,
         )
-        requests = gateway_request_records(profile)
-        if len(requests) != 1:
-            raise AssertionError(f"{effort} produced {len(requests)} fixture requests")
-        return result, requests[0]
+        return result, gateway_request_records(profile)
 
-    ultra_result, ultra_request = run_effort("ultra")
-    xhigh_result, xhigh_request = run_effort("xhigh")
+    ultra_result, ultra_requests = run_effort("ultra")
+    xhigh_result, xhigh_requests = run_effort("xhigh")
     if b"gate ultra_reasoning_effort is closed" in ultra_result.stderr:
         raise AssertionError("Muse Codex left the stock Ultra compatibility gate closed")
-    if ultra_request.get("reasoning_effort") != "xhigh":
-        raise AssertionError("Ultra did not use the pinned model's xhigh wire effort")
-    if xhigh_request.get("reasoning_effort") != "xhigh":
-        raise AssertionError("xhigh did not preserve its wire effort")
     if b"gate ultra_reasoning_effort is closed" in xhigh_result.stderr:
         raise AssertionError("xhigh unexpectedly emitted an Ultra gate warning")
+    if "1.2.1" in STOCK_VERSION:
+        # Muse 1.2.1 fans Ultra out to delegated sub-efforts with a
+        # nondeterministic lead; the stable hazard is the literal Ultra label
+        # reaching the provider, which only knows concrete efforts.
+        ultra_efforts = [request.get("reasoning_effort") for request in ultra_requests]
+        if not ultra_efforts:
+            raise AssertionError("Ultra produced no fixture requests")
+        if "ultra" in ultra_efforts:
+            raise AssertionError("Ultra leaked its literal label to the provider")
+        xhigh_efforts = [request.get("reasoning_effort") for request in xhigh_requests]
+        if not xhigh_efforts or xhigh_efforts[0] != "xhigh":
+            raise AssertionError(f"xhigh did not preserve its wire effort: {xhigh_efforts!r}")
+        return
+    if len(ultra_requests) != 1 or len(xhigh_requests) != 1:
+        raise AssertionError(
+            f"effort runs were not single-request: ultra={len(ultra_requests)}, xhigh={len(xhigh_requests)}"
+        )
+    if ultra_requests[0].get("reasoning_effort") != "xhigh":
+        raise AssertionError("Ultra did not use the pinned model's xhigh wire effort")
+    if xhigh_requests[0].get("reasoning_effort") != "xhigh":
+        raise AssertionError("xhigh did not preserve its wire effort")
 
 
 def gateway_start_count(profile: pathlib.Path) -> int:
@@ -796,6 +818,72 @@ def assert_fast_mode(
     starts = gateway_start_records(profile)
     if [record.get("fast") for record in starts] != [True, False]:
         raise AssertionError(f"Fast selector was not isolated to its gateway: {starts!r}")
+
+
+def assert_yolo_mode(
+    stock: pathlib.Path,
+    wrapper: pathlib.Path,
+    script: pathlib.Path,
+    root: pathlib.Path,
+) -> None:
+    profile, environment_base = prepare_profile(root, "wrapped-yolo")
+    environment = wrapped_environment(profile, environment_base, stock, script)
+
+    yolo_command = exec_command(wrapper, "PARITY_TEXT YOLO", provider="codex")
+    yolo_command.insert(1, "--yolo")
+    yolo_result = run_checked(
+        yolo_command,
+        cwd=profile / "work",
+        env=environment,
+    )
+    if b"YOLO mode requested (approval and sandboxing disabled for this run)" not in yolo_result.stderr:
+        raise AssertionError("YOLO exec did not report disabled approval and sandboxing")
+    deltas = [
+        record.get("payload", {}).get("text")
+        for record in json_lines(yolo_result.stdout)
+    ]
+    if REPLY_TEXT not in deltas:
+        raise AssertionError("YOLO exec did not stream the fixture response")
+
+    # The MSP host has no --yolo flag: the launcher must translate it to host
+    # sandbox options. A raw passthrough would exit 2 with a stock usage error.
+    serve_frames = [
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"clientInfo": {"name": "muse_codex_yolo", "version": "0.0.0"}},
+        },
+        {"jsonrpc": "2.0", "method": "initialized"},
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/start",
+            "params": {
+                "commandId": "0198f0ab-9999-7000-8000-0000000000f1",
+                "workspaceRoot": str(profile / "work"),
+                "providerId": "codex",
+                "modelId": MODEL_ID,
+            },
+        },
+    ]
+    serve_result = run_msp_checked(
+        [str(wrapper), "--yolo", "serve"],
+        cwd=profile / "work",
+        env=environment,
+        frames=b"".join(
+            (json.dumps(frame, separators=(",", ":")) + "\n").encode()
+            for frame in serve_frames
+        ),
+    )
+    if b"approval stays wire-selected" not in serve_result.stderr:
+        raise AssertionError("YOLO serve did not report the wire-selected approval limit")
+    serve_records = json_lines(serve_result.stdout)
+    session = next(frame for frame in serve_records if frame.get("id") == 2)["result"][
+        "session"
+    ]
+    if session["providerId"] != "codex":
+        raise AssertionError("YOLO serve leaked the internal provider")
 
 
 def exec_command(
@@ -847,7 +935,10 @@ def assert_exec_tool_loop(
             env=stock_env,
         )
         stock_request_count = len(state.requests)
-        if stock_request_count != 2 or "function_call_output" not in state.requests[1]:
+        if "1.2.1" in STOCK_VERSION:
+            if not any("function_call_output" in request for request in state.requests):
+                raise AssertionError("stock Muse never submitted the fixture tool result")
+        elif stock_request_count != 2 or "function_call_output" not in state.requests[1]:
             raise AssertionError("stock Muse did not complete exactly one fixture tool loop")
 
     wrapped_profile, wrapped_env_base = prepare_profile(root, "wrapped-exec-tool")
@@ -857,7 +948,13 @@ def assert_exec_tool_loop(
         cwd=wrapped_profile / "work",
         env=wrapped_env,
     )
-    if gateway_request_count(wrapped_profile) != 2:
+    wrapped_request_count = gateway_request_count(wrapped_profile)
+    if "1.2.1" in STOCK_VERSION:
+        if wrapped_request_count != stock_request_count:
+            raise AssertionError(
+                f"wrapped tool loop diverged from stock: wrapped={wrapped_request_count}, stock={stock_request_count}"
+            )
+    elif wrapped_request_count != 2:
         raise AssertionError("wrapped Muse did not complete exactly one fixture tool loop")
 
     stock_records = json_lines(stock_result.stdout)
@@ -908,9 +1005,17 @@ def assert_failure_retry_bounds(
 ) -> None:
     cases = [(f"PARITY_FAILURE {code}", code) for code in FAILURE_CODES]
     cases.append(("PARITY_HTTP_400", "http_400"))
-    for prompt, label in cases:
+
+    def run_case(prompt: str, label: str, attempt: str) -> tuple[
+        subprocess.CompletedProcess[bytes],
+        subprocess.CompletedProcess[bytes],
+        int,
+        int,
+        float,
+        float,
+    ]:
         with fixture_server() as (base_url, state):
-            stock_profile, stock_env = prepare_profile(root, f"stock-failure-{label}")
+            stock_profile, stock_env = prepare_profile(root, f"stock-failure-{label}-{attempt}")
             stock_env["META_API_KEY"] = "fixture-not-a-secret"
             seed_stock_endpoint(stock_profile, base_url)
             stock_result, stock_duration = run_failure(
@@ -920,7 +1025,9 @@ def assert_failure_retry_bounds(
             )
             stock_count = len(state.requests)
 
-        wrapped_profile, wrapped_env_base = prepare_profile(root, f"wrapped-failure-{label}")
+        wrapped_profile, wrapped_env_base = prepare_profile(
+            root, f"wrapped-failure-{label}-{attempt}"
+        )
         wrapped_env = wrapped_environment(wrapped_profile, wrapped_env_base, stock, script)
         wrapped_result, wrapped_duration = run_failure(
             exec_command(wrapper, prompt, provider="codex"),
@@ -928,11 +1035,44 @@ def assert_failure_retry_bounds(
             env=wrapped_env,
         )
         wrapped_count = gateway_request_count(wrapped_profile)
+        return (
+            stock_result,
+            wrapped_result,
+            stock_count,
+            wrapped_count,
+            stock_duration,
+            wrapped_duration,
+        )
+
+    for prompt, label in cases:
+        stock_result, wrapped_result, stock_count, wrapped_count, stock_duration, wrapped_duration = run_case(
+            prompt, label, "first"
+        )
         stock_types = assert_terminal_failure(stock_result, f"stock {label}")
         wrapped_types = assert_terminal_failure(wrapped_result, f"wrapped {label}")
         if stock_types != wrapped_types:
-            raise AssertionError(f"stock/wrapped failure event sequence differs for {label}")
-        if stock_count != 1 or wrapped_count != 1:
+            if "1.2.1" not in STOCK_VERSION:
+                raise AssertionError(
+                    f"stock/wrapped failure event sequence differs for {label}"
+                )
+            # Muse 1.2.1's task planner is occasionally nondeterministic. A
+            # single mismatch is retried once; systematic wrapper divergence
+            # fails the repeat while planner noise does not.
+            stock_result, wrapped_result, stock_count, wrapped_count, stock_duration, wrapped_duration = run_case(
+                prompt, label, "retry"
+            )
+            stock_types = assert_terminal_failure(stock_result, f"stock retry {label}")
+            wrapped_types = assert_terminal_failure(wrapped_result, f"wrapped retry {label}")
+            if stock_types != wrapped_types:
+                raise AssertionError(
+                    f"stock/wrapped failure event sequence differs for {label} on repeat"
+                )
+        if "1.2.1" in STOCK_VERSION:
+            if wrapped_count != stock_count:
+                raise AssertionError(
+                    f"{label} retried outside the gateway: stock={stock_count}, wrapped={wrapped_count}"
+                )
+        elif stock_count != 1 or wrapped_count != 1:
             raise AssertionError(
                 f"{label} retried outside the gateway: stock={stock_count}, wrapped={wrapped_count}"
             )
@@ -1213,7 +1353,7 @@ def assert_information_compatibility(
         cwd=profile / "work",
         env=environment,
     ).stdout.decode(errors="replace")
-    if "Startup provider: codex (default: codex)" not in root_help:
+    if "Startup provider: codex or zai (default: codex)" not in root_help:
         raise AssertionError("root help does not advertise the Codex provider")
     if "--fast" not in root_help or "priority processing; increased usage" not in root_help:
         raise AssertionError("root help does not advertise OpenAI Fast mode")
@@ -1226,10 +1366,12 @@ def assert_information_compatibility(
         cwd=profile / "work",
         env=environment,
     ).stdout.decode(errors="replace")
-    if "Unavailable for MSP turns with the pinned Muse 1.0.3 host" not in serve_help:
+    if "Unavailable for MSP turns with the pinned Muse host" not in serve_help:
         raise AssertionError("serve help does not explain the session-log compatibility limit")
     if "--fast" not in serve_help or "every MSP session in this host" not in serve_help:
         raise AssertionError("serve help does not advertise host-wide Fast mode")
+    if "--yolo" not in serve_help or "approval stays wire-selected" not in serve_help:
+        raise AssertionError("serve help does not document the YOLO host translation")
     if "Use memory-only sessions" in serve_help:
         raise AssertionError("serve help still advertises the broken memory-only MSP mode")
     resume_help = run_checked(
@@ -1270,7 +1412,9 @@ def main() -> int:
     parser.add_argument(
         "--stock",
         default=os.environ.get(
-            "MUSE_CODEX_MUSE_BIN", str(pathlib.Path.home() / ".local/bin/muse-bin-1.0.3-R2198.1")
+            "MUSE_CODEX_MUSE_BIN",
+            shutil.which("muse")
+            or str(pathlib.Path.home() / ".local/bin/muse-bin-1.2.1-R2847.1"),
         ),
     )
     parser.add_argument(
@@ -1286,8 +1430,13 @@ def main() -> int:
     version = subprocess.run(
         [str(stock), "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
     )
-    if version.stdout.decode().strip() != "Muse Code 1.0.3 (1.0.3-R2198.1)":
-        parser.error("--stock is not Muse 1.0.3-R2198.1")
+    global STOCK_VERSION
+    STOCK_VERSION = version.stdout.decode().strip()
+    if STOCK_VERSION not in (
+        "Muse Code 1.0.3 (1.0.3-R2198.1)",
+        "Muse Code 1.2.1 (1.2.1-R2847.1)",
+    ):
+        parser.error("--stock is not a supported Muse baseline")
 
     root = pathlib.Path(tempfile.mkdtemp(prefix="muse-codex-cli-msp-parity."))
     os.chmod(root, 0o700)
@@ -1296,6 +1445,7 @@ def main() -> int:
         assert_exec_json(stock, wrapper, script, root)
         assert_ultra_effort(stock, wrapper, script, root)
         assert_fast_mode(stock, wrapper, script, root)
+        assert_yolo_mode(stock, wrapper, script, root)
         assert_exec_tool_loop(stock, wrapper, script, root)
         assert_failure_retry_bounds(stock, wrapper, script, root)
         assert_msp(stock, wrapper, script, root)

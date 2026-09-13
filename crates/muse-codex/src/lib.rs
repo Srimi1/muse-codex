@@ -17,8 +17,10 @@ use tempfile::{Builder as TempBuilder, NamedTempFile, TempDir};
 
 mod msp;
 
-pub const SUPPORTED_MUSE_VERSION: &str = "1.0.3-R2198.1";
-pub const STOCK_MUSE_BASENAME: &str = "muse-bin-1.0.3-R2198.1";
+/// Exactly-pinned stock Muse hosts, oldest first. A newer build is only added
+/// here after its help baseline, MSP schema, and serve/exec flag surface have
+/// been qualified one at a time.
+pub const SUPPORTED_MUSE_VERSIONS: &[&str] = &["1.0.3-R2198.1", "1.2.1-R2847.1"];
 pub const STOCK_MUSE_COMMAND: &str = "muse";
 pub const GATEWAY_BASENAME: &str = "muse-codex-gateway";
 pub const DEFAULT_GATEWAY_READY_TIMEOUT: Duration = Duration::from_secs(100);
@@ -140,12 +142,13 @@ fn classify_auth_invocation(args: &[OsString], provider: PublicProvider) -> Invo
     } else {
         (name, matches)
     };
-    let mut arguments = os_args(&["auth", if name == "set" { "set-api-key" } else { name }]);
+    // The gateway nests the action under `auth`, so the credential selector
+    // must precede the subcommand; trailing it is a parse error there.
+    let action = if name == "set" { "set-api-key" } else { name };
+    let mut arguments = os_args(&["auth", "--provider", provider.as_str(), action]);
     if name == "login" && matches.get_flag("device-auth") {
         arguments.push("--device-auth".into());
     }
-    arguments.push("--provider".into());
-    arguments.push(provider.as_str().into());
     Invocation::GatewayAuth(arguments)
 }
 
@@ -299,7 +302,7 @@ pub fn rewrite_muse_args(args: &[OsString], base_url: &str) -> Vec<OsString> {
         index += 1;
     }
 
-    // Muse 1.0.3 dispatches a subcommand only when it is argv[1]. Injecting
+    // Stock Muse dispatches a subcommand only when it is argv[1]. Injecting
     // startup flags before `exec` or `serve` silently enters the TUI instead.
     if let Some(index) = stock_subcommand_index(&rewritten) {
         let subcommand = rewritten.remove(index);
@@ -352,7 +355,7 @@ fn take_exec_api_key_stdin(args: &[OsString]) -> (bool, Vec<OsString>) {
 }
 
 /// Removes the provider-owned Fast selector before invoking stock Muse. Fast
-/// is intentionally a launch-scoped transport setting: Muse 1.0.3 has no
+/// is intentionally a launch-scoped transport setting: stock Muse has no
 /// service-tier field in its CLI, session format, or MSP schema.
 fn take_fast_mode(args: &[OsString]) -> (bool, Vec<OsString>) {
     let mut remaining = Vec::with_capacity(args.len());
@@ -364,6 +367,38 @@ fn take_fast_mode(args: &[OsString]) -> (bool, Vec<OsString>) {
             break;
         }
         if argument == "--fast" {
+            selected = true;
+            index += 1;
+            continue;
+        }
+        let count = if option_takes_value(argument) && index + 1 < args.len() {
+            2
+        } else {
+            1
+        };
+        remaining.extend(args[index..index + count].iter().cloned());
+        index += count;
+    }
+    (selected, remaining)
+}
+
+/// Removes the launch-scoped YOLO selector before invoking stock Muse.
+///
+/// Stock Muse owns `--yolo` on its TUI, `exec`, and `resume` surfaces, but its
+/// MSP host (`serve`) has no such flag: sandbox posture is constructed from
+/// host CLI flags while approval is selected per session over the wire. The
+/// caller therefore re-attaches or translates the selector per invocation kind
+/// instead of forwarding it blindly.
+fn take_yolo_mode(args: &[OsString]) -> (bool, Vec<OsString>) {
+    let mut remaining = Vec::with_capacity(args.len());
+    let mut selected = false;
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" {
+            remaining.extend(args[index..].iter().cloned());
+            break;
+        }
+        if argument == "--yolo" {
             selected = true;
             index += 1;
             continue;
@@ -410,6 +445,9 @@ pub fn is_local_invocation(args: &[OsString]) -> bool {
                     | "schema"
                     | "session-message"
                     | "init"
+                    // MCP server OAuth is credential-local and model-free; it
+                    // must never start the provider gateway.
+                    | "mcp"
             )
         )
     })
@@ -453,6 +491,10 @@ fn stock_subcommand_index(args: &[OsString]) -> Option<usize> {
                         | "auth"
                         | "login"
                         | "logout"
+                        // `mcp login` / `mcp logout` manage MCP server OAuth and
+                        // must never be mistaken for wrapper auth commands; the
+                        // auth check only inspects the word at this index.
+                        | "mcp"
                 )
             )
             .then_some(index);
@@ -490,6 +532,27 @@ fn option_takes_value(argument: &OsStr) -> bool {
                 | "--session-id"
                 | "--out"
                 | "--format"
+                // Local subcommand options. Their values must never be mistaken
+                // for launch-scoped selectors while scanning whole-arg vectors.
+                | "--session"
+                | "--source"
+                | "--scope"
+                | "--name"
+                | "--from"
+                | "--target"
+                | "--in-reply-to"
+                | "--display-context"
+                | "--plane"
+                | "--file"
+                | "--oauth-client-id"
+                | "--callback-port"
+                | "--fixture"
+                | "--session-log"
+                | "--run-id"
+                | "--run-log"
+                | "--task-log"
+                | "--render-mode"
+                | "--max-text-bytes"
         )
     )
 }
@@ -513,7 +576,7 @@ fn validate_msp_options(arguments: &[OsString]) -> Result<()> {
         && has_option(arguments, "--no-session-log")
     {
         bail!(
-            "Muse 1.0.3 cannot deliver MSP turn events with --no-session-log. Run `muse-codex serve` without that flag; sessions stay in the isolated Muse Codex profile."
+            "Muse cannot deliver MSP turn events with --no-session-log. Run `muse-codex serve` without that flag; sessions stay in the isolated Muse Codex profile."
         );
     }
     Ok(())
@@ -593,6 +656,16 @@ fn merge_cli_base_url(slot: &mut Option<OsString>, value: &OsStr) -> Result<()> 
     Ok(())
 }
 
+/// Inserts launcher-selected stock flags before any `--` prompt separator so
+/// they are parsed as options rather than swallowed into opaque prompt text.
+fn insert_stock_flags(argv: &mut Vec<OsString>, flags: &[&str]) {
+    let position = argv
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(argv.len());
+    argv.splice(position..position, os_args(flags));
+}
+
 fn starts_with_os(value: &OsStr, prefix: &str) -> bool {
     value
         .to_str()
@@ -632,35 +705,41 @@ pub fn discover_stock_muse(inputs: &DiscoveryInputs) -> Result<PathBuf> {
     }
 
     let mut candidates = Vec::new();
+    // Prefer newer qualified versioned binaries, then the unversioned command,
+    // at each location before moving to the next location.
+    let mut basenames: Vec<OsString> = SUPPORTED_MUSE_VERSIONS
+        .iter()
+        .rev()
+        .map(|version| platform_binary_name(&format!("muse-bin-{version}")))
+        .collect();
+    basenames.push(platform_binary_name(STOCK_MUSE_COMMAND));
     if let Some(current_exe) = &inputs.current_exe
         && let Some(directory) = current_exe.parent()
     {
-        candidates.push(directory.join(platform_binary_name(STOCK_MUSE_BASENAME)));
-        candidates.push(directory.join(platform_binary_name(STOCK_MUSE_COMMAND)));
+        candidates.extend(basenames.iter().map(|name| directory.join(name)));
     }
     if let Some(directory) = &inputs.install_dir {
-        candidates.push(directory.join(platform_binary_name(STOCK_MUSE_BASENAME)));
-        candidates.push(directory.join(platform_binary_name(STOCK_MUSE_COMMAND)));
+        candidates.extend(basenames.iter().map(|name| directory.join(name)));
     }
     if let Some(home) = &inputs.home_dir {
         let user_bin = home.join(".local").join("bin");
-        candidates.push(user_bin.join(platform_binary_name(STOCK_MUSE_BASENAME)));
-        candidates.push(user_bin.join(platform_binary_name(STOCK_MUSE_COMMAND)));
+        candidates.extend(basenames.iter().map(|name| user_bin.join(name)));
     }
-    candidates.extend(path_candidates(
-        inputs.path.as_deref(),
-        &platform_binary_name(STOCK_MUSE_BASENAME),
-    ));
-    candidates.extend(path_candidates(
-        inputs.path.as_deref(),
-        &platform_binary_name(STOCK_MUSE_COMMAND),
-    ));
+    for name in &basenames {
+        candidates.extend(path_candidates(inputs.path.as_deref(), name));
+    }
 
     first_executable(candidates).ok_or_else(|| {
         anyhow!(
-            "Muse Code {SUPPORTED_MUSE_VERSION} is not installed; install the stock Muse CLI or set MUSE_CODEX_MUSE_BIN to its exact binary"
+            "Muse Code {} is not installed; install a supported stock Muse CLI or set MUSE_CODEX_MUSE_BIN to its exact binary",
+            supported_muse_versions_display()
         )
     })
+}
+
+/// Human-readable list of the exactly-pinned stock Muse hosts.
+pub fn supported_muse_versions_display() -> String {
+    SUPPORTED_MUSE_VERSIONS.join(" or ")
 }
 
 /// Confirms that an independently installed stock executable is the exact
@@ -692,15 +771,32 @@ pub fn verify_stock_muse_version(path: &Path) -> Result<()> {
     let actual = std::str::from_utf8(&output.stdout)
         .context("stock Muse --version output was not UTF-8")?
         .trim();
-    let expected = format!("Muse Code 1.0.3 ({SUPPORTED_MUSE_VERSION})");
-    if actual != expected {
+    if !is_supported_stock_muse_version(actual) {
         bail!(
-            "stock Muse must be exactly {SUPPORTED_MUSE_VERSION}; {} reported {:?}",
+            "stock Muse must be exactly {}; {} reported {:?}",
+            supported_muse_versions_display(),
             path.display(),
             actual
         );
     }
     Ok(())
+}
+
+/// Exact `--version` output accepted for every qualified stock Muse host.
+pub fn supported_stock_muse_versions() -> Vec<String> {
+    SUPPORTED_MUSE_VERSIONS
+        .iter()
+        .map(|version| {
+            let short = version.split('-').next().unwrap_or(version);
+            format!("Muse Code {short} ({version})")
+        })
+        .collect()
+}
+
+fn is_supported_stock_muse_version(reported: &str) -> bool {
+    supported_stock_muse_versions()
+        .iter()
+        .any(|expected| reported == expected)
 }
 
 pub fn discover_gateway(inputs: &DiscoveryInputs) -> Result<PathBuf> {
@@ -1026,7 +1122,7 @@ pub fn seed_stock_settings(config_home: &Path, base_url: &str) -> Result<PathBuf
     Ok(path)
 }
 
-/// Writes Muse 1.0.3's normalized provider cache from the authenticated Codex
+/// Writes stock Muse's normalized provider cache from the authenticated Codex
 /// catalog. The stock raw-catalog decoder cannot preserve multiple rows when a
 /// provider omits optional release dates or output limits, while this cache
 /// schema represents those unknowns as JSON null without inventing values.
@@ -1715,7 +1811,7 @@ fn scrub_secret_environment(command: &mut Command) {
     command.env("TBH_DISABLE_TELEMETRY", "1");
 }
 
-/// Opens Muse 1.0.3's built-in Ultra mode for the isolated Codex runtime.
+/// Opens stock Muse's built-in Ultra mode for the isolated Codex runtime.
 /// Muse keeps ownership of proactive workflow delegation and maps the model
 /// request to its catalog-defined underlying reasoning effort.
 fn enable_ultra_reasoning(command: &mut Command) {
@@ -1847,6 +1943,7 @@ fn run_stock_muse(
     let provider = selected_provider(arguments)?;
     let (api_key_stdin, arguments) = take_exec_api_key_stdin(arguments);
     let (fast_mode, arguments) = take_fast_mode(&arguments);
+    let (yolo_mode, arguments) = take_yolo_mode(&arguments);
     reject_unsupported_provider_options(provider, fast_mode)?;
     let base_url_variable = match provider {
         PublicProvider::Codex => "OPENAI_BASE_URL",
@@ -1884,10 +1981,27 @@ fn run_stock_muse(
     )?;
     let settings_path = seed_stock_settings(&directories.config_home, &gateway.ready.base_url)?;
     let auth_path = directories.config_home.join("muse").join("auth.json");
-    let rewritten = rewrite_muse_args(&arguments, &gateway.ready.base_url);
+    let mut rewritten = rewrite_muse_args(&arguments, &gateway.ready.base_url);
     let is_msp = rewritten
         .first()
         .is_some_and(|argument| argument == "serve");
+    if yolo_mode {
+        if is_msp {
+            // The MSP host has no `--yolo` flag: sandbox posture is fixed by
+            // host CLI flags while approval is selected per session over the
+            // wire (`session/start.approvalMode`). Translate the
+            // host-constructible half and leave approval to the wire client.
+            insert_stock_flags(&mut rewritten, &["--disable-sandbox", "--trust-workspace"]);
+            eprintln!(
+                "muse-codex: YOLO mode requested for the MSP host (sandboxing disabled and workspaces trusted; approval stays wire-selected)"
+            );
+        } else {
+            insert_stock_flags(&mut rewritten, &["--yolo"]);
+            eprintln!(
+                "muse-codex: YOLO mode requested (approval and sandboxing disabled for this run)"
+            );
+        }
+    }
 
     let mut command = Command::new(stock_muse);
     if fast_mode {
@@ -1946,7 +2060,11 @@ fn run_stock_information(
     arguments: &[OsString],
     provider: PublicProvider,
 ) -> Result<i32> {
-    let (_, mut arguments) = take_fast_mode(arguments);
+    let (_, without_fast) = take_fast_mode(arguments);
+    // Model-free commands execute no tools, so launch-scoped execution
+    // selectors are vacuous here; drop them like Fast rather than letting
+    // stock fail on a flag the subcommand does not define.
+    let (_, mut arguments) = take_yolo_mode(&without_fast);
     if let Some(index) = stock_subcommand_index(&arguments) {
         let command = arguments.remove(index);
         arguments.insert(0, command);
@@ -2015,6 +2133,18 @@ fn rewrite_provider_help_for(bytes: &[u8], provider: PublicProvider) -> Vec<u8> 
     } else {
         text
     };
+    // Stock documents `--yolo` on its TUI/exec/resume surfaces, but the MSP
+    // host has no such flag even though the launcher accepts it there and
+    // translates it to host sandbox options. Document the translation only in
+    // serve help, after the Fast injection above kept this anchor intact.
+    let text = if text.contains("Usage: muse-codex serve [OPTIONS]") {
+        text.replace(
+            "  -h, --help\n          Print this help\n      --no-session-log",
+            "  -h, --help\n          Print this help\n      --yolo\n          Disable sandboxing and trust workspaces for this host (approval stays wire-selected)\n      --no-session-log",
+        )
+    } else {
+        text
+    };
     text.replace(
         "Model id for non-echo providers",
         "Model id from the active provider catalog",
@@ -2035,7 +2165,7 @@ fn rewrite_provider_help_for(bytes: &[u8], provider: PublicProvider) -> Vec<u8> 
     )
     .replace(
         "Use memory-only sessions",
-        "Unavailable for MSP turns with the pinned Muse 1.0.3 host",
+        "Unavailable for MSP turns with the pinned Muse host",
     )
     .into_bytes()
 }
@@ -2272,21 +2402,21 @@ mod tests {
         );
         assert_eq!(
             classify_invocation(&args(&["login"])).unwrap(),
-            Invocation::GatewayAuth(args(&["auth", "login", "--provider", "codex"]))
+            Invocation::GatewayAuth(args(&["auth", "--provider", "codex", "login"]))
         );
         assert_eq!(
             classify_invocation(&args(&["login", "--device-auth"])).unwrap(),
             Invocation::GatewayAuth(args(&[
                 "auth",
-                "login",
-                "--device-auth",
                 "--provider",
-                "codex"
+                "codex",
+                "login",
+                "--device-auth"
             ]))
         );
         assert_eq!(
             classify_invocation(&args(&["logout"])).unwrap(),
-            Invocation::GatewayAuth(args(&["auth", "logout", "--provider", "codex"]))
+            Invocation::GatewayAuth(args(&["auth", "--provider", "codex", "logout"]))
         );
         assert_eq!(
             classify_invocation(&args(&[
@@ -2297,7 +2427,7 @@ mod tests {
                 "--api-key-stdin",
             ]))
             .unwrap(),
-            Invocation::GatewayAuth(args(&["auth", "set-api-key", "--provider", "codex"]))
+            Invocation::GatewayAuth(args(&["auth", "--provider", "codex", "set-api-key"]))
         );
         assert_eq!(
             classify_invocation(&args(&[
@@ -2307,17 +2437,17 @@ mod tests {
                 "--provider=codex",
             ]))
             .unwrap(),
-            Invocation::GatewayAuth(args(&["auth", "set-api-key", "--provider", "codex"]))
+            Invocation::GatewayAuth(args(&["auth", "--provider", "codex", "set-api-key"]))
         );
         assert_eq!(
             classify_invocation(&args(&["--provider", "codex", "login", "--device-auth",]))
                 .unwrap(),
             Invocation::GatewayAuth(args(&[
                 "auth",
-                "login",
-                "--device-auth",
                 "--provider",
-                "codex"
+                "codex",
+                "login",
+                "--device-auth"
             ]))
         );
     }
@@ -2331,11 +2461,11 @@ mod tests {
         ));
         assert_eq!(
             classify_invocation(&args(&["auth", "set", "--api-key-stdin"])).unwrap(),
-            Invocation::GatewayAuth(args(&["auth", "set-api-key", "--provider", "codex"]))
+            Invocation::GatewayAuth(args(&["auth", "--provider", "codex", "set-api-key"]))
         );
         assert_eq!(
             classify_invocation(&args(&["auth", "status"])).unwrap(),
-            Invocation::GatewayAuth(args(&["auth", "status", "--provider", "codex"]))
+            Invocation::GatewayAuth(args(&["auth", "--provider", "codex", "status"]))
         );
         for command in [
             args(&["auth", "set"]),
@@ -2396,11 +2526,11 @@ mod tests {
                 "--api-key-stdin"
             ]))
             .unwrap(),
-            Invocation::GatewayAuth(args(&["auth", "set-api-key", "--provider", "zai"]))
+            Invocation::GatewayAuth(args(&["auth", "--provider", "zai", "set-api-key"]))
         );
         assert_eq!(
             classify_invocation(&args(&["--provider", "zai", "auth", "status"])).unwrap(),
-            Invocation::GatewayAuth(args(&["auth", "status", "--provider", "zai"]))
+            Invocation::GatewayAuth(args(&["auth", "--provider", "zai", "status"]))
         );
     }
 
@@ -2629,6 +2759,89 @@ mod tests {
     }
 
     #[test]
+    fn yolo_mode_is_launch_scoped_and_never_consumes_prompt_content() {
+        assert_eq!(
+            take_yolo_mode(&args(&["--yolo", "exec", "hello"])),
+            (true, args(&["exec", "hello"]))
+        );
+        assert_eq!(
+            take_yolo_mode(&args(&["exec", "--yolo", "hello"])),
+            (true, args(&["exec", "hello"]))
+        );
+        assert_eq!(
+            take_yolo_mode(&args(&["serve", "--yolo"])),
+            (true, args(&["serve"]))
+        );
+        for original in [
+            args(&["exec", "--", "--yolo"]),
+            args(&["exec", "--prompt-file", "--yolo"]),
+            args(&["--model", "--yolo", "exec", "hello"]),
+        ] {
+            assert_eq!(take_yolo_mode(&original), (false, original));
+        }
+    }
+
+    #[test]
+    fn stock_flag_insertion_stays_before_the_prompt_separator() {
+        let mut argv = args(&["exec", "--json", "--", "prompt --yolo"]);
+        insert_stock_flags(&mut argv, &["--yolo"]);
+        assert_eq!(
+            argv,
+            args(&["exec", "--json", "--yolo", "--", "prompt --yolo"])
+        );
+
+        let mut serve = args(&["serve"]);
+        insert_stock_flags(&mut serve, &["--disable-sandbox", "--trust-workspace"]);
+        assert_eq!(
+            serve,
+            args(&["serve", "--disable-sandbox", "--trust-workspace"])
+        );
+    }
+
+    #[test]
+    fn mcp_oauth_stays_local_and_never_reaches_wrapper_auth() {
+        for command in [
+            args(&["mcp", "login", "server"]),
+            args(&["mcp", "logout", "server"]),
+            args(&["--provider", "zai", "mcp", "login", "server"]),
+        ] {
+            assert!(is_local_invocation(&command));
+            assert!(matches!(
+                classify_invocation(&command).unwrap(),
+                Invocation::Muse(_)
+            ));
+        }
+        assert_eq!(
+            rewrite_muse_args(&args(&["mcp", "login", "server"]), "http://127.0.0.1:4321"),
+            args(&["mcp", "login", "server"])
+        );
+    }
+
+    #[test]
+    fn local_subcommand_values_are_never_mistaken_for_selectors() {
+        for original in [
+            args(&["export", "--session", "--fast"]),
+            args(&["skills", "enable", "x", "--scope", "--yolo"]),
+            args(&["mcp", "login", "s", "--callback-port", "--fast"]),
+            args(&["config", "validate", "--plane", "--yolo", "--file", "p"]),
+        ] {
+            assert_eq!(take_fast_mode(&original), (false, original.clone()));
+            assert_eq!(take_yolo_mode(&original), (false, original.clone()));
+        }
+        assert!(!is_informational_invocation(&args(&[
+            "export",
+            "--session",
+            "--help"
+        ])));
+        assert!(!is_informational_invocation(&args(&[
+            "session-message",
+            "send",
+            "--target",
+            "--version"
+        ])));
+    }
+
+    #[test]
     fn rewritten_help_documents_fast_without_changing_stock_usage() {
         let help = b"      --reasoning-effort <EFFORT>\n          Meta reasoning effort: low|high\n          (default: high)\n      --base-url <URL>\n";
         let rewritten =
@@ -2652,6 +2865,28 @@ mod tests {
         ))
         .unwrap();
         assert!(rewritten.contains("Resume this session with OpenAI Fast mode"));
+    }
+
+    #[test]
+    fn serve_help_documents_yolo_translation_for_both_providers() {
+        let serve_help =
+            b"muse serve - serve an MSP session host over stdio\n\nUsage: muse serve [OPTIONS]\n\nOptions:\n  -h, --help\n          Print this help\n      --no-session-log\n          Use memory-only sessions\n";
+        for provider in [PublicProvider::Codex, PublicProvider::Zai] {
+            let rewritten =
+                String::from_utf8(rewrite_provider_help_for(serve_help, provider)).unwrap();
+            assert!(rewritten.contains("Usage: muse-codex serve [OPTIONS]"));
+            assert!(rewritten.contains("      --yolo\n"));
+            assert!(rewritten.contains("approval stays wire-selected"));
+            assert!(rewritten.contains("Unavailable for MSP turns with the pinned Muse host"));
+        }
+
+        // Root and exec help already document stock-native --yolo; the launcher
+        // must not inject a duplicate entry there.
+        let exec_help =
+            b"Usage: muse exec [OPTIONS] [PROMPT]\n\nOptions:\n  -h, --help\n          Print this help\n      --no-session-log\n";
+        let rewritten =
+            String::from_utf8(rewrite_provider_help_for(exec_help, PublicProvider::Codex)).unwrap();
+        assert!(!rewritten.contains("--yolo"));
     }
 
     #[cfg(unix)]
@@ -2738,7 +2973,7 @@ mod tests {
         let override_path = temporary.path().join("custom-muse");
         let sibling_path = temporary
             .path()
-            .join(platform_binary_name(STOCK_MUSE_BASENAME));
+            .join(platform_binary_name("muse-bin-1.0.3-R2198.1"));
         create_executable(&override_path);
         create_executable(&sibling_path);
         let inputs = DiscoveryInputs {
@@ -2754,13 +2989,31 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let expected = temporary
             .path()
-            .join(platform_binary_name(STOCK_MUSE_BASENAME));
+            .join(platform_binary_name("muse-bin-1.2.1-R2847.1"));
         create_executable(&expected);
         let inputs = DiscoveryInputs {
             path: Some(env::join_paths([temporary.path()]).unwrap()),
             ..DiscoveryInputs::default()
         };
         assert_eq!(discover_stock_muse(&inputs).unwrap(), expected);
+    }
+
+    #[test]
+    fn stock_discovery_prefers_newer_qualified_versioned_binaries() {
+        let temporary = tempfile::tempdir().unwrap();
+        let old = temporary
+            .path()
+            .join(platform_binary_name("muse-bin-1.0.3-R2198.1"));
+        let new = temporary
+            .path()
+            .join(platform_binary_name("muse-bin-1.2.1-R2847.1"));
+        create_executable(&old);
+        create_executable(&new);
+        let inputs = DiscoveryInputs {
+            path: Some(env::join_paths([temporary.path()]).unwrap()),
+            ..DiscoveryInputs::default()
+        };
+        assert_eq!(discover_stock_muse(&inputs).unwrap(), new);
     }
 
     #[test]
@@ -2780,12 +3033,17 @@ mod tests {
     #[test]
     fn stock_version_gate_requires_the_exact_baseline() {
         let temporary = tempfile::tempdir().unwrap();
-        let exact = temporary.path().join("exact-muse");
+        let old = temporary.path().join("old-muse");
+        let new = temporary.path().join("new-muse");
         let wrong = temporary.path().join("wrong-muse");
-        create_version_executable(&exact, "Muse Code 1.0.3 (1.0.3-R2198.1)");
+        create_version_executable(&old, "Muse Code 1.0.3 (1.0.3-R2198.1)");
+        create_version_executable(&new, "Muse Code 1.2.1 (1.2.1-R2847.1)");
         create_version_executable(&wrong, "Muse Code 1.0.4 (1.0.4-R2200.1)");
-        verify_stock_muse_version(&exact).unwrap();
-        assert!(verify_stock_muse_version(&wrong).is_err());
+        verify_stock_muse_version(&old).unwrap();
+        verify_stock_muse_version(&new).unwrap();
+        let error = verify_stock_muse_version(&wrong).unwrap_err().to_string();
+        assert!(error.contains("1.0.3-R2198.1"));
+        assert!(error.contains("1.2.1-R2847.1"));
     }
 
     #[cfg(unix)]

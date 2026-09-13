@@ -25,7 +25,7 @@ body:
     attributes:
       label: Muse Code version
       description: Paste the output of `muse --version`.
-      placeholder: Muse Code 1.0.3 (1.0.3-R2198.1)
+      placeholder: Muse Code 1.2.1 (1.2.1-R2847.1)
     validations:
       required: true
   - type: input

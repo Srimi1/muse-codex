@@ -7,7 +7,7 @@ binary release.
 ## Prerequisites
 
 - Apple-silicon Mac (`arm64`)
-- Muse Code exactly `1.0.3-R2198.1`, installed and licensed separately
+- Muse Code exactly `1.0.3-R2198.1` or `1.2.1-R2847.1`, installed and licensed separately
 - Rust `1.95.0` and Cargo for a source build
 - An OpenAI account eligible for the authentication mode you choose
 
@@ -18,12 +18,13 @@ so verify the result:
 
 ```console
 $ muse --version
-Muse Code 1.0.3 (1.0.3-R2198.1)
+Muse Code 1.2.1 (1.2.1-R2847.1)
 ```
 
-Muse Codex deliberately refuses to run another Muse version. If the exact build
-is not available to you through an authorized channel, this version of Muse
-Codex cannot start a session.
+`Muse Code 1.0.3 (1.0.3-R2198.1)` is also accepted. Muse Codex deliberately
+refuses to run any other Muse version. If neither exact build is available to
+you through an authorized channel, this version of Muse Codex cannot start a
+session.
 
 ## Build from source
 
@@ -50,7 +51,7 @@ to itself first, then on `PATH`.
 If Muse is stored somewhere nonstandard, point to the exact executable:
 
 ```sh
-export MUSE_CODEX_MUSE_BIN='/absolute/path/to/muse-bin-1.0.3-R2198.1'
+export MUSE_CODEX_MUSE_BIN='/absolute/path/to/muse-bin-1.2.1-R2847.1'
 ```
 
 ## Verify the build

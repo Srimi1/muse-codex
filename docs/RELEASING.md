@@ -28,9 +28,9 @@ With the exact separately licensed stock binary and debug wrapper installed:
 
 ```sh
 cargo build --workspace --locked
-MUSE_CODEX_MUSE_BIN=/absolute/path/to/muse-bin-1.0.3-R2198.1 \
+MUSE_CODEX_MUSE_BIN="$(command -v muse)" \
   bash scripts/verify-muse-baseline.sh
-MUSE_CODEX_MUSE_BIN=/absolute/path/to/muse-bin-1.0.3-R2198.1 \
+MUSE_CODEX_MUSE_BIN="$(command -v muse)" \
   python3 tests/scripts/cli-msp-parity-test.py
 ```
 
@@ -59,7 +59,7 @@ and Codex vendor revision in operator release notes.
 ```sh
 rustup target add aarch64-apple-darwin --toolchain 1.95.0
 cargo build --workspace --release --locked --target aarch64-apple-darwin
-MUSE_CODEX_MUSE_BIN=/absolute/path/to/muse-bin-1.0.3-R2198.1 \
+MUSE_CODEX_MUSE_BIN="$(command -v muse)" \
 MUSE_CODEX_GATEWAY_BIN="$PWD/target/aarch64-apple-darwin/release/muse-codex-gateway" \
   target/aarch64-apple-darwin/release/muse-codex self-test
 ```

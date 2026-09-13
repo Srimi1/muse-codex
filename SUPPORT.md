@@ -8,7 +8,7 @@ basis. There is no guaranteed response time or commercial support commitment.
 Confirm that your environment matches the supported baseline:
 
 - Apple-silicon macOS;
-- Muse Code exactly `1.0.3-R2198.1`; and
+- Muse Code exactly `1.0.3-R2198.1` or `1.2.1-R2847.1`; and
 - a source build from the latest `main` commit.
 
 Then review [installation](docs/INSTALLATION.md),

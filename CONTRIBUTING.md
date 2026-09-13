@@ -19,9 +19,9 @@ By participating, you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Development setup
 
-Development requires Apple-silicon macOS, Rust `1.95.0`, and the exact stock
-Muse Code baseline `1.0.3-R2198.1` for host integration checks. Unit and fixture
-tests do not require OpenAI credentials.
+Development requires Apple-silicon macOS, Rust `1.95.0`, and an exact stock
+Muse Code baseline (`1.0.3-R2198.1` or `1.2.1-R2847.1`) for host integration
+checks. Unit and fixture tests do not require OpenAI credentials.
 
 ```sh
 git clone https://github.com/Srimi1/muse-codex.git

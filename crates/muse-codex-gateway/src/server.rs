@@ -157,8 +157,8 @@ async fn health() -> Response {
 
 async fn models() -> StatusCode {
     // The launcher atomically seeds Muse's isolated normalized catalog from
-    // the authenticated models embedded in the private readiness file. Muse
-    // 1.0.3 cannot represent multiple provider rows when optional limits are
+    // the authenticated models embedded in the private readiness file. Stock
+    // Muse cannot represent multiple provider rows when optional limits are
     // unknown, so a 304 keeps that lossless cache rather than coercing unknown
     // values to fabricated numbers.
     StatusCode::NOT_MODIFIED

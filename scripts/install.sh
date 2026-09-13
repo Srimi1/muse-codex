@@ -63,8 +63,10 @@ fi
 [ -n "$stock_muse" ] && [ -x "$stock_muse" ] || \
   die "stock Muse is required; install it separately or set MUSE_CODEX_MUSE_BIN"
 stock_version=$(MUSE_NO_AUTO_UPDATE=1 "$stock_muse" --version 2>/dev/null || true)
-[ "$stock_version" = "Muse Code 1.0.3 (1.0.3-R2198.1)" ] || \
-  die "stock Muse must be exactly 1.0.3-R2198.1 (found: ${stock_version:-unknown})"
+case "$stock_version" in
+  "Muse Code 1.0.3 (1.0.3-R2198.1)"|"Muse Code 1.2.1 (1.2.1-R2847.1)") ;;
+  *) die "stock Muse must be exactly 1.0.3-R2198.1 or 1.2.1-R2847.1 (found: ${stock_version:-unknown})" ;;
+esac
 
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/muse-codex-install.XXXXXX")
 launcher_stage=
