@@ -29,7 +29,7 @@ arguments are handled by Muse Codex itself.
 
 | Variable | Purpose | Rules |
 | --- | --- | --- |
-| `MUSE_CODEX_MUSE_BIN` | Override stock Muse discovery | Absolute or relative path to an executable reporting exactly `1.0.3-R2198.1` |
+| `MUSE_CODEX_MUSE_BIN` | Override stock Muse discovery | Absolute or relative path to an executable reporting exactly `1.0.3-R2198.1` or `1.2.1-R2847.1` |
 | `MUSE_CODEX_GATEWAY_BIN` | Override gateway discovery | Must point to an executable gateway binary |
 | `MUSE_CODEX_HOME` | Override isolated application state | Absolute path ending in `muse-codex`; parent must exist; cannot be the home directory or live under `~/.codex` |
 | `MUSE_CODEX_GATEWAY_READY_TIMEOUT_MS` | Override gateway startup timeout | Positive integer milliseconds; invalid or zero values use the default |
@@ -69,18 +69,25 @@ catalog and interleave their session histories.
   rejected with `--provider zai`: the GLM Coding Plan has no service tier, and
   accepting a billing-affecting flag that cannot be honored would misreport what
   the user bought.
+- `--yolo` disables tool approval prompts and OS sandboxing for that process.
+  For the TUI, `exec`, and `resume` it is forwarded to stock Muse unchanged.
+  For `serve` the launcher translates it to `--disable-sandbox
+  --trust-workspace`, because the MSP host fixes sandbox posture from CLI flags
+  while approval is selected per session over the wire
+  (`session/start.approvalMode`); the adapter never injects an approval mode.
+  The launcher prints a warning whenever YOLO mode is active.
 - Under `--provider zai` the `/muse-code/search` and `/muse-code/browser_open`
   routes answer `501`, because Z.ai offers no equivalent and an empty success
   would let the model reason from a false premise.
 - Other arguments pass through to the stock Muse parser.
 
 Use `muse-codex exec --json "prompt"` for headless JSONL output and
-`muse-codex serve` for MSP over stdin/stdout. Muse 1.0.3 requires the subcommand
+`muse-codex serve` for MSP over stdin/stdout. Stock Muse requires the subcommand
 before its startup flags; the launcher places provider flags in the correct
 scope. The `serve` command gets its endpoint from isolated settings because
 its parser does not accept provider flags.
 
-Fast mode is wrapper-owned and launch-scoped because Muse 1.0.3 has no service
+Fast mode is wrapper-owned and launch-scoped because stock Muse has no service
 tier in its CLI, session format, or MSP schema and provides no `/fast` toggle.
 It therefore applies to the whole TUI, `exec`, `resume`, or `serve` process;
 restart with or without `--fast` to change it. For ChatGPT, the selected model
@@ -99,8 +106,8 @@ pinned Muse host cannot deliver turn events in that mode. Normal `serve` keeps
 sessions in the isolated profile; `exec --no-session-log` remains available.
 
 Local commands (`schema`, `export`, `trace`, `config`, `skills`, `sandbox`,
-`session-message`, and `init`) and help/version output work without starting
-the gateway. They operate on the Muse Codex profile.
+`session-message`, `mcp`, and `init`) and help/version output work without
+starting the gateway. They operate on the Muse Codex profile.
 
 `exec --api-key-stdin` reads an invocation-only key in the launcher and passes
 it through the private gateway pipe. It is removed from Muse's arguments and

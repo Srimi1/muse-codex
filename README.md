@@ -20,8 +20,8 @@
 
 > [!WARNING]
 > **Experimental and source-only.** Muse Codex currently supports Apple-silicon
-> macOS and exactly Muse Code `1.0.3-R2198.1`. Other Muse versions are rejected.
-> No public binary release is available.
+> macOS and exactly Muse Code `1.0.3-R2198.1` or `1.2.1-R2847.1`. Other Muse
+> versions are rejected. No public binary release is available.
 
 > [!IMPORTANT]
 > Muse Codex is not affiliated with, endorsed by, or distributed by Meta or
@@ -71,7 +71,7 @@ See [Architecture](docs/ARCHITECTURE.md) and the
 | Component | Supported baseline |
 | --- | --- |
 | Operating system | macOS on Apple silicon (`arm64`) |
-| Muse Code | Exactly `1.0.3-R2198.1` |
+| Muse Code | Exactly `1.0.3-R2198.1` or `1.2.1-R2847.1` |
 | Rust | `1.95.0` for source builds |
 | OpenAI Codex source | `rust-v0.153.4` at `3d2ee51ca2d5db578f328aa75e20aa22c0197c9a` |
 | Authentication | ChatGPT browser/device login, an OpenAI API key, or a Z.ai API key |
@@ -82,10 +82,11 @@ bypass its version gate; verify the installed binary before building:
 
 ```console
 $ muse --version
-Muse Code 1.0.3 (1.0.3-R2198.1)
+Muse Code 1.2.1 (1.2.1-R2847.1)
 ```
 
-If the output differs, this version of Muse Codex will not start a session.
+`Muse Code 1.0.3 (1.0.3-R2198.1)` is also accepted. If the output is any other
+build, this version of Muse Codex will not start a session.
 
 ### Providers
 
@@ -213,7 +214,7 @@ Ultra's additional behavior lives in the Muse agent harness.
 `--fast` requests OpenAI Fast mode for the entire TUI, `exec`, `resume`, or
 `serve` process. It is a service tier, not a reasoning effort, so it can be
 combined with Ultra as shown above. Fast uses priority processing with
-increased usage or cost. Stock Muse 1.0.3 has no service-tier field or `/fast`
+increased usage or cost. Stock Muse has no service-tier field or `/fast`
 command, so changing the selection requires starting a new process with or
 without `--fast`. For ChatGPT, the gateway requires the selected model to
 advertise the `priority` tier (or the pinned client's legacy `fast` capability),
@@ -222,6 +223,13 @@ API-key endpoint receives the priority tier without catalog gating and
 determines whether it supports it. Without `--fast`, the gateway strips and
 omits any service tier. The startup banner says Fast was *requested* because
 the service can report a downgraded tier.
+
+`--yolo` disables tool approval prompts and OS sandboxing for the run and is
+passed through to stock Muse for the TUI, `exec`, and `resume`. The MSP host
+(`serve`) has no `--yolo` flag: approval there is selected per session over
+the wire, so the launcher translates `serve --yolo` to the host-constructible
+half (`--disable-sandbox --trust-workspace`) and leaves approval to the wire
+client. The launcher prints a warning whenever YOLO mode is active.
 
 To run the same harness against your Z.ai subscription:
 
@@ -321,7 +329,7 @@ CLI/MSP differential suite:
 
 ```sh
 cargo build --workspace --locked
-MUSE_CODEX_MUSE_BIN=/absolute/path/to/muse-bin-1.0.3-R2198.1 \
+MUSE_CODEX_MUSE_BIN="$(command -v muse)" \
   python3 tests/scripts/cli-msp-parity-test.py
 ```
 

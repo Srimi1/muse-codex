@@ -7,9 +7,9 @@ harness. It is an external compatibility layer, not a Muse fork. This boundary
 is necessary because Meta publishes the Muse Session Protocol SDK and schema,
 but not the Rust host that implements the terminal agent.
 
-The supported Muse baseline is `1.0.3-R2198.1`. The Codex client and wire
-compatibility version are pinned to `rust-v0.153.4`; dependency upgrades and
-Muse upgrades are separate compatibility events.
+The supported Muse baselines are `1.0.3-R2198.1` and `1.2.1-R2847.1`. The
+Codex client and wire compatibility version are pinned to `rust-v0.153.4`;
+dependency upgrades and Muse upgrades are separate compatibility events.
 
 This document describes current behavior in the present tense. Statements
 labelled as release requirements or planned gates describe work that must be
@@ -100,7 +100,7 @@ The gateway does not maintain a local model allowlist. Before signaling
 readiness it fetches the authenticated catalog, sorts on upstream priority,
 marks the first picker-visible result as the default, and includes the result in
 its private readiness document. The launcher atomically converts that document
-to Muse 1.0.3's normalized cache format. This cache path is necessary because
+to stock Muse's normalized cache format. This cache path is necessary because
 the pinned Muse raw-catalog decoder cannot retain multiple rows whose optional
 release date or output limit is unknown. Unknown values remain JSON `null`;
 they are never replaced with fabricated limits or dates. Authenticated
@@ -109,7 +109,7 @@ provider-default effort field, so no default effort is invented.
 
 Fast mode is a provider setting owned by the launcher and gateway. When
 `--fast` is selected, it applies to every Responses turn for that TUI, `exec`,
-`resume`, or `serve` process; stock Muse 1.0.3 has no service-tier field or
+`resume`, or `serve` process; stock Muse has no service-tier field or
 `/fast` command. For ChatGPT, the transport accepts Fast only when the selected
 catalog model advertises the `priority` tier or the pinned legacy `fast`
 capability, emits the canonical `service_tier: "priority"` field, and supplies
@@ -120,13 +120,18 @@ orthogonal to Ultra or any other reasoning effort. The launcher reports it as
 requested rather than guaranteed because upstream can downgrade the effective
 service tier; priority processing also increases usage or cost.
 
-The launcher opens Muse 1.0.3's built-in Ultra feature gate only for the
+The launcher opens stock Muse's built-in Ultra feature gate only for the
 isolated stock-Muse runtime. Muse therefore owns Ultra's proactive workflow and
 subagent delegation behavior. Consistent with the pinned Codex client, Ultra
-uses the model catalog's multi-agent wire effort (`xhigh` for GPT-6 Astra)
-instead of forwarding a literal `ultra` API value. This preserves the
-provider-only boundary: orchestration stays in Muse and transport stays in the
-gateway.
+uses the model catalog's multi-agent wire effort (for example `xhigh`) instead
+of forwarding a literal `ultra` API value. This preserves the provider-only
+boundary: orchestration stays in Muse and transport stays in the gateway.
+
+`--yolo` is forwarded to stock Muse for the TUI, `exec`, and `resume`, where
+stock owns the flag. The MSP host has no `--yolo` flag, so for `serve` the
+launcher translates it to the host-constructible sandbox posture
+(`--disable-sandbox --trust-workspace`); approval stays selected per session
+over the wire and the MSP adapter never injects it.
 
 The catalog parser honors each model's minimum client version, picker
 visibility, input modalities, reasoning-effort list, Responses Lite flag, and

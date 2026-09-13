@@ -187,7 +187,7 @@ impl State {
                     }
                 }
                 Ok(FrameDisposition::Drop(event)) => {
-                    // Metadata is intentionally not exposed to Muse 1.0.3, but
+                    // Metadata is intentionally not exposed to stock Muse, but
                     // it still participates in identity and sequence tracking.
                     self.observe(&event);
                 }

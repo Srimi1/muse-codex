@@ -31,6 +31,11 @@ All notable project changes will be documented here. The format follows
 - A pinned GLM model catalog validated at startup against Z.ai's plan-usage
   endpoint, which consumes no coding prompt; skip it with
   `MUSE_CODEX_ZAI_SKIP_PROBE=1`.
+- Support for the qualified stock Muse `1.2.1-R2847.1` host alongside
+  `1.0.3-R2198.1`, including the new model-free `mcp` subcommand.
+- Launch-scoped `--yolo` mode: forwarded to stock Muse for the TUI, `exec`,
+  and `resume`, and translated to host sandbox options for MSP `serve` with a
+  stderr warning whenever it is active.
 
 ### Changed
 
@@ -83,6 +88,11 @@ All notable project changes will be documented here. The format follows
   `codex.response.metadata`, and continue to reject unknown non-metadata events.
 - Open Muse's isolated Ultra feature gate so a requested Ultra session no
   longer silently falls back to ordinary `xhigh` mode.
+- Accept every qualified stock Muse build in the version gate instead of
+  rejecting all CLI invocations when a newer supported host is installed.
+- Teach the parity harness the v4 readiness contract, the gateway `--provider`
+  flag, and Muse 1.2.1's task fan-out so the offline differential suite is
+  green on both qualified hosts.
 
 ### Security
 

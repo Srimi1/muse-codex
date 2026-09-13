@@ -37,7 +37,9 @@ fully compromised user account are outside this threat model.
 ### Release requirements
 
 - The provider swap must preserve stock Muse's approval, sandbox, workspace,
-  session, and extension behavior.
+  session, and extension behavior. `--yolo` is the explicit exception: it
+  disables approval prompts and sandboxing at the user's request, and the
+  launcher warns on stderr whenever it is active.
 - Retry and cancellation behavior must not cause Muse to execute an observable
   tool call more than once.
 - Credentials and private-feed secrets must remain absent from diagnostics,

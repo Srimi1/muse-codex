@@ -14,9 +14,9 @@ Muse Codex has not published a stable binary release yet.
 | Older commits and forks | Best effort |
 | Unofficial binary builds | Not supported |
 
-The only supported host baseline is Muse Code `1.0.3-R2198.1` on Apple-silicon
-macOS. Reports involving other Muse builds are still useful, but may not be
-reproducible in the supported configuration.
+The only supported host baselines are Muse Code `1.0.3-R2198.1` and
+`1.2.1-R2847.1` on Apple-silicon macOS. Reports involving other Muse builds
+are still useful, but may not be reproducible in the supported configuration.
 
 ## Report a vulnerability privately
 

@@ -8,7 +8,7 @@ before a broader release.
 
 - Rust launcher, private loopback gateway, and Responses stream translation.
 - Browser, device, and API-key authentication with isolated credential state.
-- Exact Muse Code `1.0.3-R2198.1` version gate.
+- Exact Muse Code `1.0.3-R2198.1` and `1.2.1-R2847.1` version gate.
 - Unit and deterministic fixture coverage for first-party crates.
 - Credential-free stock-vs-wrapped CLI/MSP differential harness, including
   tool loops and single-request terminal failure checks.
